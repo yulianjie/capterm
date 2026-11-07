@@ -1,0 +1,65 @@
+{
+  "$comment": "CapTerm 终端配色。gpui-kit 主题不覆盖终端画布，由自绘的 TerminalView 读取本文件；名称与 capterm.theme.json 中的主题一一对应。",
+  "themes": {
+    "CapTerm Night": {
+      "background": "#0B0E12",
+      "foreground": "#D5DCE3",
+      "cursor": "#5CC8E6",
+      "cursor_text": "#0B0E12",
+      "selection": "#5CC8E647",
+      "search_match": "#E8B04A52",
+      "search_match_current": "#E8B04ABF",
+      "ansi": [
+        "#1B2129", "#F0626A", "#4CC38A", "#E8B04A", "#5B9CF0", "#C58AF0", "#5CC8E6", "#C9D1D9",
+        "#4A5664", "#FF8A8F", "#7BDCA9", "#F5CC7A", "#8AB8F7", "#DCB0F7", "#8ADCF0", "#F2F5F8"
+      ],
+      "gutter": {
+        "line_number": "#7A8695",
+        "timestamp": "#7A8695",
+        "timestamp_repeated": "#5E6977",
+        "divider": "#232A33",
+        "block_guide": "#313B47",
+        "command_ok": "#4CC38A",
+        "command_failed": "#F0626A",
+        "command_running": "#5CC8E6",
+        "live_region": "#5CC8E673",
+        "idle_gap": "#7A8695"
+      },
+      "overview_ruler": {
+        "command": "#5CC8E699",
+        "failed": "#F0626A",
+        "search": "#E8B04A"
+      }
+    },
+    "CapTerm Day": {
+      "background": "#FFFFFF",
+      "foreground": "#1D2630",
+      "cursor": "#086F95",
+      "cursor_text": "#FFFFFF",
+      "selection": "#086F952E",
+      "search_match": "#C9850038",
+      "search_match_current": "#C985008C",
+      "ansi": [
+        "#1D2630", "#BE2E3A", "#157A4B", "#8F5C00", "#2257C9", "#8E44C0", "#086F95", "#8A94A0",
+        "#5E6A78", "#D9434F", "#1E9460", "#A86F00", "#3A6FE0", "#A55BD4", "#0B86B3", "#B9C1CB"
+      ],
+      "gutter": {
+        "line_number": "#65717F",
+        "timestamp": "#65717F",
+        "timestamp_repeated": "#8C96A3",
+        "divider": "#D8DEE5",
+        "block_guide": "#BCC6D0",
+        "command_ok": "#157A4B",
+        "command_failed": "#BE2E3A",
+        "command_running": "#086F95",
+        "live_region": "#086F9566",
+        "idle_gap": "#65717F"
+      },
+      "overview_ruler": {
+        "command": "#086F9599",
+        "failed": "#BE2E3A",
+        "search": "#C98500"
+      }
+    }
+  }
+}

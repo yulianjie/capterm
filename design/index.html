@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CapTerm 设计稿</title>
+<link rel="stylesheet" href="prototype/tokens.css">
+<link rel="stylesheet" href="prototype/styles.css">
+<script src="prototype/icons.js"></script>
+<style>
+  html, body { height: auto; }
+  body { overflow: auto; background: var(--bg-panel); }
+  a { color: inherit; text-decoration: none; }
+  .wrap { max-width: 1360px; margin: 0 auto; padding: 0 32px; }
+
+  .bd-head { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--bg-app) 92%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+  .bd-head .wrap { height: 56px; display: flex; align-items: center; gap: 24px; }
+  .bd-brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 14px; white-space: nowrap; }
+  .bd-brand .logo { width: 24px; height: 24px; }
+  .bd-nav { display: flex; gap: 2px; flex: 1; }
+  .bd-nav a { height: 30px; display: inline-flex; align-items: center; padding: 0 10px; border-radius: 6px; color: var(--text-2); font-size: 13px; }
+  .bd-nav a:hover { background: var(--bg-hover); color: var(--text); }
+  .bd-actions { display: flex; gap: 8px; align-items: center; }
+
+  .hero { border-bottom: 1px solid var(--line); background: var(--bg-term); }
+  .hero .wrap { padding-top: 56px; padding-bottom: 52px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 28px; }
+  .hero h1 { margin: 0; font-size: 34px; line-height: 44px; font-weight: 600; letter-spacing: -0.3px; }
+  .hero p { margin: 0; max-width: 66ch; font-size: 15px; line-height: 26px; color: var(--text-2); }
+  .route.hero-route { --route-bg: var(--bg-term); font-size: 16px; line-height: 28px; overflow: visible; flex: none; padding: 26px 0 8px; }
+  .hero-route .stop { gap: 12px; }
+  .hero-route .stop .node { width: 16px; height: 16px; box-shadow: 0 0 0 4px var(--bg-term); }
+  .hero-route .stop.target .node { width: 22px; height: 22px; background: radial-gradient(circle, var(--route) 0 4.5px, transparent 5.2px); box-shadow: inset 0 0 0 3.5px var(--route), 0 0 0 4px var(--bg-term); }
+  .hero-route .stop.origin { font-size: 15px; }
+  .hero-route .stop.origin .i { width: 22px; height: 22px; }
+  .hero-route .seg { flex: 1 1 160px; min-width: 70px; height: 28px; margin: 0 16px; }
+  .hero-route .seg::before { height: 3px; margin-top: -1.5px; }
+  .hero-route .seg .lat { font-size: 13px; padding: 0 8px; }
+  .hero-route .host { display: flex; flex-direction: column; line-height: 20px; }
+  .hero-route .host small { font: 12px/18px var(--font-mono); color: var(--muted); font-weight: 400; }
+  .hero-notes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px; }
+  .hero-notes div { border-top: 1px solid var(--line); padding-top: 14px; }
+  .hero-notes b { display: block; font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+  .hero-notes span { font-size: 13px; line-height: 22px; color: var(--text-2); }
+
+  section.blk { padding: 56px 0 8px; }
+  section.blk > .wrap > h2 { margin: 0 0 6px; font-size: 22px; line-height: 30px; font-weight: 600; }
+  section.blk > .wrap > p.lead { margin: 0 0 24px; color: var(--text-2); font-size: 14px; line-height: 24px; max-width: 72ch; }
+
+  .boards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px 24px; }
+  .board figure { margin: 0; }
+  .board .shot { display: block; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); box-shadow: var(--shadow-pop); background: var(--bg-app); aspect-ratio: 1440 / 900; }
+  .board .shot img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .board .shot:hover { border-color: var(--accent); }
+  .board figcaption { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; column-gap: 10px; padding: 12px 2px 0; }
+  .board .no { font: 600 13px/22px var(--font-mono); color: var(--muted); }
+  .board h3 { margin: 0; font-size: 15px; line-height: 22px; font-weight: 600; }
+  .board p { margin: 4px 0 0; font-size: 13px; line-height: 21px; color: var(--text-2); grid-column: 2 / 4; }
+  .board .open { font-size: 12.5px; color: var(--accent); display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .board .open:hover { text-decoration: underline; }
+  .board.wide { grid-column: 1 / -1; }
+  .board.wide .shot { aspect-ratio: 1120 / 760; max-width: 760px; }
+
+  .route-states { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--bg-term); }
+  .rs-row { display: grid; grid-template-columns: 150px minmax(0, 1fr); align-items: center; min-height: 54px; padding: 0 20px; border-bottom: 1px solid var(--line); }
+  .rs-row:last-child { border-bottom: 0; }
+  .rs-row .lbl { font-size: 13px; color: var(--text-2); }
+  .rs-row .lbl small { display: block; font-size: 11.5px; color: var(--muted); }
+  .rs-row .route { --route-bg: var(--bg-term); overflow: visible; }
+  .glyphs { display: flex; gap: 28px; align-items: center; padding: 16px 20px; border-top: 1px solid var(--line); background: var(--bg-panel); font-size: 12.5px; color: var(--text-2); flex-wrap: wrap; }
+  .glyphs span { display: inline-flex; gap: 8px; align-items: center; }
+
+  .bd-palette { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+  .pal { border-radius: 12px; border: 1px solid var(--line); padding: 20px; background: var(--bg-panel); color: var(--text); }
+  .pal h3 { margin: 0 0 14px; font-size: 14px; font-weight: 600; display: flex; justify-content: space-between; }
+  .pal h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .sw-group { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .sw { display: grid; gap: 6px; align-content: start; }
+  .sw i { display: block; height: 44px; border-radius: 6px; box-shadow: inset 0 0 0 1px rgba(127, 127, 127, 0.22); }
+  .sw b { font-size: 12px; font-weight: 500; }
+  .sw code { font: 11.5px/14px var(--font-mono); color: var(--muted); }
+  .sw .k { font: 10.5px/14px var(--font-mono); color: var(--muted); opacity: 0.85; }
+  .pal .sample { margin-top: 6px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: var(--bg-term); padding: 12px 14px; font: 13px/20px var(--font-mono); color: var(--term-fg); }
+  .ansi { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; margin-top: 10px; }
+  .ansi i { height: 18px; border-radius: 3px; }
+
+  .type-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; }
+  .type-card { border: 1px solid var(--line); border-radius: 12px; padding: 22px 24px; background: var(--bg-raised); }
+  .type-card h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+  .type-card .meta { font-size: 12px; color: var(--muted); margin-bottom: 18px; }
+  .scale div { display: grid; grid-template-columns: 96px minmax(0, 1fr); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--line); }
+  .scale small { font: 11.5px var(--font-mono); color: var(--muted); }
+  .mono-demo { font: 14px/22px var(--font-mono); white-space: pre; background: var(--bg-term); color: var(--term-fg); border-radius: 8px; padding: 14px 16px; border: 1px solid var(--line); overflow: auto; font-variant-ligatures: none; }
+
+  .bd-foot { padding: 56px 0 72px; color: var(--muted); font-size: 12.5px; }
+  .files { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 28px; }
+  .files a { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-raised); color: var(--text); }
+  .files a:hover { border-color: var(--accent); }
+  .files b { font-size: 13px; font-weight: 600; display: block; }
+  .files span { font-size: 12px; color: var(--muted); }
+  .files .i { color: var(--accent); margin-top: 2px; }
+
+  @media (max-width: 980px) {
+    .boards, .bd-palette, .type-grid, .files, .hero-notes { grid-template-columns: minmax(0, 1fr); }
+    .bd-nav { display: none; }
+    .hero-route .host small { display: none; }
+  }
+</style>
+</head>
+<body>
+<header class="bd-head">
+  <div class="wrap">
+    <div class="bd-brand">
+      <svg class="logo" viewBox="0 0 22 22" aria-hidden="true">
+        <circle cx="5" cy="16" r="2.6" fill="none" stroke="var(--route)" stroke-width="1.8"/>
+        <path d="M7.1 14.5 14.2 8.1" stroke="var(--route)" stroke-width="1.8" stroke-linecap="round"/>
+        <circle cx="16.4" cy="6.2" r="3.4" fill="var(--route)"/>
+      </svg>
+      CapTerm 设计稿
+    </div>
+    <nav class="bd-nav" aria-label="页面目录">
+      <a href="#boards">画板</a><a href="#route">航线</a><a href="#color">颜色</a><a href="#type">字体</a><a href="#files">文件</a>
+    </nav>
+    <div class="bd-actions">
+      <a class="btn" href="README.md">设计说明</a>
+      <a class="btn primary" href="prototype/index.html">打开交互原型</a>
+      <button class="icon-btn" id="bd-theme" title="切换深色 / 浅色"><svg class="i"><use href="#i-moon"/></svg></button>
+    </div>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <div class="route hero-route" aria-label="示例航线：本机经 edge-bastion、core-gw 到 prod-api-01">
+      <span class="stop origin"><svg class="i"><use href="#i-laptop"/></svg>本机</span>
+      <span class="seg"><span class="lat">12 ms</span></span>
+      <span class="stop"><span class="node"></span><span class="host">edge-bastion<small>ops@203.0.113.40:2222</small></span></span>
+      <span class="seg"><span class="lat">9 ms</span></span>
+      <span class="stop"><span class="node"></span><span class="host">core-gw<small>jump@10.20.0.4</small></span></span>
+      <span class="seg"><span class="lat">17 ms</span></span>
+      <span class="stop target"><span class="node"></span><span class="host">prod-api-01<small>deploy@10.20.3.21</small></span></span>
+    </div>
+    <h1>每一次连接都是一条航线</h1>
+    <p>CapTerm 是用 Rust 和 gpui-kit 开发的 SSH 远程管理程序：左侧 SFTP 文件，中间是带行号和逐行时间的终端，右侧是会话和主机监控，底部是命令输入栏。品红色的航线只用来表示连接链路——从本机出发，经过跳板机，到达目标主机；界面的其余部分保持安静，把注意力留给终端。</p>
+    <div class="hero-notes">
+      <div><b>终端可追溯</b><span>每一行都有行号和写入时间，命令带退出码和耗时，空闲超过一分钟会插入间隔线。</span></div>
+      <div><b>为 TUI 和 Agent CLI 而做</b><span>备用屏幕、Kitty 键盘协议、括号粘贴、同步输出、OSC 通知；内联 TUI 的重绘区单独标记为「实时」。</span></div>
+      <div><b>深浅两套等价主题</b><span>每个颜色分别取值并校验对比度，附带可直接加载的 gpui-kit 主题文件。</span></div>
+    </div>
+  </div>
+</section>
+
+<section class="blk" id="boards">
+  <div class="wrap">
+    <h2>画板</h2>
+    <p class="lead">全部由同一个交互原型渲染导出（1440×900，2 倍图）。点击图片查看原图，点击「打开原型」进入对应场景并继续操作。</p>
+    <div class="boards" id="board-list"></div>
+  </div>
+</section>
+
+<section class="blk" id="route">
+  <div class="wrap">
+    <h2>航线的几种状态</h2>
+    <p class="lead">航线条位于每个终端标签下方。线段上是这一跳的往返延迟；空心圆环是目标主机。同一套图形也用在会话列表（迷你航线表示跳数）和会话编辑器（纵向航线，见画板 07）。</p>
+    <div class="route-states">
+      <div class="rs-row"><span class="lbl">已连接<small>两级跳板</small></span><div class="route" id="rs-ok"></div></div>
+      <div class="rs-row"><span class="lbl">连接中<small>第 3 跳等待确认主机密钥</small></span><div class="route" id="rs-pending"></div></div>
+      <div class="rs-row"><span class="lbl">失败<small>第 2 跳认证被拒绝</small></span><div class="route" id="rs-failed"></div></div>
+      <div class="rs-row"><span class="lbl">直连<small>没有跳板</small></span><div class="route" id="rs-direct"></div></div>
+      <div class="glyphs" id="glyphs"></div>
+    </div>
+  </div>
+</section>
+
+<section class="blk" id="color">
+  <div class="wrap">
+    <h2>颜色</h2>
+    <p class="lead">取值直接读取原型使用的 tokens.css。强调色只表示「可交互、已选中」，航线色只表示连接链路，状态色必须同时配图标或文字。</p>
+    <div class="bd-palette">
+      <div class="pal" data-theme="dark"><h3>夜航 · 深色<small>CapTerm Night</small></h3><div class="pal-body"></div></div>
+      <div class="pal" data-theme="light"><h3>白昼 · 浅色<small>CapTerm Day</small></h3><div class="pal-body"></div></div>
+    </div>
+  </div>
+</section>
+
+<section class="blk" id="type">
+  <div class="wrap">
+    <h2>字体</h2>
+    <p class="lead">界面使用 Noto Sans SC；终端、编辑器、路径和主机名使用 Maple Mono NF CN——中文字宽严格是英文的两倍，TUI 的边框和表格不会因为中文错位。</p>
+    <div class="type-grid">
+      <div class="type-card">
+        <h3>Noto Sans SC</h3><div class="meta">界面：标签、菜单、表单、说明文字</div>
+        <div class="scale">
+          <div><small>15 / 600</small><span style="font-size:15px;font-weight:600">编辑会话 prod-api-01</span></div>
+          <div><small>13 / 400</small><span style="font-size:13px">按顺序经过下列跳板机到达目标主机</span></div>
+          <div><small>12 / 400</small><span style="font-size:12px;color:var(--text-2)">保存在「生产环境」分组，上次连接于今天 10:41</span></div>
+          <div><small>11 / 400</small><span style="font-size:11px;color:var(--muted)">峰值 16.9 MB/s</span></div>
+          <div><small>18 / 600</small><span style="font-size:18px;font-weight:600">24%　5.1 / 7.8 GiB</span></div>
+        </div>
+      </div>
+      <div class="type-card">
+        <h3>Maple Mono NF CN</h3><div class="meta">终端、编辑器、路径、主机名、PID；关闭连字</div>
+<div class="mono-demo">╭────────────────────────────────╮
+│ 主机    prod-api-01            │
+│ 用户    deploy                 │
+│ 链路    edge-bastion → core-gw │
+╰────────────────────────────────╯
+deploy@prod-api-01:/srv/api$ ls -la</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="bd-foot" id="files">
+  <div class="wrap">
+    <div class="files">
+      <a href="README.md"><svg class="i"><use href="#i-file-text"/></svg><div><b>设计说明</b><span>布局、交互规则、跳板与导入、TUI 适配、组件对照</span></div></a>
+      <a href="theme/capterm.theme.json"><svg class="i"><use href="#i-sun-moon"/></svg><div><b>gpui-kit 主题</b><span>CapTerm Night / Day，已按 0.9 schema 校验</span></div></a>
+      <a href="theme/terminal-colors.json"><svg class="i"><use href="#i-square-terminal"/></svg><div><b>终端配色</b><span>ANSI 16 色、行号列、概览条</span></div></a>
+    </div>
+    原型中的图标来自 gpui-kit-assets 自带的 Lucide 图标集（ISC 许可）。示例中的主机、地址均为虚构，使用文档保留网段。
+  </div>
+</footer>
+
+<script>
+(function () {
+  const $ = (s) => document.querySelector(s);
+  const ic = (n, c) => `<svg class="i ${c || ''}"><use href="#i-${n}"/></svg>`;
+
+  const boards = [
+    ['01', '主界面 · 深色', '五区布局与航线条；终端每行有行号和时间，命令块带退出码与耗时，空闲间隔线、全屏程序记录；监控区展示悬停读数。', '01-workbench-dark', 'scene=workbench&theme=dark'],
+    ['02', '主界面 · 浅色 · 终端搜索', '浅色主题；搜索高亮与「5 / 16」计数，右侧概览条用琥珀色标出命中位置。', '02-workbench-light-search', 'scene=search&theme=light'],
+    ['03', 'Agent CLI', 'Claude Code 的内联 TUI：输入框所在的重绘区标为「实时」；输入栏自动切到整段粘贴；后台 Codex 标签待确认并弹出通知。', '03-agent-cli-dark', 'scene=agent&theme=dark'],
+    ['04', '全屏 TUI', 'htop 进入备用屏幕：行号列改为屏幕行号，时间列留空，输入栏收起为提示条。', '04-fullscreen-tui-light', 'scene=tui&theme=light'],
+    ['05', '文件编辑', '单击文件以斜体预览标签打开；未保存圆点；远端文件被他人修改时提示比较差异。', '05-file-editor-light', 'scene=editor&theme=light'],
+    ['06', '拖拽上传', '拖入系统文件：目标文件夹高亮、投放提示；同名冲突在传输队列内原地处理，不打断其他传输。', '06-drag-upload-dark', 'scene=upload&theme=dark'],
+    ['07', '会话编辑 · 跳板链路', '纵向航线编辑多级跳板，每一跳单独认证并显示测试结果，下方给出等效 OpenSSH 命令。', '07-session-jump-dark', 'scene=session&theme=dark'],
+    ['08', '导入 SSH 配置', '自定义配置文件路径、自动展开 Include；选择「链接并自动同步」或「复制为本地会话」，逐条预览导入结果。', '08-import-ssh-config-light', 'scene=import&theme=light'],
+    ['09', '首次连接', '逐跳建立连接，航线条显示进度；第 3 跳首次连接，展示指纹请求确认。', '09-first-connect-dark', 'scene=connect&theme=dark'],
+    ['10', '设置', '主题三选一（深色 / 浅色 / 跟随系统）、字体，以及行号与时间戳的显示规则。', '10-settings-light', 'scene=settings&theme=light'],
+    ['11', '窄窗口', '宽度小于 1200px 时右栏收成图标栏，终端保持完整宽度。', '11-compact-dark', 'scene=workbench&theme=dark', true]
+  ];
+  $('#board-list').innerHTML = boards.map(([no, title, desc, file, q, wide]) => `
+    <div class="board${wide ? ' wide' : ''}"><figure>
+      <a class="shot" href="exports/${file}.png" title="查看原图"><img src="exports/${file}.png" alt="${no} ${title}" loading="lazy"></a>
+      <figcaption><span class="no">${no}</span><h3>${title}</h3><a class="open" href="prototype/index.html?${q}">${ic('square-terminal', 'sm')}打开原型</a><p>${desc}</p></figcaption>
+    </figure></div>`).join('');
+
+  // 航线状态（与原型相同的结构与样式）
+  const stop = (name, cls, note) => `<span class="stop ${cls || ''}"><span class="node"></span>${name}${note || ''}</span>`;
+  const seg = (lat, cls) => `<span class="seg ${cls || ''}">${lat ? `<span class="lat">${lat}</span>` : ''}</span>`;
+  const origin = `<span class="stop origin">${ic('laptop')}本机</span>`;
+  $('#rs-ok').innerHTML = origin + seg('12 ms') + stop('edge-bastion') + seg('9 ms') + stop('core-gw') + seg('17 ms') + stop('prod-api-01', 'target');
+  $('#rs-pending').innerHTML = origin + seg('12 ms') + stop('edge-bastion') + seg('9 ms') + stop('core-gw') + seg('…', 'active') + stop('prod-db-01', 'target pending', `<span class="note">${ic('shield', 'xs')}等待确认主机密钥</span>`);
+  $('#rs-failed').innerHTML = origin + seg('12 ms') + stop('edge-bastion') + seg('', 'failed') + stop('core-gw', 'failed', `<span class="note danger-text">${ic('circle-x', 'xs')}认证被拒绝（publickey）</span>`) + seg('', 'pending') + stop('prod-api-01', 'target pending');
+  $('#rs-direct').innerHTML = origin + seg('6 ms') + stop('staging', 'target');
+  const mini = (n) => {
+    const w = 8 + n * 9;
+    let s = `<svg class="mini-route" width="${w + 2}" height="8" viewBox="0 0 ${w + 2} 8"><line x1="3" y1="4" x2="${3 + n * 9 - 3}" y2="4" style="stroke:var(--route)" stroke-width="1.5"/>`;
+    for (let i = 0; i < n; i++) s += `<circle cx="${3 + i * 9}" cy="4" r="2.3" style="fill:var(--route)"/>`;
+    return s + `<circle cx="${3 + n * 9}" cy="4" r="2.8" fill="none" style="stroke:var(--route)" stroke-width="1.5"/></svg>`;
+  };
+  $('#glyphs').innerHTML = `<b style="font-weight:500;color:var(--text)">会话列表中的迷你航线</b>` + [1, 2, 3].map((n) => `<span>${mini(n)}${n} 跳</span>`).join('') +
+    `<span><span class="dot connected"></span>已连接</span><span><span class="dot idle"></span>未连接</span><span><span class="dot connecting"></span>连接中</span><span><span class="dot failed"></span>失败</span>`;
+
+  // 色板：从 tokens.css 读取实际取值
+  const groups = [
+    ['表面', [['bg-app', '标题栏 / 状态栏', 'title_bar'], ['bg-panel', '面板', 'background'], ['bg-term', '终端画布', 'tab.active'], ['bg-raised', '浮层', 'popover']]],
+    ['文字与线', [['text', '主要文字', 'foreground'], ['text-2', '次要文字', ''], ['muted', '弱化文字', 'muted.foreground'], ['line', '分隔线', 'border']]],
+    ['强调与状态', [['accent', '强调', 'primary'], ['route', '航线', 'base.magenta'], ['ok', '正常', 'success'], ['caution', '注意', 'warning']]],
+    ['', [['danger', '故障', 'danger'], ['bg-sel', '选中行', 'list.active'], ['bg-hover', '悬停', 'list.hover'], ['faint', '重复时间', '']]]
+  ];
+  document.querySelectorAll('.pal').forEach((pal) => {
+    const body = pal.querySelector('.pal-body');
+    const cs = getComputedStyle(pal);
+    const hex = (v) => cs.getPropertyValue('--' + v).trim().toUpperCase();
+    body.innerHTML = groups.map(([g, items]) => `<div class="sw-group">${items.map(([v, label, key]) => `<div class="sw"><i style="background:var(--${v})"></i><b>${label}</b><code>${hex(v)}</code>${key ? `<span class="k">${key}</span>` : ''}</div>`).join('')}</div>`).join('') +
+      `<div class="sample"><span class="p-user">deploy@prod-api-01</span>:<span class="p-path">/srv/api</span>$ docker compose ps<br><span class="a1 b">ERROR</span> redis: NOAUTH　<span class="a2">Up 2 hours</span>　<span class="a3">Restarting (1)</span>
+       <div class="ansi">${Array.from({ length: 16 }, (_, i) => `<i style="background:var(--ansi-${i})" title="ANSI ${i}"></i>`).join('')}</div></div>`;
+  });
+
+  $('#bd-theme').addEventListener('click', () => {
+    const html = document.documentElement;
+    html.dataset.theme = html.dataset.theme === 'light' ? 'dark' : 'light';
+    $('#bd-theme use').setAttribute('href', html.dataset.theme === 'light' ? '#i-moon' : '#i-sun');
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,208 @@
+/* CapTerm design tokens — 夜航（深色）/ 白昼（浅色）
+ *
+ * 每个 token 都有两套取值；名称旁的注释给出对应的 gpui-kit ThemeColor 字段，
+ * 同一套值也写进了 ../theme/capterm.theme.json，供 ThemeRegistry 直接加载。
+ *
+ * 颜色分工（不要混用）：
+ *   accent  仪表青  可交互、选中、焦点、当前值
+ *   route   航线品红 只表示连接链路（跳板链），全局唯一的强调元素
+ *   ok / caution / danger  状态：已连接·正常 / 连接中·偏高 / 失败·告急，必须配图标和文字
+ */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* 表面 */
+  --bg-app: #0F1317;        /* title_bar / tab_bar / status_bar.background */
+  --bg-panel: #141920;      /* sidebar.background、background */
+  --bg-term: #0B0E12;       /* 终端与编辑器画布；tab.active.background */
+  --bg-raised: #1B2129;     /* popover.background、对话框 */
+  --bg-input: #10151B;      /* 面板内输入框 */
+  --bg-hover: #1F262E;      /* list.hover.background、accent.background */
+  --bg-press: #27303A;
+  --bg-sel: #16303B;        /* list.active.background（带强调色倾向） */
+  --bg-sel-quiet: #1A222B;  /* 失焦时的选中行 */
+
+  /* 线 */
+  --line: #232A33;          /* border */
+  --line-strong: #313B47;   /* input.border、分隔 */
+
+  /* 文字 */
+  --text: #E4E9EE;          /* foreground            14.5:1 on panel */
+  --text-2: #A2AEBB;        /* 次要文字              7.8:1 */
+  --muted: #7A8695;         /* muted.foreground      4.8:1 */
+  --faint: #5E6977;         /* 重复时间戳等弱化信息   3.2:1 */
+
+  /* 强调 */
+  --accent: #5CC8E6;        /* primary.background、ring、caret */
+  --accent-hover: #7AD3EC;
+  --accent-press: #46B4D4;
+  --accent-fg: #06222C;     /* primary.foreground    8.5:1 on accent */
+  --accent-soft: rgba(92, 200, 230, 0.14);
+  --accent-line: rgba(92, 200, 230, 0.45);
+
+  --route: #E07AE0;         /* 航线：连接链路 */
+  --route-soft: rgba(224, 122, 224, 0.14);
+
+  --ok: #4CC38A;            /* success */
+  --ok-soft: rgba(76, 195, 138, 0.14);
+  --caution: #E8B04A;       /* warning */
+  --caution-soft: rgba(232, 176, 74, 0.15);
+  --danger: #F0626A;        /* danger */
+  --danger-soft: rgba(240, 98, 106, 0.15);
+
+  /* 图表 */
+  --chart-line: #5CC8E6;    /* chart.1 */
+  --chart-area: rgba(92, 200, 230, 0.10);
+  --chart-grid: #232A33;    /* chart.grid */
+  --meter-track: rgba(92, 200, 230, 0.16);
+  --meter-track-caution: rgba(232, 176, 74, 0.18);
+  --meter-track-danger: rgba(240, 98, 106, 0.18);
+  --caution-mark: #E8B04A;
+  --danger-mark: #F0626A;
+
+  /* 浮层 */
+  --overlay: rgba(4, 7, 10, 0.62);    /* overlay */
+  --shadow-pop: 0 10px 28px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --shadow-dialog: 0 28px 80px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  --scroll-thumb: rgba(162, 174, 187, 0.22);
+  --scroll-thumb-hover: rgba(162, 174, 187, 0.38);
+  --drop-target: rgba(92, 200, 230, 0.12); /* drop_target.background */
+
+  /* 终端色板（ANSI 16 色） */
+  --term-fg: #D5DCE3;
+  --term-cursor: #5CC8E6;
+  --term-sel: rgba(92, 200, 230, 0.28);
+  --term-hit: rgba(232, 176, 74, 0.32);
+  --term-hit-cur: rgba(232, 176, 74, 0.75);
+  --ansi-0: #1B2129;  --ansi-8: #4A5664;
+  --ansi-1: #F0626A;  --ansi-9: #FF8A8F;
+  --ansi-2: #4CC38A;  --ansi-10: #7BDCA9;
+  --ansi-3: #E8B04A;  --ansi-11: #F5CC7A;
+  --ansi-4: #5B9CF0;  --ansi-12: #8AB8F7;
+  --ansi-5: #C58AF0;  --ansi-13: #DCB0F7;
+  --ansi-6: #5CC8E6;  --ansi-14: #8ADCF0;
+  --ansi-7: #C9D1D9;  --ansi-15: #F2F5F8;
+
+  /* 代码高亮（编辑器） */
+  --syn-key: #8AB8F7;
+  --syn-string: #9AD8A6;
+  --syn-number: #E8B04A;
+  --syn-comment: #6E7A88;
+  --syn-punct: #8794A2;
+  --syn-anchor: #C58AF0;
+  --editor-active-line: #121820;
+  --diff-added: #4CC38A;
+  --diff-modified: #E8B04A;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-app: #E9EDF1;
+  --bg-panel: #F3F5F8;
+  --bg-term: #FFFFFF;
+  --bg-raised: #FFFFFF;
+  --bg-input: #FFFFFF;
+  --bg-hover: #E4E9EE;
+  --bg-press: #D9E0E7;
+  --bg-sel: #D9EEF7;
+  --bg-sel-quiet: #E4E9EE;
+
+  --line: #D8DEE5;
+  --line-strong: #BCC6D0;
+
+  --text: #17202A;          /* 15.1:1 on panel */
+  --text-2: #4A5664;        /* 6.9:1 */
+  --muted: #65717F;         /* 4.6:1 */
+  --faint: #8C96A3;         /* 2.8:1，仅用于重复信息 */
+
+  --accent: #086F95;        /* 5.2:1 on panel；白字 5.7:1 */
+  --accent-hover: #0A7FAA;
+  --accent-press: #065E7F;
+  --accent-fg: #FFFFFF;
+  --accent-soft: rgba(8, 111, 149, 0.10);
+  --accent-line: rgba(8, 111, 149, 0.40);
+
+  --route: #A62C95;         /* 5.6:1 on panel */
+  --route-soft: rgba(166, 44, 149, 0.10);
+
+  --ok: #157A4B;
+  --ok-soft: rgba(21, 122, 75, 0.10);
+  --caution: #8F5C00;
+  --caution-soft: rgba(201, 133, 0, 0.14);
+  --danger: #BE2E3A;
+  --danger-soft: rgba(190, 46, 58, 0.10);
+
+  --chart-line: #086F95;
+  --chart-area: rgba(8, 111, 149, 0.10);
+  --chart-grid: #DCE2E8;
+  --meter-track: rgba(8, 111, 149, 0.14);
+  --meter-track-caution: rgba(201, 133, 0, 0.18);
+  --meter-track-danger: rgba(190, 46, 58, 0.14);
+  --caution-mark: #C98500;  /* 3.0:1，作为图形而非文字 */
+  --danger-mark: #D03B3B;
+
+  --overlay: rgba(23, 32, 42, 0.30);
+  --shadow-pop: 0 8px 24px rgba(23, 32, 42, 0.14), 0 0 0 1px rgba(23, 32, 42, 0.06);
+  --shadow-dialog: 0 24px 64px rgba(23, 32, 42, 0.22), 0 0 0 1px rgba(23, 32, 42, 0.08);
+  --scroll-thumb: rgba(74, 86, 100, 0.22);
+  --scroll-thumb-hover: rgba(74, 86, 100, 0.38);
+  --drop-target: rgba(8, 111, 149, 0.08);
+
+  --term-fg: #1D2630;
+  --term-cursor: #086F95;
+  --term-sel: rgba(8, 111, 149, 0.18);
+  --term-hit: rgba(201, 133, 0, 0.22);
+  --term-hit-cur: rgba(201, 133, 0, 0.55);
+  --ansi-0: #1D2630;  --ansi-8: #5E6A78;
+  --ansi-1: #BE2E3A;  --ansi-9: #D9434F;
+  --ansi-2: #157A4B;  --ansi-10: #1E9460;
+  --ansi-3: #8F5C00;  --ansi-11: #A86F00;
+  --ansi-4: #2257C9;  --ansi-12: #3A6FE0;
+  --ansi-5: #8E44C0;  --ansi-13: #A55BD4;
+  --ansi-6: #086F95;  --ansi-14: #0B86B3;
+  --ansi-7: #8A94A0;  --ansi-15: #B9C1CB;
+
+  --syn-key: #2257C9;
+  --syn-string: #157A4B;
+  --syn-number: #8F5C00;
+  --syn-comment: #7A8694;
+  --syn-punct: #5E6A78;
+  --syn-anchor: #8E44C0;
+  --editor-active-line: #F3F7FA;
+  --diff-added: #1E9460;
+  --diff-modified: #C98500;
+}
+
+:root {
+  /* 字体：界面 Noto Sans SC；终端/路径/主机名 Maple Mono NF CN（中文严格 2 列宽，TUI 对齐不乱） */
+  --font-ui: "Noto Sans SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  --font-mono: "Maple Mono NF CN", "Maple Mono", "Sarasa Mono SC", "Cascadia Mono", Consolas, monospace;
+
+  /* 字号（px / 行高） */
+  --fs-caption: 11px;   --lh-caption: 16px;
+  --fs-small: 12px;     --lh-small: 18px;
+  --fs-body: 13px;      --lh-body: 20px;
+  --fs-title: 15px;     --lh-title: 22px;
+  --fs-value: 18px;     --lh-value: 24px;
+  --fs-term: 13px;      --lh-term: 20px;
+
+  /* 尺寸（4px 网格） */
+  --h-titlebar: 40px;
+  --h-tabbar: 34px;
+  --h-routebar: 32px;
+  --h-statusbar: 24px;
+  --h-panehead: 34px;
+  --h-row: 26px;
+  --w-left: 272px;
+  --w-right: 296px;
+  --w-gutter-num: 46px;
+  --w-gutter-time: 64px;
+  --w-gutter-mark: 16px;
+
+  --r-sm: 4px;   /* 标签、徽标 */
+  --r-md: 6px;   /* 按钮、输入框 */
+  --r-lg: 10px;  /* 对话框、浮层 */
+}

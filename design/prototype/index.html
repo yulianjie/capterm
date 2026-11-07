@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CapTerm 交互原型</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="styles.css">
+<script src="icons.js"></script>
+<script src="data.js" defer></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="titlebar">
+    <div class="tb-left">
+      <svg class="logo" viewBox="0 0 22 22" aria-hidden="true">
+        <circle cx="5" cy="16" r="2.6" fill="none" stroke="var(--route)" stroke-width="1.8"/>
+        <path d="M7.1 14.5 14.2 8.1" stroke="var(--route)" stroke-width="1.8" stroke-linecap="round"/>
+        <circle cx="16.4" cy="6.2" r="3.4" fill="var(--route)"/>
+      </svg>
+      <span class="app-name">CapTerm</span>
+      <span class="tb-ws">默认工作区</span>
+    </div>
+    <button class="quick" id="quick" title="命令面板 (Ctrl+Shift+P)">
+      <svg class="i sm"><use href="#i-search"/></svg>
+      <span class="quick-text">搜索会话、命令，或输入 user@host 快速连接</span>
+      <span class="kbds"><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>P</kbd></span>
+    </button>
+    <div class="tb-right">
+      <button class="icon-btn" data-toggle-pane="left" aria-pressed="true" title="文件面板 (Ctrl+Shift+E)"><svg class="i"><use href="#i-panel-left"/></svg></button>
+      <button class="icon-btn" data-toggle-pane="right" aria-pressed="true" title="会话与监控面板 (Ctrl+Shift+B)"><svg class="i"><use href="#i-panel-right"/></svg></button>
+      <span class="divider-v"></span>
+      <button class="icon-btn" id="theme-toggle" title="切换深色 / 浅色主题 (Ctrl+Shift+L)"><svg class="i"><use href="#i-sun"/></svg></button>
+      <button class="icon-btn" id="open-notify" title="通知"><svg class="i"><use href="#i-bell"/></svg></button>
+      <button class="icon-btn" id="open-settings" title="设置 (Ctrl+,)"><svg class="i"><use href="#i-settings"/></svg></button>
+      <div class="win-ctl" aria-hidden="true">
+        <span><svg class="i"><use href="#i-minus"/></svg></span>
+        <span><svg class="i"><use href="#i-square"/></svg></span>
+        <span class="close"><svg class="i"><use href="#i-x"/></svg></span>
+      </div>
+    </div>
+  </header>
+
+  <div class="workspace" id="workspace">
+    <aside class="pane pane-left" id="pane-left" aria-label="远程文件"></aside>
+    <div class="splitter" data-split="left" role="separator" aria-orientation="vertical"></div>
+    <main class="center" id="center">
+      <div class="tabbar" id="tabbar" role="tablist"></div>
+      <div class="routebar" id="routebar"></div>
+      <div class="viewport" id="viewport"></div>
+      <div class="composer" id="composer"></div>
+    </main>
+    <div class="splitter" data-split="right" role="separator" aria-orientation="vertical"></div>
+    <aside class="pane pane-right" id="pane-right">
+      <section class="sessions" id="sessions" aria-label="会话"></section>
+      <div class="splitter-h" data-split="monitor" role="separator" aria-orientation="horizontal"></div>
+      <section class="monitor" id="monitor" aria-label="主机监控"></section>
+    </aside>
+    <nav class="rail" id="rail" aria-label="折叠的面板">
+      <button class="icon-btn" data-rail="sessions" title="会话"><svg class="i"><use href="#i-server"/></svg></button>
+      <button class="icon-btn" data-rail="monitor" title="主机监控"><svg class="i"><use href="#i-activity"/></svg></button>
+      <span class="sep"></span>
+      <button class="icon-btn" data-rail="import" title="导入 SSH 配置"><svg class="i"><use href="#i-import"/></svg></button>
+    </nav>
+  </div>
+
+  <footer class="statusbar" id="statusbar"></footer>
+</div>
+
+<div class="layer" id="layer"></div>
+<div class="toasts" id="toasts"></div>
+</body>
+</html>

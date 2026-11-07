@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CapTerm — Workbench design</title>
+<style>
+*{box-sizing:border-box}
+:root{color-scheme:dark;--base:#111216;--panel:#191a1f;--raised:#212229;--hover:#282a32;--line:#30313a;--ink:#ececf1;--muted:#a7a9b6;--dim:#898b9a;--accent:#b6bcf2;--tint:#292b40;--online:#b1b9e5;--warn:#d8b58d;--shadow:#0008;--folder:#aeb5cc;--mono:"Cascadia Mono",Consolas,monospace;--ui:"Segoe UI",system-ui,sans-serif}
+:root[data-theme=light]{color-scheme:light;--base:#faf9f7;--panel:#f2f1ef;--raised:#eae8e6;--hover:#e6e4e6;--line:#d8d6da;--ink:#23232c;--muted:#50515e;--dim:#626575;--accent:#4b508b;--tint:#e7e7f3;--online:#4b508b;--warn:#815726;--shadow:#25242f29;--folder:#565c85}
+body{margin:0;background:var(--base);color:var(--ink);font:13px var(--ui);height:100dvh;overflow:hidden}
+button,input,textarea{font:inherit;color:inherit}
+button{cursor:pointer;border:1px solid transparent;background:none;padding:0}
+button:hover{background:var(--hover)}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.app{height:100%;display:grid;grid-template-rows:52px minmax(0,1fr) 29px}
+.top{display:flex;align-items:center;justify-content:space-between;padding:0 16px;border-bottom:1px solid var(--line);background:var(--panel);gap:10px}
+.top>div,.inline,.actions{display:flex;align-items:center;gap:8px;min-width:0}
+.brand{display:flex;align-items:center;gap:9px;font-size:16px;font-weight:670;letter-spacing:.1px;white-space:nowrap}
+.mark{display:grid;place-items:center;background:var(--tint);color:var(--accent);font:bold 16px var(--mono);width:29px;height:29px;border-radius:7px}
+.divider{height:20px;width:1px;background:var(--line);margin:0 5px}
+.caption,.eyebrow{color:var(--dim)}
+.eyebrow{text-transform:uppercase;letter-spacing:1.15px;font-size:10px;font-weight:700}
+.btn,.tool{border-radius:6px;height:30px;padding:0 9px;white-space:nowrap}
+.btn{border-color:var(--line);display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.tool{color:var(--muted);font-family:var(--ui);min-width:30px}
+.tool[aria-pressed=true]{background:var(--tint);color:var(--accent)}
+.local-launch{position:relative;display:flex}
+.local-launch .local-main{border-radius:6px 0 0 6px}
+.local-launch .local-toggle{border-left:0;border-radius:0 6px 6px 0}
+.local-short{display:none}
+.local-menu{position:absolute;z-index:4;right:0;top:35px;min-width:160px;padding:4px;border:1px solid var(--line);border-radius:6px;background:var(--panel);box-shadow:0 8px 26px var(--shadow)}
+.local-menu button{width:100%;height:30px;padding:0 9px;border-radius:4px;text-align:left;white-space:nowrap}
+.local-empty{margin:12px;color:var(--muted)}
+.primary{background:var(--accent);color:var(--base);border-color:var(--accent);font-weight:650}
+.primary:hover{background:var(--accent);filter:brightness(.91)}
+[data-theme=light] .primary{color:white}
+.workspace{min-height:0;display:grid;grid-template-columns:276px minmax(0,1fr) 244px;position:relative}
+aside{background:var(--panel);min-height:0;min-width:0;display:flex;flex-direction:column}
+.files{border-right:1px solid var(--line)}
+.sessions{border-left:1px solid var(--line)}
+.pane-head{height:48px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 12px 0 15px;border-bottom:1px solid var(--line);gap:6px}
+.pane-head strong{font-size:13px;font-weight:650}
+.badge{border:1px solid var(--line);border-radius:4px;padding:2px 5px;font:10px var(--mono);color:var(--muted)}
+.path{display:flex;align-items:center;margin:12px 11px 9px;height:33px;gap:5px;border:1px solid var(--line);border-radius:6px;background:var(--base);white-space:nowrap;overflow:hidden;padding-right:7px;font:11px var(--mono)}
+.path button{height:100%;width:29px;border-right:1px solid var(--line);color:var(--accent)}
+.file-table{width:100%;border-collapse:collapse;text-align:left;table-layout:fixed}
+.file-table th{padding:0 11px 7px;font-size:10px;letter-spacing:.7px;text-transform:uppercase;font-weight:600;color:var(--dim);border-bottom:1px solid var(--line)}
+.file-table td:last-child,.file-table th:last-child{text-align:right;width:64px}
+.file-table td:last-child{padding-right:11px;color:var(--muted);font:11px var(--mono)}
+.file-table tbody tr:hover,.file-table tbody tr:has(:focus-visible){background:var(--hover)}
+.file-table tbody tr.selected{background:var(--tint)}
+.file-table button{display:flex;align-items:center;gap:8px;width:100%;height:32px;text-align:left;white-space:nowrap;padding:0 10px;color:var(--ink)}
+.file-table button:hover{background:none}
+.file-icon{width:15px;text-align:center;color:var(--folder)}
+.files-scroll{overflow:auto;flex:1}
+.dropzone{margin:11px;border:1px dashed var(--line);border-radius:7px;padding:12px 9px;text-align:center;color:var(--muted);font-size:11px}
+.dropzone strong{display:block;color:var(--accent);margin-bottom:3px;font-size:12px}
+.dropzone.hover{background:var(--tint);border-color:var(--accent)}
+.middle{display:grid;grid-template-rows:41px 43px minmax(0,1fr) 61px;min-width:0;min-height:0}
+.tab-strip{display:flex;min-width:0;background:var(--panel)}
+.tabs{display:flex;align-items:stretch;gap:0;background:var(--panel);border-bottom:1px solid var(--line);padding:0 7px;overflow:auto}
+.tab-strip .tabs{flex:1;min-width:0}
+#compact-launch{display:none;align-items:center;padding-right:7px;border-bottom:1px solid var(--line)}
+.tab{display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:2px solid transparent;white-space:nowrap;color:var(--muted)}
+.tab[aria-selected=true]{background:var(--base);color:var(--ink);border-bottom-color:var(--accent)}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;background:var(--dim);flex:none}
+.dot.online{background:var(--online)}
+.context{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:0 12px;border-bottom:1px solid var(--line);min-width:0}
+.context .route{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:12px var(--mono)}
+.context .route span{color:var(--muted)}
+.surface{min-height:0;min-width:0;position:relative;overflow:auto}
+.terminal{min-width:max-content;padding:13px 0 0;font:13px/22px var(--mono)}
+.logline{display:grid;grid-template-columns:51px 72px minmax(0,1fr);min-height:22px}
+.logline .num,.logline time{background:var(--panel);color:var(--dim);font-size:11px;user-select:none}
+.logline .num{text-align:right;padding-right:12px}
+.logline time{border-right:1px solid var(--line)}
+.logline .output{padding:0 14px;white-space:pre}
+.logline.meta-off{grid-template-columns:minmax(0,1fr)}
+.logline.meta-off .num,.logline.meta-off time{display:none}
+.term-title{color:var(--accent);font-weight:700}
+.prompt{color:var(--online);font-weight:650}
+.term-warn{color:var(--warn)}
+.cursor{display:inline-block;width:8px;height:15px;background:var(--accent);vertical-align:-2px}
+.tui{padding:17px 18px;color:var(--ink);white-space:pre;font:13px/22px var(--mono)}
+.compose{display:flex;align-items:center;gap:8px;padding:0 12px;border-top:1px solid var(--line);background:var(--panel)}
+.compose label{font:13px var(--mono);color:var(--accent);padding-right:1px}
+input,textarea{background:var(--base);border:1px solid var(--line);border-radius:6px;padding:8px 10px;min-width:0}
+input::placeholder,textarea::placeholder{color:var(--dim)}
+.compose input{flex:1;font:12px var(--mono)}
+.monitor{border-top:1px solid var(--line);background:var(--panel);padding:8px 9px;min-width:0;min-height:116px;flex:none}
+.monitor-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px}
+.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.metric{padding:5px 8px 6px;border:1px solid var(--line);border-radius:6px;background:var(--base);min-width:0}
+.metric header{display:flex;justify-content:space-between;gap:4px;white-space:nowrap;font:11px var(--mono)}
+.metric header span{color:var(--muted)}
+.metric b{font-weight:600}
+.meter{height:3px;background:var(--line);border-radius:2px;margin-top:6px;overflow:hidden}
+.meter i{display:block;height:100%;width:var(--value);background:var(--accent)}
+.session-body{flex:1;overflow:auto;padding:11px 9px}
+.search{height:32px;width:100%;margin-bottom:16px}
+.group{margin:5px 6px 5px}
+.session{display:grid;grid-template-columns:8px minmax(0,1fr) 27px;align-items:center;gap:8px;padding:7px 5px 7px 8px;min-height:55px;border:1px solid transparent;border-radius:6px}
+.session.selected{background:var(--tint);border-color:var(--line)}
+.session:hover{background:var(--hover)}
+.session .name{text-align:left;min-width:0;line-height:17px;font-weight:650}
+.session .name:hover{background:none}
+.session .name small{display:block;color:var(--muted);font:10px/15px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.test{border-radius:5px;width:26px;height:26px;color:var(--accent);font-size:16px}
+.sessions footer{padding:10px 9px;border-top:1px solid var(--line)}
+.sessions footer .btn{width:100%}
+.status{display:flex;align-items:center;justify-content:space-between;gap:8px;background:var(--panel);border-top:1px solid var(--line);padding:0 13px;color:var(--muted);font:11px var(--mono);overflow:hidden;white-space:nowrap}
+.status strong{color:var(--online);font-weight:500}
+.files-toggle,.sessions-toggle{display:none!important}
+dialog{width:min(470px,calc(100vw - 24px));background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:11px;padding:0;box-shadow:0 18px 65px var(--shadow)}
+dialog::backdrop{background:#0c0c12a0}
+.dialog-body{display:grid;gap:12px;padding:15px}
+.dialog-body label{display:grid;gap:4px;color:var(--muted)}
+.dialog-actions{display:flex;justify-content:flex-end;gap:8px;padding:11px 15px;border-top:1px solid var(--line)}
+#editor{width:min(760px,calc(100vw - 24px))}
+#editor textarea{width:100%;min-height:250px;resize:vertical;font:13px/21px var(--mono)}
+[hidden]{display:none!important}
+@media(max-width:1099px){.workspace{grid-template-columns:240px minmax(0,1fr)}.sessions{display:none;position:absolute;right:0;top:0;bottom:0;width:244px;z-index:2;box-shadow:0 0 30px var(--shadow)}.sessions.open{display:flex}.sessions-toggle{display:inline-flex!important}}
+@media(max-width:759px){.workspace{grid-template-columns:minmax(0,1fr)}.files{display:none;position:absolute;left:0;top:0;bottom:0;width:min(276px,85vw);z-index:2;box-shadow:0 0 30px var(--shadow)}.files.open{display:flex}.files-toggle{display:inline-flex!important}.top{padding:0 8px}.top .caption,.top .divider,.status .aux{display:none}.middle{grid-template-rows:41px 43px minmax(0,1fr) 55px}.logline{grid-template-columns:36px 60px minmax(0,1fr)}.logline .num{padding-right:6px}.logline .output{padding-left:9px}}
+@media(max-width:759px){.local-short{display:inline}.local-long{display:none}#compact-launch{display:flex}}
+</style>
+</head>
+<body>
+<div class="app">
+<header class="top"><div><div class="brand"><span class="mark">›_</span>CapTerm</div><span class="divider"></span><span class="caption">SSH Workbench</span></div><div>
+<button class="btn files-toggle" data-pane="files">Files</button><button class="btn sessions-toggle" data-pane="sessions">Sessions</button>
+<button class="tool" id="theme" aria-label="Toggle light and dark theme">☼</button>
+<span id="top-launch"><span class="local-launch" id="local-launch"><button class="btn local-main" id="local-default" aria-label="Open local PowerShell"><span class="local-long">＋ Local shell</span><span class="local-short">Local</span></button><button class="btn local-toggle" id="local-toggle" aria-label="Choose local shell" aria-controls="local-menu" aria-expanded="false">▾</button>
+<span class="local-menu" id="local-menu" hidden><button data-shell="PowerShell">PowerShell</button><button data-shell="Command Prompt">Command Prompt</button><button data-shell="WSL">WSL</button></span></span></span>
+<button class="btn primary" data-dialog="new">＋ New session</button></div></header>
+<div class="workspace">
+<aside class="files" id="files"><div class="pane-head"><div class="inline"><strong>Remote files</strong><span class="badge">SFTP</span></div><div class="actions"><button class="tool" id="refresh" aria-label="Refresh files">↻</button><button class="tool" id="upload" aria-label="Upload file">↑</button></div></div>
+<div class="path"><button id="parent" aria-label="Parent folder">↑</button><span id="file-path">/srv/api/current</span></div>
+<div class="files-scroll"><table class="file-table"><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody id="file-list">
+<tr><td><button data-folder="config"><span class="file-icon">▱</span>config</button></td><td>—</td></tr>
+<tr><td><button data-folder="logs"><span class="file-icon">▱</span>logs</button></td><td>—</td></tr>
+<tr><td><button data-folder="scripts"><span class="file-icon">▱</span>scripts</button></td><td>—</td></tr>
+<tr><td><button data-folder="src"><span class="file-icon">▱</span>src</button></td><td>—</td></tr>
+<tr class="selected"><td><button data-file="compose.yaml" draggable="true"><span class="file-icon">▤</span>compose.yaml</button></td><td>1.6 KB</td></tr>
+<tr><td><button data-file="README.md" draggable="true"><span class="file-icon">▤</span>README.md</button></td><td>3.4 KB</td></tr>
+<tr><td><button data-file="Cargo.toml" draggable="true"><span class="file-icon">▤</span>Cargo.toml</button></td><td>0.9 KB</td></tr>
+</tbody></table></div>
+<p class="local-empty" id="local-files" hidden>SFTP is available for SSH sessions.</p>
+<button class="dropzone" id="drop"><strong>↑ Drop files to upload</strong>Drag files directly to Explorer to download</button><input hidden type="file" id="pick" multiple>
+</aside>
+<main class="middle"><div class="tab-strip"><div class="tabs" role="tablist" aria-label="Open sessions"><button class="tab" role="tab" aria-selected="true" data-host="prod-api-01"><span class="dot online"></span>prod-api-01</button><button class="tab" role="tab" aria-selected="false" data-host="staging"><span class="dot"></span>staging</button><button class="tool" id="new-tab" data-dialog="new" aria-label="New session tab">＋</button></div><div id="compact-launch"></div></div>
+<div class="context"><div class="route" id="route">deploy@prod-api-01 <span>via edge-bastion</span></div><div class="actions"><button class="tool" id="meta" aria-pressed="true" aria-label="Toggle line numbers and timestamps"># Time</button><button class="tool" id="mode" aria-pressed="false">TUI</button></div></div>
+<div class="surface" tabindex="0" aria-label="Terminal viewport"><div class="terminal" id="terminal"></div><div hidden class="tui" id="tui"><span class="term-title">╭─ Agent CLI ─────────────────────────────────────╮</span>
+│ Working directory  /srv/api/current             │
+│                                                  │
+│ › Inspect service health                         │
+│                                                  │
+│   ✓ Read compose.yaml                            │
+│   ▸ Run docker compose ps                        │
+│                                                  │
+│ <span class="prompt">›</span> <span class="cursor"></span>                                              │
+<span class="term-title">╰──────────────────────────────────────────────────╯</span></div></div>
+<form class="compose" id="compose"><label for="command">›_</label><input id="command" aria-label="Send a command" placeholder="Send a command to this session…" autocomplete="off"><button class="btn primary">Send ↵</button></form></main>
+<aside class="sessions" id="sessions"><div class="pane-head"><strong>Saved sessions</strong><button class="tool" data-dialog="new" aria-label="Add saved session">＋</button></div>
+<div class="session-body"><input id="search" class="search" type="search" placeholder="Filter sessions…" aria-label="Filter sessions"><div class="group eyebrow">Production</div>
+<div class="session selected"><span class="dot online"></span><button class="name" data-host="prod-api-01">prod-api-01<small>deploy · via edge-bastion</small></button><button class="test" aria-label="Test prod-api-01">⌁</button></div>
+<div class="session"><span class="dot"></span><button class="name" data-host="edge-bastion">edge-bastion<small>ops · 203.0.113.40</small></button><button class="test" aria-label="Test edge-bastion">⌁</button></div>
+<div class="group eyebrow">Development</div>
+<div class="session"><span class="dot"></span><button class="name" data-host="staging">staging<small>deploy · 192.0.2.48</small></button><button class="test" aria-label="Test staging">⌁</button></div>
+<div class="session"><span class="dot"></span><button class="name" data-host="build-box">build-box<small>builder · 192.0.2.76</small></button><button class="test" aria-label="Test build-box">⌁</button></div></div>
+<footer><button class="btn" data-dialog="import">↓ Import SSH config</button></footer>
+<section class="monitor" aria-label="Remote host monitoring"><div class="monitor-head"><span class="eyebrow">Host monitor</span><span class="caption" id="sample">Linux · 5s ago</span></div><p class="caption" id="local-monitor" hidden>Host monitoring is available for SSH sessions.</p><div class="metrics">
+<div class="metric"><header><span>CPU</span><b>24%</b></header><div class="meter"><i style="--value:24%"></i></div></div>
+<div class="metric"><header><span>RAM</span><b>5.1 / 8 GB</b></header><div class="meter"><i style="--value:64%"></i></div></div>
+<div class="metric"><header><span>Disk</span><b>62%</b></header><div class="meter"><i style="--value:62%"></i></div></div>
+<div class="metric"><header><span>RTT</span><b>38 ms</b></header><div class="meter"><i style="--value:20%"></i></div></div>
+</div></section></aside>
+</div>
+<footer class="status"><div class="inline"><span class="dot online"></span><strong id="status">Connected</strong><span class="aux" id="status-detail">· SSH 2 · xterm-256color · UTF-8</span></div><span class="aux">Design preview · Sample session</span><span>CapTerm</span></footer>
+</div>
+<dialog id="new"><form method="dialog"><div class="pane-head"><strong>New SSH session</strong><button class="tool" aria-label="Close">×</button></div><div class="dialog-body"><label>Display name<input placeholder="prod-api-01"></label><label>Host or SSH config alias<input placeholder="host.example.com" required></label><label>User<input placeholder="deploy"></label><label>Port<input type="number" value="22" min="1" max="65535"></label><label>Jump host<input placeholder="ops@edge-bastion"></label><label>Identity file<input placeholder="~/.ssh/id_ed25519"></label></div><div class="dialog-actions"><button class="btn" formnovalidate value="cancel">Cancel</button><button class="btn primary" value="save">Save session</button></div></form></dialog>
+<dialog id="import"><form method="dialog"><div class="pane-head"><strong>Import SSH config</strong><button class="tool" aria-label="Close">×</button></div><div class="dialog-body"><label>OpenSSH config path<input value="~/.ssh/config"></label><span class="caption">Named hosts and their jump routes will appear in Saved sessions.</span></div><div class="dialog-actions"><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="import">Import sessions</button></div></form></dialog>
+<dialog id="editor"><form method="dialog"><div class="pane-head"><div class="inline"><strong id="edit-title">compose.yaml</strong><span class="badge">UTF-8</span></div><button class="tool" aria-label="Close">×</button></div><div class="dialog-body"><span class="caption" id="edit-path">/srv/api/current/compose.yaml</span><textarea aria-label="Remote text file" spellcheck="false"></textarea></div><div class="dialog-actions"><button class="btn" value="download">Download</button><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="save">Save to host</button></div></form></dialog>
+<script>
+const $=id=>document.getElementById(id);
+const lines=[
+ ['10:42:08','SSH connection established · via edge-bastion','term-title'],
+ ['10:42:08','Welcome to Ubuntu 24.04.2 LTS'],
+ ['10:42:08','Last login: Sat Nov  7 10:31:52 2026 from 10.0.4.21'],
+ ['',''],
+ ['10:42:12','deploy@prod-api-01:/srv/api/current$ docker compose ps','prompt'],
+ ['10:42:12','NAME              IMAGE              SERVICE    STATUS'],
+ ['10:42:12','api-1             capterm/api:1.8    api        Up 2 hours'],
+ ['10:42:12','redis-1           redis:7-alpine     redis      Up 2 hours'],
+ ['',''],
+ ['10:42:18','deploy@prod-api-01:/srv/api/current$ git status --short','prompt'],
+ ['10:42:18',' M compose.yaml','term-warn'],
+ ['',''],
+ ['10:42:22','deploy@prod-api-01:/srv/api/current$ tail -n 3 logs/api.log','prompt'],
+ ['10:42:22','INFO  health probe passed   route=/healthz'],
+ ['10:42:22','INFO  request completed     status=200 duration=14ms'],
+ ['10:42:22','INFO  workers ready         count=4'],
+ ['',''],
+ ['10:42:25','deploy@prod-api-01:/srv/api/current$ ','prompt']];
+let meta=true, active='prod-api-01', nextShell=0;
+const localTabs=new Map();
+const prompts={PowerShell:'PS C:\\Users\\jack> ','Command Prompt':'C:\\Users\\jack> ',WSL:'jack@ubuntu:~$ '};
+const currentLines=()=>localTabs.get(active)?.lines||lines;
+function draw(){
+ $('terminal').replaceChildren();
+ const entries=currentLines();
+ entries.forEach(([time,msg,kind],i)=>{
+  const row=document.createElement('div');row.className='logline'+(meta?'':' meta-off');
+  const num=document.createElement('span');num.className='num';num.textContent=time?String(i+1).padStart(3,'0'):'';
+  const stamp=document.createElement('time');stamp.textContent=time;
+  const content=document.createElement('span');content.className='output '+(kind||'');content.textContent=msg.replace('prod-api-01',active);
+  if(i===entries.length-1){const cursor=document.createElement('i');cursor.className='cursor';content.append(cursor);}
+  row.append(num,stamp,content);$('terminal').append(row);
+ });
+}
+draw();
+$('theme').onclick=()=>{const light=document.documentElement.dataset.theme==='light';document.documentElement.dataset.theme=light?'dark':'light';$('theme').textContent=light?'☼':'☾';};
+$('meta').onclick=()=>{meta=!meta;$('meta').setAttribute('aria-pressed',meta);draw();};
+$('mode').onclick=()=>{const show=$('tui').hidden;$('tui').hidden=!show;$('terminal').hidden=show;$('mode').setAttribute('aria-pressed',show);$('meta').disabled=show;$('command').disabled=show;$('compose').querySelector('button').disabled=show;$('command').placeholder=show?'Keyboard goes directly to the terminal…':'Send a command to this session…';};
+document.querySelectorAll('[data-pane]').forEach(btn=>btn.onclick=()=>{const target=$(btn.dataset.pane);document.querySelectorAll('aside.open').forEach(p=>{if(p!==target)p.classList.remove('open');});target.classList.toggle('open');});
+document.querySelectorAll('[data-dialog]').forEach(btn=>btn.onclick=()=>$(btn.dataset.dialog).showModal());
+for(const id of ['new','import','editor']) $(id).querySelector('.pane-head button').setAttribute('formnovalidate','');
+function selectSession(host){
+ active=host;
+ const local=localTabs.get(active);
+ document.querySelectorAll('.tab[role=tab]').forEach(tab=>tab.setAttribute('aria-selected',tab.dataset.host===active));
+ document.querySelectorAll('.session').forEach(row=>row.classList.toggle('selected',row.querySelector('[data-host]').dataset.host===active));
+ $('route').textContent=local?'Local · '+local.shell:active==='prod-api-01'?'deploy@prod-api-01 via edge-bastion':active;
+ $('status').textContent=local?'Local':'Connected';
+ $('status-detail').textContent=local?'· '+local.shell+' · UTF-8':'· SSH 2 · xterm-256color · UTF-8';
+ document.querySelectorAll('.path,.files-scroll,.dropzone,.metrics,#sample').forEach(el=>el.hidden=!!local);
+ for(const id of ['local-files','local-monitor']) $(id).hidden=!local;
+ for(const id of ['upload','refresh']) $(id).disabled=!!local;
+ $('sessions').classList.remove('open');draw();
+}
+document.querySelectorAll('[data-host]').forEach(btn=>btn.onclick=()=>selectSession(btn.dataset.host));
+function showShellMenu(open){
+ $('local-menu').hidden=!open;$('local-toggle').setAttribute('aria-expanded',open);
+}
+function openLocal(shell){
+ const id='local-'+(++nextShell);
+ localTabs.set(id,{shell,lines:[['10:42:28',prompts[shell],'prompt']]});
+ const tab=document.createElement('button'), dot=document.createElement('span');
+ tab.className='tab';tab.setAttribute('role','tab');tab.dataset.host=id;dot.className='dot online';
+ tab.append(dot,shell);tab.onclick=()=>selectSession(id);$('new-tab').before(tab);
+ showShellMenu(false);selectSession(id);
+}
+$('local-default').onclick=()=>openLocal('PowerShell');
+$('local-toggle').onclick=()=>showShellMenu($('local-menu').hidden);
+document.querySelectorAll('[data-shell]').forEach(btn=>btn.onclick=()=>openLocal(btn.dataset.shell));
+document.addEventListener('click',event=>{if(!event.target.closest('.local-launch'))showShellMenu(false);});
+document.addEventListener('keydown',event=>{if(event.key==='Escape')showShellMenu(false);});
+const compact=matchMedia('(max-width:759px)');
+function placeLauncher(){showShellMenu(false);$(compact.matches?'compact-launch':'top-launch').append($('local-launch'));}
+compact.addEventListener('change',placeLauncher);
+placeLauncher();
+document.querySelectorAll('.test').forEach(btn=>btn.onclick=()=>{$('status').textContent='Sample test passed · '+btn.parentElement.querySelector('[data-host]').dataset.host;});
+$('search').oninput=()=>document.querySelectorAll('.session').forEach(row=>row.hidden=!row.textContent.toLowerCase().includes($('search').value.toLowerCase()));
+document.querySelectorAll('[data-folder]').forEach(btn=>btn.onclick=()=>{$('file-path').textContent+='/'+btn.dataset.folder;});
+$('parent').onclick=()=>{$('file-path').textContent=$('file-path').textContent.split('/').slice(0,-1).join('/')||'/';};
+$('refresh').onclick=()=>{$('status').textContent='Sample directory refreshed';};
+document.querySelectorAll('[data-file]').forEach(btn=>{
+ btn.onclick=()=>{document.querySelectorAll('.file-table tr').forEach(row=>row.classList.toggle('selected',row===btn.closest('tr')));$('edit-title').textContent=btn.dataset.file;$('edit-path').textContent=$('file-path').textContent+'/'+btn.dataset.file;$('editor').querySelector('textarea').value=btn.dataset.file==='compose.yaml'?'services:\n  api:\n    image: capterm/api:1.8\n    ports:\n      - "8080:8080"\n  redis:\n    image: redis:7-alpine':'# '+btn.dataset.file;$('editor').showModal();};
+ btn.ondragstart=e=>e.dataTransfer.setData('text/plain',$('file-path').textContent+'/'+btn.dataset.file);
+});
+for(const id of ['upload','drop']) $(id).onclick=()=>$('pick').click();
+$('drop').ondragover=e=>{e.preventDefault();$('drop').classList.add('hover');};
+$('drop').ondragleave=()=>$('drop').classList.remove('hover');
+$('drop').ondrop=e=>{e.preventDefault();$('drop').classList.remove('hover');$('status').textContent=e.dataTransfer.files.length+' sample files queued';};
+$('pick').onchange=()=>{$('status').textContent=$('pick').files.length+' sample files queued';};
+$('compose').onsubmit=e=>{e.preventDefault();const command=$('command').value.trim();if(!command)return;const time=new Date().toTimeString().slice(0,8);currentLines().splice(-1,0,[time,'› '+command,'prompt'],[time,'[Design preview · command not sent]']);$('command').value='';draw();$('terminal').parentElement.scrollTop=$('terminal').scrollHeight;};
+</script>
+</body>
+</html>

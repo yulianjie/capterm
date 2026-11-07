@@ -1,0 +1,49 @@
+[package]
+name = "capterm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Native SSH and local terminal workbench with SFTP and host monitoring"
+
+[dependencies]
+alacritty_terminal = "=0.26.0"
+anyhow = "1"
+async-channel = "2"
+chrono = "0.4"
+dirs = "6"
+glob = "0.3"
+gpui-kit = "=0.9.0"
+russh = { version = "=0.65.1", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh-sftp = "=3.0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+portable-pty = "=0.9.0"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Com_Marshal",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
