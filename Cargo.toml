@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native SSH and local terminal workbench with SFTP and host monitoring"
+license = "Apache-2.0"
 
 [dependencies]
 alacritty_terminal = "=0.26.0"

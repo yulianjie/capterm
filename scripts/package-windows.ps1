@@ -84,9 +84,11 @@ try {
     Copy-Item -LiteralPath $executablePath -Destination (Join-Path $payload 'capterm.exe')
 
     $licenses = [ordered] @{
+        'LICENSE' = 'CapTerm-Apache-2.0.txt'
         'assets/windows/conpty/LICENSE' = 'Microsoft-ConPTY-MIT.txt'
         'assets/fonts/MapleMono-OFL.txt' = 'Maple-Mono-OFL.txt'
         'assets/fonts/NotoSansSC-OFL.txt' = 'Noto-Sans-SC-OFL.txt'
+        'assets/licenses/Lucide-Feather.txt' = 'Lucide-Feather.txt'
     }
     foreach ($license in $licenses.GetEnumerator()) {
         Copy-Item -LiteralPath (Join-Path $repoRoot $license.Key) -Destination (Join-Path $licenseDirectory $license.Value)

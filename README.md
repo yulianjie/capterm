@@ -1,46 +1,66 @@
 # CapTerm
 
-CapTerm 是用 Rust 和 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构建的 SSH 工作台。左侧管理 SFTP 文件与传输，中间运行终端和远程编辑器，右侧管理会话并监控当前主机。夜航和白昼主题共用同一布局，用品红标记 SSH 航线、用青色标记交互。
+**简体中文** · [English](README.en.md)
 
-[设计说明、交互原型和导出画板](design/README.md) · [Linux 终端输出高亮规则](docs/linux-highlights.md)
+CapTerm 是用 Rust 和 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构建的原生 SSH 工作台。你可以在一个窗口里操作终端、浏览 SFTP 文件、编辑远程文本并查看主机状态。Windows 上也可以在同一标签栏中打开 PowerShell、命令提示符和 WSL。
+
+[下载 Windows x64 版](https://github.com/yulianjie/capterm/releases/latest) · [快速开始](#快速开始) · [构建与发布](#构建与发布)
+
+![CapTerm 深色工作台，左侧显示 SFTP 文件，中间是 SSH 终端，右侧显示会话与主机监控](docs/screenshots/ssh-workbench.jpg)
+
+## 功能
+
+- **SSH 会话与跳板**。保存、分组和搜索会话，或直接用 `user@host[:port]` 连接。航线逐跳显示握手与认证状态。支持多级跳板复用、连接测试、网络代理，以及本地、远程和动态 TCP 转发。
+- **OpenSSH 配置**。逐项预览导入结果，将配置文件链接为可同步的会话，或复制为本地会话。预览会列出跳过的配置和不适用的选项。本地会话可导出为 OpenSSH 配置片段。
+- **终端与发送栏**。滚动历史带逻辑行号、时间戳和命令块，支持文本和正则表达式搜索，可选择区分大小写。发送栏支持逐行执行、整段粘贴、会话历史和可复用的命令片段。运行 vim、htop 等全屏程序时，终端切换到备用屏幕布局。识别到 Codex、Claude Code 等 Agent CLI 时，发送栏默认使用整段粘贴。
+- **SFTP 与远程编辑**。让文件面板跟随终端当前目录，拖入文件上传，或把远程文件拖到 Windows 资源管理器。传输队列显示进度与冲突。单击远程文本可在标签中预览和编辑，保存时检查远端版本。遇到冲突时可查看差异或重新加载。覆盖保存需要服务端支持 OpenSSH 的 `posix-rename@openssh.com` 扩展。
+- **主机监控与布局**。通过当前 SSH 连接查看 CPU、内存、磁盘、网络、负载和进程，无需在服务器安装采集程序。可用指标随远端系统而异。工作台提供深色和浅色主题、可收起的侧栏和专注模式。
+
+![CapTerm 浅色远程编辑器，左侧是 SFTP 文件列表，右侧是进程监控](docs/screenshots/remote-editor.jpg)
+
+截图来自实际运行的 CapTerm，使用本机隔离的 SSH 演示环境。终端输出、远程文件和监控数据均为示例。更多场景见[设计说明和交互原型](design/README.md)。SSH 与 WSL 的终端文本高亮可通过 [Linux 高亮规则](docs/linux-highlights.md)自定义。
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/yulianjie/capterm/releases) 下载 Windows x64 版本。运行 `*-setup.exe` 可为当前用户安装并创建开始菜单快捷方式。也可以解压 `*-portable.zip` 后直接运行 `capterm.exe`。同页提供 `SHA256SUMS.txt`，可用 `Get-FileHash -Algorithm SHA256` 核对下载文件。
+从 [GitHub Releases](https://github.com/yulianjie/capterm/releases/latest) 获取 Windows x64 版。
 
-## 构建和运行
+| 文件 | 用法 |
+| --- | --- |
+| `*-setup.exe` | 为当前用户安装，并创建开始菜单快捷方式。 |
+| `*-portable.zip` | 解压后直接运行 `capterm.exe`。 |
+| `SHA256SUMS.txt` | 可用 `Get-FileHash -Algorithm SHA256` 计算下载文件的哈希值并核对。 |
 
-Windows x64 使用 Rust 1.95 或更高版本的 MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK。
+## 快速开始
+
+1. 按 `Ctrl+Shift+P` 打开命令面板，输入 `user@host[:port]` 连接。也可以双击右侧已保存的会话，或从面板导入 OpenSSH 配置。
+2. 首次连接时，核对主机密钥指纹，再选择仅本次信任或保存到 CapTerm 的独立 `known_hosts`。替换已保存的密钥需要输入对应主机名。
+3. 连接后在终端运行命令，或从左侧 SFTP 面板打开远程文本。按 `Ctrl+Shift+F` 搜索终端输出，按 `Ctrl+Shift+Enter` 切换专注模式。
+
+密码用于目标主机认证，跳板使用私钥或 SSH Agent。加密私钥可先加载到本机 SSH Agent。
+
+## 构建与发布
+
+在 Windows x64 上构建需要 Rust 1.95 或更高版本的 MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK。
 
 ```powershell
 cargo run --locked
 cargo test --locked
 ```
 
-要在本地打包，先安装 Inno Setup 6.3 或以上的 6.x 版本，再用 PowerShell 7 运行以下命令。将 `-Version` 的值设为 `Cargo.toml` 中的版本号，产物位于 `dist/`。
+本地打包需要 Inno Setup 6.3 或更高的 6.x 版本和 PowerShell 7。将 `-Version` 设为 `Cargo.toml` 中的版本号，生成的文件位于 `dist/`。
 
 ```powershell
 cargo build --release --locked
 ./scripts/package-windows.ps1 -Version 0.1.0 -Executable target/release/capterm.exe
 ```
 
-## 自动出包
-
-[Windows build and release](https://github.com/yulianjie/capterm/actions/workflows/windows.yml) 会在推送到 `main`、提交面向 `main` 的 PR 或手动运行时检查格式、运行测试，并验证便携包及安装、卸载流程。
-
-发布新版本时，更新 `Cargo.toml` 中的版本号和 `Cargo.lock`，将提交推送到 `main`，再推送同版本的 `vX.Y.Z` 标签。工作流验证标签与项目版本一致后，自动将安装版、便携版和校验文件直接发布到 **Releases**。
+[Windows build and release](https://github.com/yulianjie/capterm/actions/workflows/windows.yml) 在推送到 `main`、面向 `main` 的 PR 和手动运行时检查格式、运行测试，并验证便携包及安装和卸载流程。发布时更新 `Cargo.toml` 和 `Cargo.lock` 中的版本号，把提交推送到 `main`，再推送对应的 `vX.Y.Z` 标签。工作流核对标签与项目版本后，将安装版、便携版和校验文件发布到 GitHub Releases。
 
 ```powershell
 git tag -a v0.1.0 -m "CapTerm v0.1.0"
 git push origin v0.1.0
 ```
 
-## 使用
+## 许可证
 
-- **会话与跳板**。双击保存的会话即可连接，也可按 `Ctrl+Shift+P` 输入 `user@host[:port]` 快速连接。航线逐跳显示握手和认证状态。会话支持跳板排序与复用、连接测试、网络代理以及本地、远程和动态 TCP 转发。
-- **SSH 配置**。选择配置文件后逐项预览，再链接并同步或复制为本地会话。预览会标明跳过的配置和不适用的选项。本地会话可以导出 OpenSSH 配置片段。首次遇到主机密钥时，可仅本次信任或保存密钥。替换已有密钥需要输入对应主机名。
-- **终端与发送栏**。直接操作远程 PTY，或在发送栏编辑后逐行执行、整段粘贴。已保存会话的发送历史随本机设置保存。终端显示逻辑行号、写入时间和命令块，备用屏幕改用屏幕行号。按 `Ctrl+Shift+F` 搜索输出。Windows 仍可通过新标签菜单打开 PowerShell、cmd 或 WSL。
-- **远程文件**。单击文本文件打开预览，开始编辑后固定标签。保存前检查远端版本，可比较差异或重新加载。覆盖保存需要服务端支持 OpenSSH 的原子重命名扩展。上传与下载在传输队列显示进度和冲突，Windows 支持把远程文件拖到资源管理器。
-- **监控与布局**。监控通过现有 SSH 连接采集目标主机的 CPU、内存、磁盘、网络、负载和进程。宽度低于 1200 px 时右侧缩为图标栏，低于 900 px 时左侧也收起。按 `Ctrl+Shift+Enter` 切换专注模式。
-
-应用使用独立的 `known_hosts`。密码用于目标主机认证，跳板使用私钥或 SSH Agent。可将加密私钥先加载到本机 SSH Agent。
+CapTerm 使用 [Apache License 2.0](LICENSE)。随应用分发的 [Microsoft ConPTY 和 OpenConsole](assets/windows/conpty/LICENSE) 使用 MIT 许可证。[Maple Mono NF CN](assets/fonts/MapleMono-OFL.txt) 和 [Noto Sans SC](assets/fonts/NotoSansSC-OFL.txt) 使用 SIL Open Font License 1.1。图标的许可见 [Lucide 和 Feather 声明](assets/licenses/Lucide-Feather.txt)。
