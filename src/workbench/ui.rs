@@ -893,7 +893,7 @@ impl Workbench {
     fn session_tab(&self, tab: &Tab, p: Palette, cx: &Context<Self>) -> Div {
         let id = tab.id;
         let selected = self.active == Some(id) && self.active_file_editor.is_none();
-        let agent = tab.terminal.read(cx).agent_name().is_some();
+        let agent = tab.observed_terminal.agent_running;
         row()
             .h_full()
             .relative()
@@ -996,9 +996,10 @@ impl Workbench {
                         .enumerate()
                     {
                         let progress = tab.route.iter().find(|hop| hop.index == index);
-                        let live_rtt = tab.sample.as_ref().and_then(|(metrics, _)| {
-                            metrics.hop_rtt_ms.get(index).copied().flatten()
-                        });
+                        let live_rtt = tab
+                            .sample
+                            .as_ref()
+                            .and_then(|metrics| metrics.hop_rtt_ms.get(index).copied().flatten());
                         let stage = progress.map(|hop| hop.stage);
                         let color = match stage {
                             Some(HopStage::Connected) if tab.phase != Phase::Disconnected => {
@@ -1975,7 +1976,7 @@ impl Workbench {
         let cipher = tab
             .and_then(|tab| tab.connection.as_ref()?.cipher())
             .map(str::to_owned);
-        let rtt = tab.and_then(|tab| tab.sample.as_ref()?.0.rtt_ms);
+        let rtt = tab.and_then(|tab| tab.sample.as_ref()?.rtt_ms);
         let transfer_count = self.file_transfer_count();
         status = status.child(if tab.is_some() {
             row()

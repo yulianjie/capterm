@@ -761,12 +761,15 @@ impl Workbench {
         let prompt = observed.prompt != terminal.prompt_serial();
         let note = (observed.notification != terminal.notification_serial())
             .then(|| terminal.notification().unwrap_or("终端响铃").to_owned());
+        let agent_running = terminal.agent_name().is_some();
+        let agent_changed = observed.agent_running != agent_running;
         if !observed.fullscreen && terminal.raw() {
             tab.show_sender = false;
         }
         observed.fullscreen = terminal.raw();
         observed.prompt = terminal.prompt_serial();
         observed.notification = terminal.notification_serial();
+        observed.agent_running = agent_running;
         if let Some(dir) = dir {
             self.file_terminal_directory(id, dir, cx);
         }
@@ -780,7 +783,9 @@ impl Workbench {
         {
             self.terminal_notice(id, note, window, cx);
         }
-        cx.notify();
+        if self.active == Some(id) || agent_changed {
+            cx.notify();
+        }
     }
 
     fn terminal_notice(

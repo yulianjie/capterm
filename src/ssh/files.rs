@@ -8,12 +8,10 @@ use tokio::sync::watch;
 
 use crate::file_text::{
     FileText, MEBIBYTE, PREVIEW_BYTES, SaveTextResult, TEXT_PROBE_BYTES, TextEncoding, decode_text,
-    encode_text, preserve_line_endings, strip_bom,
+    decode_text_buffer, encode_text, preserve_line_endings,
 };
 
 use super::*;
-
-const PREVIEW_LIMIT: u64 = 50 * MEBIBYTE;
 
 pub(crate) enum RemoteMutation {
     CreateFile(String),
@@ -102,7 +100,8 @@ impl Connection {
         let current = read_text(&sftp, path, original.encoding, edit_limit).await?;
         if !force
             && current.as_ref().is_none_or(|current| {
-                current.size != original.size
+                current.readonly
+                    || current.size != original.size
                     || current.mtime != original.mtime
                     || current.text != original.text
                     || current.bom != original.bom
@@ -146,7 +145,9 @@ impl Connection {
                 && read_text(&sftp, path, original.encoding, edit_limit)
                     .await?
                     .is_none_or(|current| {
-                        current.text != original.text || current.bom != original.bom
+                        current.readonly
+                            || current.text != original.text
+                            || current.bom != original.bom
                     }))
         {
             return Ok(SaveTextResult::Conflict(
@@ -432,17 +433,17 @@ async fn read_text(
     edit_limit: u64,
 ) -> Result<Option<FileText>> {
     let metadata = sftp.symlink_metadata(path).await?;
-    if !metadata.file_type().is_file() || metadata.size.is_some_and(|size| size > PREVIEW_LIMIT) {
+    if !metadata.file_type().is_file() {
         return Ok(None);
     }
-    let readonly = metadata.size.is_some_and(|size| size > edit_limit);
-    let limit = if readonly {
+    let read_limit = if metadata.size.is_some_and(|size| size > edit_limit) {
         PREVIEW_BYTES
     } else {
-        edit_limit + 1
+        edit_limit
     };
     let mut file = sftp.open(path).await?;
-    let mut data = Vec::new();
+    let probe_capacity = metadata.size.unwrap_or(0).min(TEXT_PROBE_BYTES as u64);
+    let mut data = Vec::with_capacity(probe_capacity as usize);
     let read = async {
         let prefix = (&mut file)
             .take(TEXT_PROBE_BYTES as u64)
@@ -451,10 +452,18 @@ async fn read_text(
         if data.contains(&0) || decode_text(&data, encoding, prefix == TEXT_PROBE_BYTES).is_none() {
             return Ok::<_, std::io::Error>(false);
         }
-        (&mut file)
-            .take(limit.saturating_sub(prefix as u64))
-            .read_to_end(&mut data)
-            .await?;
+        if prefix == TEXT_PROBE_BYTES {
+            let budget = metadata
+                .size
+                .unwrap_or(0)
+                .saturating_add(1)
+                .min(read_limit + 1);
+            data.reserve_exact((budget as usize).saturating_sub(prefix));
+            (&mut file)
+                .take(read_limit + 1 - prefix as u64)
+                .read_to_end(&mut data)
+                .await?;
+        }
         Ok(true)
     }
     .await;
@@ -464,18 +473,17 @@ async fn read_text(
     if !text {
         return Ok(None);
     }
-    let readonly = readonly || data.len() as u64 > edit_limit;
-    if readonly {
+    let truncated = data.len() as u64 > read_limit;
+    if truncated {
         data.truncate(PREVIEW_BYTES as usize);
     }
-    let (data, bom) = strip_bom(&data, encoding);
-    let Some(text) = decode_text(data, encoding, readonly) else {
+    let Some((text, bom)) = decode_text_buffer(data, encoding, truncated) else {
         return Ok(None);
     };
     Ok(Some(FileText {
         text,
-        readonly,
-        truncated: readonly,
+        readonly: truncated || metadata.size.is_some_and(|size| size > edit_limit),
+        truncated,
         encoding,
         size: metadata.size,
         mtime: metadata.mtime,

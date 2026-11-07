@@ -1,13 +1,15 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt::Write as _,
     hash::{DefaultHasher, Hash, Hasher},
+    num::NonZeroU64,
     time::Duration,
 };
 
 use alacritty_terminal::{
     grid::{Dimensions, Grid},
     index::{Column, Line},
-    term::cell::{Cell, Flags},
+    term::cell::{Cell, Flags, LineLength},
 };
 use chrono::{DateTime, Local};
 
@@ -45,7 +47,7 @@ pub(super) struct Stamp {
     pub(super) number: u64,
     pub(super) time: DateTime<Local>,
     pub(super) live: bool,
-    text_hash: Option<u64>,
+    text_hash: Option<NonZeroU64>,
 }
 
 pub(super) struct CommandBlock {
@@ -158,8 +160,11 @@ impl Timeline {
             }
         }
         self.update_history_anchor(grid);
+        // A cleanup scans the entire grid. Keep it infrequent when the
+        // history is large and rows are being recycled at a steady rate.
+        let cleanup_slack = (grid.total_lines() / 8).max(1024);
         if self.rows.len() > grid.total_lines().saturating_add(128)
-            || self.logical_times.len() > self.rows.len().saturating_add(1024)
+            || self.logical_times.len() > self.rows.len().saturating_add(cleanup_slack)
         {
             self.retain_live(grid);
         }
@@ -224,7 +229,7 @@ impl Timeline {
         let mut start = grid.topmost_line();
         let mut last_used = grid.cursor.point.line;
         for line in (grid.topmost_line().0..grid.screen_lines() as i32).map(Line) {
-            if row_text_hash(grid, line).is_some() {
+            if grid[line][..].iter().any(has_text) {
                 last_used = last_used.max(line);
             }
             if !wraps(grid, line) {
@@ -258,38 +263,45 @@ impl Timeline {
     pub(super) fn formatted_log(&self, grid: &Grid<Cell>, format: TimestampFormat) -> String {
         let mut log = String::new();
         let mut last_number = None;
+        let mut last_timestamp: Option<(DateTime<Local>, String)> = None;
         for line in (grid.topmost_line().0..=grid.bottommost_line().0).map(Line) {
             if let Some(stamp) = self.stamp(grid, line) {
                 let continuation = last_number == Some(stamp.number);
                 if !continuation {
                     if let Some(messages) = self.systems.get(&stamp.number) {
                         for message in messages {
-                            log.push_str(&format!(
-                                "· {}  {}\n",
+                            writeln!(
+                                log,
+                                "· {}  {}",
                                 self.timestamp(message.time, format),
                                 message.text
-                            ));
+                            )
+                            .unwrap();
                         }
                     }
-                    log.push_str(&format!(
-                        "{} {}  ",
-                        stamp.number,
-                        self.timestamp(stamp.time, format)
-                    ));
+                    if last_timestamp.as_ref().is_none_or(|(time, _)| {
+                        *time != stamp.time || time.offset() != stamp.time.offset()
+                    }) {
+                        last_timestamp = Some((stamp.time, self.timestamp(stamp.time, format)));
+                    }
+                    let timestamp = &last_timestamp.as_ref().unwrap().1;
+                    write!(log, "{} {timestamp}  ", stamp.number).unwrap();
                 }
                 last_number = Some(stamp.number);
-                log.push_str(&row_text(grid, line));
+                append_row_text(&mut log, grid, line);
                 if !wraps(grid, line) {
                     log.push('\n');
                 }
             }
         }
         for message in self.pending_systems() {
-            log.push_str(&format!(
-                "· {}  {}\n",
+            writeln!(
+                log,
+                "· {}  {}",
                 self.timestamp(message.time, format),
                 message.text
-            ));
+            )
+            .unwrap();
         }
         log
     }
@@ -557,7 +569,14 @@ pub(super) fn row_key(grid: &Grid<Cell>, line: Line) -> usize {
 
 pub(super) fn row_text(grid: &Grid<Cell>, line: Line) -> String {
     let mut result = String::new();
-    for cell in &grid[line][..] {
+    append_row_text(&mut result, grid, line);
+    result
+}
+
+fn append_row_text(result: &mut String, grid: &Grid<Cell>, line: Line) {
+    let start = result.len();
+    let row = &grid[line];
+    for cell in &row[..row.line_length()] {
         if cell
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -569,8 +588,7 @@ pub(super) fn row_text(grid: &Grid<Cell>, line: Line) -> String {
             result.extend(extra);
         }
     }
-    result.truncate(result.trim_end().len());
-    result
+    result.truncate(start + result[start..].trim_end().len());
 }
 
 pub(super) fn wraps(grid: &Grid<Cell>, line: Line) -> bool {
@@ -579,22 +597,27 @@ pub(super) fn wraps(grid: &Grid<Cell>, line: Line) -> bool {
         .contains(Flags::WRAPLINE)
 }
 
-fn row_text_hash(grid: &Grid<Cell>, line: Line) -> Option<u64> {
+fn has_text(cell: &Cell) -> bool {
+    !cell
+        .flags
+        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        && (cell.c != ' ' || cell.zerowidth().is_some_and(|chars| !chars.is_empty()))
+}
+
+fn row_text_hash(grid: &Grid<Cell>, line: Line) -> Option<NonZeroU64> {
     let mut hash = DefaultHasher::new();
     let mut has_content = false;
     for (column, cell) in grid[line][..].iter().enumerate() {
-        if cell
-            .flags
-            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-        {
-            continue;
-        }
-        if cell.c != ' ' || cell.zerowidth().is_some_and(|chars| !chars.is_empty()) {
-            column.hash(&mut hash);
-            cell.c.hash(&mut hash);
-            cell.zerowidth().hash(&mut hash);
+        if has_text(cell) {
+            let extra = cell.zerowidth();
+            hash.write_u64(
+                (column as u64) << 32 | u64::from(cell.c) << 1 | u64::from(extra.is_some()),
+            );
+            if let Some(chars) = extra {
+                chars.hash(&mut hash);
+            }
             has_content = true;
         }
     }
-    has_content.then(|| hash.finish())
+    has_content.then(|| NonZeroU64::new(hash.finish().max(1)).unwrap())
 }

@@ -434,13 +434,31 @@ impl Settings {
     }
 
     pub fn sync_config(&mut self, result: &ImportResult) -> bool {
-        let Some(index) = self
-            .linked_configs
-            .iter()
-            .position(|entry| entry.path == result.source)
-        else {
+        let Some((index, incoming)) = self.config_update(result) else {
             return false;
         };
+        self.apply_config_update(index, incoming);
+        true
+    }
+
+    pub fn synced_configs(&self, results: &[ImportResult]) -> Option<Self> {
+        let mut updated = None;
+        for result in results {
+            let current = updated.as_ref().unwrap_or(self);
+            if let Some((index, incoming)) = current.config_update(result) {
+                updated
+                    .get_or_insert_with(|| self.clone())
+                    .apply_config_update(index, incoming);
+            }
+        }
+        updated
+    }
+
+    fn config_update(&self, result: &ImportResult) -> Option<(usize, Vec<ConnectionProfile>)> {
+        let index = self
+            .linked_configs
+            .iter()
+            .position(|entry| entry.path == result.source)?;
         let path = &self.linked_configs[index].path;
         let existing = self
             .profiles
@@ -477,14 +495,17 @@ impl Settings {
         }));
         incoming.sort_by(|a, b| a.name.cmp(&b.name));
         if existing.iter().copied().eq(incoming.iter().copied()) {
-            return false;
+            return None;
         }
-        let incoming = incoming.into_iter().cloned().collect::<Vec<_>>();
+        Some((index, incoming.into_iter().cloned().collect()))
+    }
+
+    fn apply_config_update(&mut self, index: usize, incoming: Vec<ConnectionProfile>) {
+        let path = &self.linked_configs[index].path;
         self.profiles
             .retain(|profile| profile.source.as_ref() != Some(path));
         self.profiles.extend(incoming);
         self.linked_configs[index].synced_at = Some(sync_time());
-        true
     }
 }
 
@@ -1635,7 +1656,7 @@ Host edge
         )?;
         let first_result = import(first.to_str().unwrap())?;
         let second_result = import(second.to_str().unwrap())?;
-        let mut settings = Settings {
+        let settings = Settings {
             profiles: first_result.profiles,
             linked_configs: vec![
                 LinkedConfig {
@@ -1655,9 +1676,9 @@ Host edge
             "Host shared\n HostName changed.example\nHost added\n HostName added.example\n",
         )?;
         let first_result = import(first.to_str().unwrap())?;
-        assert!(settings.sync_config(&first_result));
-        assert!(settings.sync_config(&second_result));
-        assert!(!settings.sync_config(&first_result));
+        let results = [first_result, second_result];
+        let mut settings = settings.synced_configs(&results).unwrap();
+        assert!(settings.synced_configs(&results).is_none());
         assert_eq!(
             settings
                 .profiles
@@ -1670,8 +1691,8 @@ Host edge
                 ("unique", "unique.example"),
             ]
         );
-        settings.unlink(&first_result.source);
-        assert!(settings.sync_config(&second_result));
+        settings.unlink(&results[0].source);
+        assert!(settings.sync_config(&results[1]));
         assert_eq!(settings.profiles[0].host, "second.example");
         Ok(())
     }

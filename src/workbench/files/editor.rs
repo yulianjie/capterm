@@ -12,6 +12,9 @@ use super::browser::{byte_size, file_icon, file_time, short_time, small_icon};
 use super::*;
 use crate::workbench::ui::{Palette, button, col, primary, row, tab_close_tool};
 
+const FULL_EDITOR_BYTES: usize = 256 * 1024;
+const LONG_LINE_BYTES: usize = 128 * 1024;
+
 pub(in crate::workbench) struct FileEditor {
     pub(in crate::workbench) id: u64,
     terminal: u64,
@@ -19,7 +22,11 @@ pub(in crate::workbench) struct FileEditor {
     hostname: String,
     entry: RemoteEntry,
     state: Entity<EditorState>,
-    original: FileText,
+    original: Arc<FileText>,
+    baseline: Rope,
+    language: (&'static str, &'static str),
+    endings: &'static str,
+    large: bool,
     pinned: bool,
     dirty: bool,
     busy: bool,
@@ -77,7 +84,7 @@ impl Workbench {
         &mut self,
         terminal: u64,
         entry: RemoteEntry,
-        original: FileText,
+        mut original: FileText,
         pinned: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -90,15 +97,24 @@ impl Workbench {
                 .map_or_else(String::new, |tab| tab.name().to_owned())
         };
         let id = self.new_id();
-        let language = editor_language(&entry.name).1;
-        let normalized = normalize(&original.text).into_owned();
+        let language = editor_language(&entry.name);
+        let endings = line_endings(&original.text);
+        let large = original.text.len() > FULL_EDITOR_BYTES;
+        let normalized = normalize(&original.text);
+        let wrap = wrap_editor_text(&normalized, large);
         let state = cx.new(|cx| {
             EditorState::new(window, cx)
-                .language(language)
+                .language(if large { "text" } else { language.1 })
+                .soft_wrap(wrap)
+                .folding(!large)
                 .line_number(true)
                 .gutter_decorations_width(px(4.))
-                .default_value(normalized)
+                .default_value(normalized.as_ref())
         });
+        if original.readonly {
+            original.text = String::new();
+        }
+        let baseline = state.read(cx).text().clone();
         let gutter = state.update(cx, |state, cx| {
             state.create_gutter_decorations_collection(Vec::new(), cx)
         });
@@ -106,17 +122,25 @@ impl Workbench {
             if !matches!(event, InputEvent::Change) {
                 return;
             }
-            let value = state.read(cx).value();
             let Some(editor) = this.file_editors.iter_mut().find(|editor| editor.id == id) else {
                 return;
             };
-            let original = normalize(&editor.original.text);
-            editor.dirty = value.as_ref() != original.as_ref();
+            let value = state.read(cx).text();
+            editor.dirty = value != &editor.baseline;
             if editor.dirty {
                 editor.pinned = true;
             }
             let warn = Palette::new(this.settings.light).warn;
-            gutter.set(changed_lines(original.as_ref(), &value, warn), cx);
+            let decorations = if editor.dirty
+                && !editor.large
+                && value.len() <= FULL_EDITOR_BYTES
+                && editor.baseline.len() <= FULL_EDITOR_BYTES
+            {
+                changed_lines(&editor.baseline.to_string(), &value.to_string(), warn)
+            } else {
+                Vec::new()
+            };
+            gutter.set(decorations, cx);
             cx.notify();
         });
         let cursor = cx.observe(&state, move |this, state, cx| {
@@ -137,7 +161,11 @@ impl Workbench {
             hostname,
             entry,
             state,
-            original,
+            original: Arc::new(original),
+            baseline,
+            language,
+            endings,
+            large,
             pinned,
             dirty: false,
             busy: false,
@@ -253,13 +281,13 @@ impl Workbench {
         };
         editor.busy = true;
         editor.error = None;
-        let edited = editor.state.read(cx).value().to_string();
+        let edited = editor.state.read(cx).text().clone();
         let original = editor.original.clone();
         let path = editor.entry.path.clone();
         let events = self.events.clone();
         self.runtime.spawn(async move {
             let result = source
-                .save_text(&path, &original, &edited, force)
+                .save_text(&path, &original, &edited.to_string(), force)
                 .await
                 .map_err(report_error);
             let _ = events
@@ -272,7 +300,7 @@ impl Workbench {
     pub(super) fn finish_editor_save(
         &mut self,
         id: u64,
-        edited: String,
+        edited: Rope,
         result: Result<SaveTextResult, String>,
         _: &mut Window,
         cx: &mut Context<Self>,
@@ -285,8 +313,10 @@ impl Workbench {
             Ok(SaveTextResult::Saved(original)) => {
                 editor.entry.size = original.size;
                 editor.entry.mtime = original.mtime;
-                editor.original = original;
-                editor.dirty = editor.state.read(cx).value().as_ref() != edited;
+                editor.endings = line_endings(&original.text);
+                editor.original = Arc::new(original);
+                editor.baseline = edited;
+                editor.dirty = editor.state.read(cx).text() != &editor.baseline;
                 editor.conflict = None;
                 editor.diff = None;
                 let path = editor.entry.path.clone();
@@ -312,18 +342,33 @@ impl Workbench {
         let Some(editor) = self.file_editors.iter_mut().find(|editor| editor.id == id) else {
             return;
         };
-        let Some(current) = editor.conflict.take().and_then(|conflict| conflict.current) else {
+        let Some(mut current) = editor.conflict.take().and_then(|conflict| conflict.current) else {
             return;
         };
-        let text = normalize(&current.text).into_owned();
-        editor.original = current;
+        editor.endings = line_endings(&current.text);
+        let large = current.text.len() > FULL_EDITOR_BYTES;
+        let text = normalize(&current.text);
+        let wrap = wrap_editor_text(&text, large);
+        let changed_mode = large != editor.large;
+        editor.large = large;
+        let language = if large { "text" } else { editor.language.1 };
         editor.dirty = false;
         editor.diff = None;
         editor.error = None;
-        editor.state.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
+        editor.baseline = editor.state.update(cx, |state, cx| {
+            if changed_mode {
+                state.set_highlighter(language, cx);
+                state.set_folding(!large, window, cx);
+            }
+            state.set_value(text.as_ref(), window, cx);
+            state.set_soft_wrap(wrap, window, cx);
             state.focus(window, cx);
+            state.text().clone()
         });
+        if current.readonly {
+            current.text = String::new();
+        }
+        editor.original = Arc::new(current);
         cx.notify();
     }
 
@@ -363,9 +408,9 @@ impl Workbench {
         let editor = self.active_editor()?;
         Some((
             format!("行 {}，列 {}", editor.cursor.0 + 1, editor.cursor.1 + 1),
-            editor_language(&editor.entry.name).0,
+            editor.language.0,
             editor.original.encoding.label(),
-            line_endings(&editor.original.text),
+            editor.endings,
             editor.dirty,
         ))
     }
@@ -562,9 +607,13 @@ impl Workbench {
                     .font_family(mono.clone())
                     .text_color(palette.muted)
                     .text_size(px(11.))
-                    .child(editor_language(&entry.name).0)
+                    .child(if editor.large {
+                        "大文件 · 纯文本"
+                    } else {
+                        editor.language.0
+                    })
                     .child(editor.original.encoding.label())
-                    .child(line_endings(&editor.original.text))
+                    .child(editor.endings)
                     .child("空格：2"),
             )
             .child(div().w(px(1.)).h(px(16.)).bg(palette.line))
@@ -769,10 +818,12 @@ fn normalize(text: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+fn wrap_editor_text(text: &str, large: bool) -> bool {
+    // Unwrapped GPUI layout shapes the longest physical line up front.
+    !large || text.lines().any(|line| line.len() > LONG_LINE_BYTES)
+}
+
 fn changed_lines(original: &str, edited: &str, color: Hsla) -> Vec<GutterDecoration> {
-    if original == edited {
-        return Vec::new();
-    }
     let prefix = original
         .split_inclusive('\n')
         .zip(edited.split_inclusive('\n'))

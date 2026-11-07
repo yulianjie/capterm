@@ -54,7 +54,7 @@ pub(super) struct ParserHandler<'a> {
 pub(super) struct Tracking<'a> {
     pub(super) timeline: &'a mut Timeline,
     pub(super) reflow: &'a mut Option<Vec<Option<Stamp>>>,
-    pub(super) primary_log: &'a mut Option<String>,
+    pub(super) primary_log: &'a mut Option<Box<str>>,
     pub(super) timestamp_format: TimestampFormat,
     pub(super) reflowed: &'a mut bool,
     pub(super) redraw: &'a mut Option<usize>,
@@ -62,6 +62,7 @@ pub(super) struct Tracking<'a> {
     pub(super) program: Option<&'a str>,
     pub(super) inline_agent: bool,
     pub(super) now: DateTime<Local>,
+    pub(super) last_input: Option<(Line, bool)>,
 }
 
 impl ParserHandler<'_> {
@@ -69,7 +70,14 @@ impl ParserHandler<'_> {
         &mut self.keyboard.0[screen_index(*self.term.mode())]
     }
 
+    fn reset_input_run(&mut self) {
+        if let Some(track) = &mut self.tracking {
+            track.last_input = None;
+        }
+    }
+
     fn touch_edited_row(&mut self) {
+        self.reset_input_run();
         if !self.term.mode().contains(TermMode::ALT_SCREEN)
             && let Some(track) = &mut self.tracking
         {
@@ -87,6 +95,7 @@ impl ParserHandler<'_> {
 macro_rules! forward_actions {
     ($(fn $method:ident($($arg:ident: $ty:ty),*);)*) => {
         $(fn $method(&mut self, $($arg: $ty),*) {
+            self.reset_input_run();
             Handler::$method(self.term, $($arg),*);
         })*
     };
@@ -170,6 +179,7 @@ impl Handler for ParserHandler<'_> {
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
+        self.reset_input_run();
         let clears_view = matches!(mode, ClearMode::All);
         self.term.clear_screen(mode);
         if clears_view
@@ -201,31 +211,45 @@ impl Handler for ParserHandler<'_> {
     }
 
     fn input(&mut self, character: char) {
+        let Some(track) = self
+            .tracking
+            .as_mut()
+            .filter(|_| !self.term.mode().contains(TermMode::ALT_SCREEN))
+        else {
+            self.term.input(character);
+            return;
+        };
         let grid = self.term.grid();
         let cursor = grid.cursor.point;
         let before = cursor.line;
-        let key = timeline::row_key(grid, before);
-        let replaces_agent_cell = self
-            .tracking
-            .as_ref()
-            .is_some_and(|track| track.inline_agent)
-            && !grid.cursor.input_needs_wrap
-            && grid[cursor].c != ' ';
-        self.term.input(character);
-        if !self.term.mode().contains(TermMode::ALT_SCREEN)
-            && let Some(track) = &mut self.tracking
+        let needs_wrap = grid.cursor.input_needs_wrap;
+        let replaces_agent_cell = track.inline_agent && !needs_wrap && grid[cursor].c != ' ';
+        // An ASCII character inside the same physical row cannot change its
+        // logical line number. The row has already been stamped for this batch.
+        if character.is_ascii()
+            && !needs_wrap
+            && let Some((line, live)) = track.last_input
+            && line == before
+            && live == replaces_agent_cell
         {
-            let grid = self.term.grid();
-            let after = grid.cursor.point.line;
-            let after_key = timeline::row_key(grid, after);
-            let fresh = before == after && key != after_key;
-            let live = !fresh
-                && (*track.redraw == Some(after_key) || (before == after && replaces_agent_cell));
-            track.timeline.touch(grid, after, track.now, fresh, live);
+            self.term.input(character);
+            return;
         }
+        let key = timeline::row_key(grid, before);
+        self.term.input(character);
+        let grid = self.term.grid();
+        let after = grid.cursor.point.line;
+        let after_key = timeline::row_key(grid, after);
+        let fresh = before == after && key != after_key;
+        let live = !fresh
+            && (*track.redraw == Some(after_key) || (before == after && replaces_agent_cell));
+        track.timeline.touch(grid, after, track.now, fresh, live);
+        // A pending redraw can belong to a different row after wrapping.
+        track.last_input = track.redraw.is_none().then_some((after, live));
     }
 
     fn carriage_return(&mut self) {
+        self.reset_input_run();
         if let Some(track) = &mut self.tracking {
             let grid = self.term.grid();
             let line = grid.cursor.point.line;
@@ -235,6 +259,7 @@ impl Handler for ParserHandler<'_> {
     }
 
     fn linefeed(&mut self) {
+        self.reset_input_run();
         let primary = !self.term.mode().contains(TermMode::ALT_SCREEN);
         let grid = self.term.grid();
         let line = grid.cursor.point.line;
@@ -262,6 +287,7 @@ impl Handler for ParserHandler<'_> {
     }
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
+        self.reset_input_run();
         if mode.raw() == 1049
             && !self.term.mode().contains(TermMode::ALT_SCREEN)
             && let Some(track) = &mut self.tracking
@@ -271,7 +297,8 @@ impl Handler for ParserHandler<'_> {
             *track.primary_log = Some(
                 track
                     .timeline
-                    .formatted_log(self.term.grid(), track.timestamp_format),
+                    .formatted_log(self.term.grid(), track.timestamp_format)
+                    .into_boxed_str(),
             );
             *track.redraw = None;
             *track.fullscreen = Some((Instant::now(), track.program.map(str::to_owned)));
@@ -280,6 +307,7 @@ impl Handler for ParserHandler<'_> {
     }
 
     fn unset_private_mode(&mut self, mode: PrivateMode) {
+        self.reset_input_run();
         let was_alternate = self.term.mode().contains(TermMode::ALT_SCREEN);
         self.term.unset_private_mode(mode);
         if mode.raw() == 1049
@@ -306,6 +334,7 @@ impl Handler for ParserHandler<'_> {
     }
 
     fn reset_state(&mut self) {
+        self.reset_input_run();
         *self.keyboard = KeyboardProtocol::default();
         self.term.reset_state();
         if let Some(track) = &mut self.tracking {
@@ -376,7 +405,7 @@ mod tests {
         keyboard: KeyboardProtocol,
         timeline: Timeline,
         reflow: Option<Vec<Option<Stamp>>>,
-        primary_log: Option<String>,
+        primary_log: Option<Box<str>>,
         reflowed: bool,
         redraw: Option<usize>,
         fullscreen: Option<(Instant, Option<String>)>,
@@ -429,6 +458,7 @@ mod tests {
                         program: None,
                         inline_agent: false,
                         now,
+                        last_input: None,
                     }),
                 },
                 bytes,
@@ -493,6 +523,15 @@ mod tests {
         assert_eq!(timeline::row_text(terminal.term.grid(), Line(0)), "abcdef");
         assert_eq!(terminal.stamp(0), (1, "10:00:02".into(), false));
         assert_eq!(terminal.stamp(1), (2, "10:00:02".into(), false));
+    }
+
+    #[test]
+    fn explicit_scroll_keeps_input_numbering_in_order_within_one_batch() {
+        let mut terminal = TerminalFixture::new(20, 3);
+        terminal.feed(b"old\x1b[Snew\x1b[2Bend", 1);
+        assert_eq!(terminal.stamp(-1).0, 1);
+        assert_eq!(terminal.stamp(0).0, 2);
+        assert_eq!(terminal.stamp(2).0, 3);
     }
 
     #[test]

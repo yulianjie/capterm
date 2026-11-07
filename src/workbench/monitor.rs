@@ -4,7 +4,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -15,20 +15,57 @@ use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::{Disableable, Theme};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use tokio::{sync::watch, time};
 
 use super::{
-    Phase, SendTarget, Tab, Workbench,
+    Event, Phase, SendTarget, Tab, Workbench,
     ui::{Palette, col, icon, icon_tool, row, tool},
 };
-use crate::ssh::{Metrics, ProcessSample, Usage};
+use crate::ssh::{Connection, Metrics, ProcessSample, Usage};
 
 const TREND_SPAN: Duration = Duration::from_secs(5 * 60);
 
+pub(super) async fn sample_host(
+    id: u64,
+    connection: Arc<Connection>,
+    mut monitored_tab: watch::Receiver<Option<u64>>,
+    interval: Arc<AtomicU64>,
+    events: async_channel::Sender<Event>,
+) {
+    let mut next = time::Instant::now();
+    while monitored_tab
+        .wait_for(|active| *active == Some(id))
+        .await
+        .is_ok()
+    {
+        tokio::select! {
+            _ = time::sleep_until(next) => {
+                if *monitored_tab.borrow_and_update() != Some(id) {
+                    continue;
+                }
+            }
+            changed = monitored_tab.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
+        let result = connection.metrics().await;
+        next = time::Instant::now() + Duration::from_secs(interval.load(Ordering::Relaxed));
+        if let Ok(sample) = result
+            && events.send(Event::Sample(id, sample)).await.is_err()
+        {
+            break;
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct MonitorState {
-    pub(super) paused: Arc<AtomicBool>,
+    pub(super) paused: bool,
     processes: bool,
-    latest: Option<Metrics>,
+    latest: Option<Arc<Metrics>>,
     history: VecDeque<SamplePoint>,
     selected: [Option<Instant>; 3],
     focus: RefCell<[Option<FocusHandle>; 3]>,
@@ -93,7 +130,7 @@ fn format_network_rate(bytes_per_second: f64) -> (String, &'static str) {
 }
 
 impl MonitorState {
-    pub(super) fn push(&mut self, metrics: &Metrics) {
+    pub(super) fn push(&mut self, metrics: Arc<Metrics>) {
         if !metrics.probe_available {
             return;
         }
@@ -111,7 +148,7 @@ impl MonitorState {
         {
             self.history.pop_front();
         }
-        self.latest = Some(metrics.clone());
+        self.latest = Some(metrics);
     }
 
     pub(super) fn clear(&mut self) {
@@ -149,7 +186,7 @@ impl Workbench {
         let ssh_tab = tab.filter(|tab| !tab.is_local());
         let tab_id = ssh_tab.map(|tab| tab.id);
         let state = ssh_tab.map(|tab| &tab.monitor_state);
-        let paused = state.is_some_and(|state| state.paused.load(Ordering::Relaxed));
+        let paused = state.is_some_and(|state| state.paused);
         let mut pages = row()
             .h(px(24.))
             .gap(px(2.))
@@ -230,7 +267,8 @@ impl Workbench {
                 .disabled(!connected)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(tab) = tab_id.and_then(|id| this.tab_mut(id)) {
-                        tab.monitor_state.paused.fetch_xor(true, Ordering::Relaxed);
+                        tab.monitor_state.paused = !tab.monitor_state.paused;
+                        this.set_monitored_tab(this.active);
                         cx.notify();
                     }
                 })),

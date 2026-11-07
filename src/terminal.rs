@@ -238,7 +238,7 @@ pub struct TerminalView {
     linux_highlights: Option<Rc<LinuxHighlights>>,
     primary_reflowed: bool,
     primary_snapshot: Option<Vec<Option<Stamp>>>,
-    primary_log: Option<String>,
+    primary_log: Option<Box<str>>,
     redraw: Option<usize>,
     resize_pending: Option<Task<()>>,
     scanner: Scanner,
@@ -469,10 +469,13 @@ impl TerminalView {
     }
 
     pub fn formatted_log(&self) -> String {
-        self.primary_log.clone().unwrap_or_else(|| {
-            self.timeline
-                .formatted_log(self.term.grid(), self.timestamp_format)
-        })
+        self.primary_log
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                self.timeline
+                    .formatted_log(self.term.grid(), self.timestamp_format)
+            })
     }
 
     pub fn end_session(&mut self, cx: &mut Context<Self>) {
@@ -550,6 +553,7 @@ impl TerminalView {
                     program: self.last_program.as_deref(),
                     inline_agent,
                     now,
+                    last_input: None,
                 }),
             },
             bytes,
@@ -634,6 +638,7 @@ impl TerminalView {
                 program: self.last_program.as_deref(),
                 inline_agent,
                 now,
+                last_input: None,
             }),
         });
         for marker in std::mem::take(&mut self.sync_markers) {

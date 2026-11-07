@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::input::InputState;
+use gpui_kit::component::input::{InputState, Rope};
 use gpui_kit::*;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
@@ -91,13 +91,14 @@ pub(super) struct FilePane {
     queried_login_directory: bool,
     entries: Vec<RemoteEntry>,
     branches: HashMap<String, Option<Vec<RemoteEntry>>>,
+    visible_rows: std::cell::RefCell<Option<browser::VisibleFileRows>>,
     selected: Option<RemoteEntry>,
     loading: bool,
     error: Option<String>,
     listing: u64,
     navigation: Option<String>,
     editor_request: u64,
-    pending_editor: Option<(String, TextEncoding, bool)>,
+    pending_editor: Option<PendingEditor>,
     follow_disabled: bool,
     hide_hidden: bool,
     filter_open: bool,
@@ -109,6 +110,19 @@ pub(super) struct FilePane {
     conflict_all: bool,
     conflict_choices: HashMap<u64, TransferChoice>,
     local_previews: Vec<tempfile::TempDir>,
+}
+
+struct PendingEditor {
+    path: String,
+    encoding: TextEncoding,
+    pinned: bool,
+    task: AbortHandle,
+}
+
+impl Drop for PendingEditor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -198,7 +212,7 @@ pub(super) enum FileEvent {
     Directory(Result<String, String>),
     Text(u64, RemoteEntry, Result<Option<FileText>, String>),
     ClipboardReady(Result<(tempfile::TempDir, PathBuf), String>),
-    Saved(u64, String, Result<SaveTextResult, String>),
+    Saved(u64, Rope, Result<SaveTextResult, String>),
     Mutation(Result<(), String>),
     Progress(u64, u64, u64),
     Transfer(u64, u64, Result<TransferOutcome, String>),
@@ -235,6 +249,7 @@ impl Workbench {
             return;
         };
         tab.files.selected = Some(entry.clone());
+        *tab.files.visible_rows.get_mut() = None;
         if tab.files.branches.remove(&entry.path).is_some() {
             let local = tab.browses_local_files();
             let remote_prefix = format!("{}/", entry.path);
@@ -398,28 +413,40 @@ impl Workbench {
         let Some(source) = FileSource::for_tab(tab) else {
             return;
         };
-        if let Some((path, requested, pin)) = &mut tab.files.pending_editor
-            && *path == entry.path
-            && *requested == encoding
+        if let Some(pending) = &mut tab.files.pending_editor
+            && pending.path == entry.path
+            && pending.encoding == encoding
         {
-            *pin |= pinned;
+            pending.pinned |= pinned;
             cx.notify();
             return;
         }
         tab.files.editor_request += 1;
-        tab.files.pending_editor = Some((entry.path.clone(), encoding, pinned));
+        tab.files.pending_editor = None;
         let request = tab.files.editor_request;
+        let path = entry.path.clone();
         let edit_limit_mb = self.settings.file_edit_limit_mb;
         let events = self.events.clone();
-        self.runtime.spawn(async move {
-            let result = source
-                .open_text(&entry.path, encoding, edit_limit_mb)
-                .await
-                .map_err(report_error);
-            let _ = events
-                .send(Event::File(id, FileEvent::Text(request, entry, result)))
-                .await;
-        });
+        let task = self
+            .runtime
+            .spawn(async move {
+                let result = source
+                    .open_text(&entry.path, encoding, edit_limit_mb)
+                    .await
+                    .map_err(report_error);
+                let _ = events
+                    .send(Event::File(id, FileEvent::Text(request, entry, result)))
+                    .await;
+            })
+            .abort_handle();
+        if let Some(tab) = self.tab_mut(id) {
+            tab.files.pending_editor = Some(PendingEditor {
+                path,
+                encoding,
+                pinned,
+                task,
+            });
+        }
         cx.notify();
     }
 
@@ -1056,6 +1083,7 @@ impl Workbench {
                         }
                         tab.files.directory = directory;
                         tab.files.entries = entries;
+                        *tab.files.visible_rows.get_mut() = None;
                         tab.files.error = None;
                     }
                     Err(error) => tab.files.error = Some(error),
@@ -1070,6 +1098,7 @@ impl Workbench {
                             tab.files.error = Some(error);
                         }
                     }
+                    *tab.files.visible_rows.get_mut() = None;
                 }
             }
             FileEvent::Directory(Ok(directory))
@@ -1085,7 +1114,7 @@ impl Workbench {
                     .files
                     .pending_editor
                     .take()
-                    .is_some_and(|(_, _, pinned)| pinned);
+                    .is_some_and(|pending| pending.pinned);
                 if self.active != Some(id) {
                     return;
                 }

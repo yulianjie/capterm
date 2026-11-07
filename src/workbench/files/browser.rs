@@ -462,24 +462,38 @@ impl Workbench {
                     .text_right()
                     .child("修改"),
             );
-        let query = files
-            .filter
-            .as_ref()
-            .filter(|_| files.filter_open)
-            .map(|(state, _)| state.read(cx).value().to_lowercase())
-            .unwrap_or_default();
-        let mut visible = Vec::new();
-        visible_entries(files, &files.entries, &query, 0, &mut visible);
-        let rows = visible
-            .into_iter()
-            .map(|(entry, depth)| self.render_file_row(tab, entry, depth, palette, &mono, cx));
-        let drop_destination = directory.clone();
-        let scroll = div()
+        let row_count = files.visible_row_count(cx);
+        let row_font = mono.clone();
+        let rows = uniform_list(
+            ("file-list", id),
+            row_count,
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                let Some(tab) = this.tab(id) else {
+                    return Vec::new();
+                };
+                let visible = tab.files.visible_rows.borrow();
+                range
+                    .filter_map(|index| {
+                        let (entry, depth) = if let Some(visible) = visible.as_ref() {
+                            visible.entry(&tab.files, index)?
+                        } else {
+                            (tab.files.entries.get(index)?, 0)
+                        };
+                        Some(this.render_file_row(tab, entry, depth, palette, &row_font, cx))
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .with_sizing_behavior(ListSizingBehavior::Auto)
+        .flex_1()
+        .w_full()
+        .min_h_0();
+        let scroll = col()
             .id(("file-rows", id))
             .flex_1()
             .min_h_0()
             .pt(px(3.))
-            .overflow_y_scroll()
+            .overflow_hidden()
             .when(files.loading && files.entries.is_empty(), |list| {
                 list.child(file_message("正在读取目录…", palette.muted))
             })
@@ -493,7 +507,7 @@ impl Workbench {
                     palette.warn,
                 ))
             })
-            .children(rows)
+            .child(rows)
             .when(!local && can_operate, |list| {
                 list.on_drag_move::<ExternalPaths>(cx.listener(
                     move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
@@ -501,7 +515,7 @@ impl Workbench {
                         this.update_drop_target(
                             id,
                             event.event.position,
-                            &drop_destination,
+                            &directory,
                             count,
                             event.bounds.contains(&event.event.position),
                             false,
@@ -680,6 +694,7 @@ impl Workbench {
             .map(|time| time.format("%Y-%m-%d %H:%M:%S %Z").to_string());
         let file_row = row()
             .id(SharedString::from(format!("remote-{}", entry.path)))
+            .w_full()
             .h(px(26.))
             .gap(px(5.))
             .pr(px(10.))
@@ -1603,23 +1618,88 @@ impl Render for FileDragPreview {
     }
 }
 
-fn visible_entries<'a>(
-    files: &'a FilePane,
-    entries: &'a [RemoteEntry],
-    query: &str,
+impl FilePane {
+    fn visible_row_count(&self, cx: &App) -> usize {
+        let query = self
+            .filter
+            .as_ref()
+            .filter(|_| self.filter_open)
+            .map(|(state, _)| state.read(cx).value())
+            .unwrap_or_default();
+        let mut visible = self.visible_rows.borrow_mut();
+        if self.branches.is_empty() && !self.hide_hidden && query.is_empty() {
+            *visible = None;
+            return self.entries.len();
+        }
+        if let Some(rows) = visible
+            .as_ref()
+            .filter(|rows| rows.query == query && rows.hide_hidden == self.hide_hidden)
+        {
+            return rows.entries.len();
+        }
+
+        let mut rows = VisibleFileRows {
+            hide_hidden: self.hide_hidden,
+            branches: Vec::new(),
+            entries: Vec::new(),
+            query,
+        };
+        let query = rows.query.to_lowercase();
+        rows.append(self, &self.entries, &query, None, 0);
+        let count = rows.entries.len();
+        *visible = Some(rows);
+        count
+    }
+}
+
+struct FileRowIndex {
+    branch: Option<usize>,
+    index: usize,
     depth: usize,
-    visible: &mut Vec<(&'a RemoteEntry, usize)>,
-) {
-    for entry in entries
-        .iter()
-        .filter(|entry| !files.hide_hidden || !entry.hidden)
-    {
-        if query.is_empty() || entry.name.to_lowercase().contains(query) || entry.is_dir {
-            visible.push((entry, depth));
+}
+
+pub(super) struct VisibleFileRows {
+    query: SharedString,
+    hide_hidden: bool,
+    branches: Vec<String>,
+    entries: Vec<FileRowIndex>,
+}
+
+impl VisibleFileRows {
+    fn append(
+        &mut self,
+        files: &FilePane,
+        entries: &[RemoteEntry],
+        query: &str,
+        branch: Option<usize>,
+        depth: usize,
+    ) {
+        for (index, entry) in entries.iter().enumerate() {
+            if self.hide_hidden && entry.hidden {
+                continue;
+            }
+            if query.is_empty() || entry.is_dir || entry.name.to_lowercase().contains(query) {
+                self.entries.push(FileRowIndex {
+                    branch,
+                    index,
+                    depth,
+                });
+            }
+            if let Some(Some(entries)) = files.branches.get(&entry.path) {
+                let branch = self.branches.len();
+                self.branches.push(entry.path.clone());
+                self.append(files, entries, query, Some(branch), depth + 1);
+            }
         }
-        if let Some(Some(entries)) = files.branches.get(&entry.path) {
-            visible_entries(files, entries, query, depth + 1, visible);
-        }
+    }
+
+    fn entry<'a>(&self, files: &'a FilePane, index: usize) -> Option<(&'a RemoteEntry, usize)> {
+        let row = self.entries.get(index)?;
+        let entries = match row.branch {
+            Some(branch) => files.branches.get(&self.branches[branch])?.as_ref()?,
+            None => &files.entries,
+        };
+        Some((entries.get(row.index)?, row.depth))
     }
 }
 

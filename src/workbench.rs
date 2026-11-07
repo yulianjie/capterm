@@ -11,14 +11,14 @@ use std::io::Write;
 use std::rc::Rc;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{Theme, TitleBar, WindowExt};
 use gpui_kit::*;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
 use crate::config::{self, ConnectionProfile, Settings, ThemePreference};
@@ -44,6 +44,8 @@ pub fn open(cx: &mut App) {
     };
     ui::install_theme(cx);
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        // The session runtime primarily waits on I/O. GPUI has its own workers.
+        .worker_threads(std::thread::available_parallelism().map_or(2, |count| count.get().min(4)))
         .thread_name("capterm-session")
         .enable_all()
         .build()
@@ -114,6 +116,7 @@ struct TerminalObservation {
     prompt: u64,
     notification: u64,
     fullscreen: bool,
+    agent_running: bool,
 }
 
 struct ConnectionTest {
@@ -184,8 +187,7 @@ struct Tab {
     operation: AbortHandle,
     monitor: Option<AbortHandle>,
     monitor_state: monitor::MonitorState,
-    monitor_active: Arc<AtomicBool>,
-    sample: Option<(Metrics, Instant)>,
+    sample: Option<Arc<Metrics>>,
     files: FilePane,
     _subscriptions: Vec<Subscription>,
 }
@@ -243,7 +245,7 @@ enum Event {
     TestFinished(u64, Result<(), String>),
     Route(u64, HopProgress),
     Shell(u64, ShellEvent),
-    Sample(u64, Option<Metrics>),
+    Sample(u64, Metrics),
     File(u64, FileEvent),
     DragFinished(String),
 }
@@ -274,7 +276,8 @@ struct Workbench {
     notifications_open: bool,
     tests: HashMap<u64, ConnectionTest>,
     recent_tests: VecDeque<(String, Vec<HopProgress>)>,
-    window_active: Arc<AtomicBool>,
+    window_active: bool,
+    monitored_tab: watch::Sender<Option<u64>>,
     monitor_interval: Arc<AtomicU64>,
     file_editors: Vec<files::FileEditor>,
     active_file_editor: Option<u64>,
@@ -314,8 +317,8 @@ impl Workbench {
             }
         });
         let activation = cx.observe_window_activation(window, |this, window, _| {
-            this.window_active
-                .store(window.is_window_active(), Ordering::Relaxed);
+            this.window_active = window.is_window_active();
+            this.set_monitored_tab(this.active);
         });
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
             if this.settings.theme == ThemePreference::System {
@@ -365,7 +368,8 @@ impl Workbench {
             notifications_open: false,
             tests: HashMap::new(),
             recent_tests: VecDeque::new(),
-            window_active: Arc::new(AtomicBool::new(true)),
+            window_active: window.is_window_active(),
+            monitored_tab: watch::Sender::new(None),
             monitor_interval,
             file_editors: Vec::new(),
             active_file_editor: None,
@@ -539,10 +543,19 @@ impl Workbench {
     }
 
     fn set_monitored_tab(&self, id: Option<u64>) {
-        for tab in &self.tabs {
-            tab.monitor_active
-                .store(Some(tab.id) == id, Ordering::Relaxed);
-        }
+        let monitored = id.filter(|&id| {
+            self.window_active
+                && self
+                    .tab(id)
+                    .is_some_and(|tab| !tab.is_local() && !tab.monitor_state.paused)
+        });
+        self.monitored_tab.send_if_modified(|current| {
+            if *current == monitored {
+                return false;
+            }
+            *current = monitored;
+            true
+        });
     }
 
     fn close_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -559,6 +572,8 @@ impl Workbench {
             self.active = None;
             if let Some(tab) = self.tabs.get(index.min(self.tabs.len().saturating_sub(1))) {
                 self.select_tab(tab.id, window, cx);
+            } else {
+                self.set_monitored_tab(None);
             }
         }
         cx.notify();
@@ -740,7 +755,6 @@ impl Workbench {
             operation: operation.abort_handle(),
             monitor: None,
             monitor_state: monitor::MonitorState::default(),
-            monitor_active: Arc::new(AtomicBool::new(false)),
             sample: None,
             files: FilePane::default(),
             _subscriptions: vec![
@@ -934,29 +948,13 @@ impl Workbench {
                         terminal.system_message(format!("已启用端口转发 · {rule}"), cx);
                     });
                 }
-                let monitor_active = tab.monitor_active.clone();
-                let paused = tab.monitor_state.paused.clone();
-                let window_active = self.window_active.clone();
-                let interval = self.monitor_interval.clone();
-                let events = self.events.clone();
-                let monitor = self.runtime.spawn(async move {
-                    let mut next = Instant::now();
-                    loop {
-                        if Instant::now() >= next
-                            && monitor_active.load(Ordering::Relaxed)
-                            && window_active.load(Ordering::Relaxed)
-                            && !paused.load(Ordering::Relaxed)
-                        {
-                            let result = connection.metrics().await.ok();
-                            next = Instant::now()
-                                + Duration::from_secs(interval.load(Ordering::Relaxed));
-                            if events.send(Event::Sample(id, result)).await.is_err() {
-                                break;
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                });
+                let monitor = self.runtime.spawn(monitor::sample_host(
+                    id,
+                    connection,
+                    self.monitored_tab.subscribe(),
+                    self.monitor_interval.clone(),
+                    self.events.clone(),
+                ));
                 if let Some(tab) = self.tab_mut(id) {
                     tab.monitor = Some(monitor.abort_handle());
                 }
@@ -1065,14 +1063,13 @@ impl Workbench {
                 self.finish_tab(id, Phase::Failed, &error, cx)
             }
             Event::Sample(id, sample) => {
-                if let Some((tab, sample)) = self
-                    .tab_mut(id)
-                    .filter(|tab| tab.phase == Phase::Connected)
-                    .zip(sample)
-                {
-                    tab.monitor_state.push(&sample);
-                    tab.sample = Some((sample, Instant::now()));
-                    cx.notify();
+                if let Some(tab) = self.tab_mut(id).filter(|tab| tab.phase == Phase::Connected) {
+                    let sample = Arc::new(sample);
+                    tab.monitor_state.push(sample.clone());
+                    tab.sample = Some(sample);
+                    if self.active == Some(id) {
+                        cx.notify();
+                    }
                 }
             }
             Event::File(id, event) => self.apply_file_event(id, event, window, cx),

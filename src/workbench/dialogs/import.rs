@@ -782,12 +782,7 @@ impl Workbench {
                     {
                         return;
                     }
-                    let mut settings = this.settings.clone();
-                    let mut changed = false;
-                    for source in &parsed {
-                        changed |= settings.sync_config(source);
-                    }
-                    if changed {
+                    if let Some(settings) = this.settings.synced_configs(&parsed) {
                         this.persist(settings, cx);
                     }
                 });

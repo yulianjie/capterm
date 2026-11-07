@@ -1733,6 +1733,8 @@ mod tests {
     const METRIC_SAMPLE: &[u8] = b"platform Linux\nos Test Linux\ncpu 1000000000000 500000000000\nmemory 1048576 262144\nswap 0 0\nload 0.42 0.44 0.48\nuptime 3600\ndisk 68% 680000 1000000 /volume with spaces\nnet en0 10000 20000\nprocess 12 125.3 8.5 build worker\n";
     const FIXTURE_TEXT: &str = "capterm\r\n你好\r\n";
     const FIXTURE_PATH: &str = "/fixture/notes.txt";
+    const FIXTURE_LARGE_PATH: &str = "/fixture/large.log";
+    const FIXTURE_LARGE_SIZE: u64 = 64 * crate::file_text::MEBIBYTE;
     const FIXTURE_MTIME: u32 = 1_700_000_001;
 
     #[test]
@@ -1946,6 +1948,13 @@ mod tests {
             .context("fixture text must open in the editor")?;
         assert_eq!(text.text, FIXTURE_TEXT);
         assert!(!text.readonly);
+        let preview = connection
+            .open_remote_text(FIXTURE_LARGE_PATH, TextEncoding::Utf8, 5)
+            .await?
+            .context("large file must open as a preview")?;
+        assert!(preview.readonly && preview.truncated);
+        assert_eq!(preview.size, Some(FIXTURE_LARGE_SIZE));
+        assert_eq!(preview.text.len(), crate::file_text::PREVIEW_BYTES as usize);
         let destination = temp.path().join("notes.txt");
         fs::write(&destination, "existing").await?;
         let (_signal, watch) = tokio::sync::watch::channel(TransferSignal::Running);
@@ -2481,10 +2490,22 @@ mod tests {
                     shell: None,
                     channels: HashMap::new(),
                     sftp_rejected: false,
-                    sftp_files: Arc::new(std::sync::Mutex::new(HashMap::from([(
-                        FIXTURE_PATH.to_owned(),
-                        (FIXTURE_TEXT.as_bytes().to_vec(), fixture_file_attrs()),
-                    )]))),
+                    sftp_files: Arc::new(std::sync::Mutex::new(HashMap::from([
+                        (
+                            FIXTURE_PATH.to_owned(),
+                            (FIXTURE_TEXT.as_bytes().to_vec(), fixture_file_attrs()),
+                        ),
+                        (
+                            FIXTURE_LARGE_PATH.to_owned(),
+                            (
+                                vec![b'x'; crate::file_text::PREVIEW_BYTES as usize + 1],
+                                FileAttributes {
+                                    size: Some(FIXTURE_LARGE_SIZE),
+                                    ..fixture_file_attrs()
+                                },
+                            ),
+                        ),
+                    ]))),
                     forwards: HashMap::new(),
                 };
                 tokio::spawn(async move {
