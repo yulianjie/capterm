@@ -436,7 +436,8 @@ impl TerminalView {
     }
 
     pub fn prompt_text(&self) -> Option<&str> {
-        self.prompt.as_ref().map(|(_, text)| text.as_str())
+        let (number, row) = self.prompt.as_ref()?;
+        Some(self.timeline.powershell_prompt(*number).unwrap_or(row))
     }
 
     pub fn notification_serial(&self) -> u64 {
@@ -665,13 +666,16 @@ impl TerminalView {
             .is_some_and(|stamp| stamp.number == number)
         {
             let text = timeline::row_text(grid, line);
-            if !text.is_empty()
-                && (prompt_complete || text.trim_end().ends_with(['$', '#', '❯', '%', '>']))
+            let powershell = self.timeline.powershell_prompt(number).is_some()
+                || timeline::is_powershell_prompt(&text);
+            if powershell
+                || !text.is_empty()
+                    && (prompt_complete || text.trim_end().ends_with(['$', '#', '❯', '%', '>']))
             {
                 self.prompt_serial = self.prompt_serial.wrapping_add(1);
                 let previous = self.agent_name();
                 self.launched_agent = None;
-                if prompt_complete || timeline::is_powershell_prompt(&text) {
+                if prompt_complete || powershell {
                     self.title_agent = None;
                     self.last_program = None;
                 }
@@ -1146,7 +1150,7 @@ impl TerminalView {
                     && !self.raw()
                 {
                     self.timeline.start_fallback(Local::now());
-                    if let Some(prompt) = self.prompt_text() {
+                    if let Some((_, prompt)) = &self.prompt {
                         let grid = self.term.grid();
                         let text = timeline::row_text(grid, grid.cursor.point.line);
                         let program = text

@@ -37,8 +37,8 @@ mod proxy;
 
 use agent_forward::{AgentForwarding, AgentLease};
 pub(crate) use files::{
-    RemoteMutation, RemoteText, SaveTextResult, TextEncoding, TransferChoice, TransferConflict,
-    TransferOptions, TransferOutcome, TransferSignal,
+    RemoteMutation, TransferChoice, TransferConflict, TransferOptions, TransferOutcome,
+    TransferSignal,
 };
 pub use forward::PortForward;
 use forward::{Forwarding, RemoteForwards};
@@ -85,6 +85,7 @@ pub struct RemoteEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    pub hidden: bool,
     pub size: Option<u64>,
     pub mtime: Option<u32>,
     pub permissions: Option<u32>,
@@ -868,6 +869,7 @@ impl Connection {
                 let metadata = entry.metadata();
                 Some(RemoteEntry {
                     path: join_remote(&path, &name),
+                    hidden: name.starts_with('.'),
                     name,
                     is_dir: entry.file_type().is_dir(),
                     size: metadata.size,
@@ -1507,15 +1509,6 @@ fn remote_temp(destination: &str) -> String {
     }
 }
 
-fn preserve_line_endings(original: &str, edited: &str) -> String {
-    let original_newlines = original.bytes().filter(|&byte| byte == b'\n').count();
-    if original_newlines > 0 && original.matches("\r\n").count() == original_newlines {
-        edited.replace("\r\n", "\n").replace('\n', "\r\n")
-    } else {
-        edited.to_owned()
-    }
-}
-
 async fn posix_rename(raw: &RawSftpSession, source: &str, destination: &str) -> Result<()> {
     let mut arguments = Vec::new();
     for path in [source, destination] {
@@ -1734,6 +1727,8 @@ mod tests {
     };
     use russh_sftp::protocol::{Attrs, Data, File as SftpFile, Handle, Name, Status, Version};
     use tokio::{io::AsyncReadExt, net::TcpListener, sync::RwLock, task::JoinHandle};
+
+    use crate::file_text::{SaveTextResult, TextEncoding, preserve_line_endings};
 
     const METRIC_SAMPLE: &[u8] = b"platform Linux\nos Test Linux\ncpu 1000000000000 500000000000\nmemory 1048576 262144\nswap 0 0\nload 0.42 0.44 0.48\nuptime 3600\ndisk 68% 680000 1000000 /volume with spaces\nnet en0 10000 20000\nprocess 12 125.3 8.5 build worker\n";
     const FIXTURE_TEXT: &str = "capterm\r\n你好\r\n";

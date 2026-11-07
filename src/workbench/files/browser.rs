@@ -140,7 +140,8 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab = self.active_tab();
-        let active = tab.filter(|tab| tab.connection.is_some()).map(|tab| tab.id);
+        let local = tab.is_some_and(Tab::browses_local_files);
+        let active = tab.filter(|tab| tab.has_file_browser()).map(|tab| tab.id);
         let refresh = file_tool("file-refresh", IconName::RefreshCw, "刷新文件", palette)
             .disabled(active.is_none())
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -159,7 +160,7 @@ impl Workbench {
                     "复制当前路径",
                     &view,
                     move |this, _, cx| {
-                        if let Some(path) = this.upload_directory(id) {
+                        if let Some(path) = this.file_directory(id) {
                             cx.write_to_clipboard(ClipboardItem::new_string(path));
                         }
                     },
@@ -176,7 +177,11 @@ impl Workbench {
             .border_b_1()
             .border_color(palette.line)
             .child(div().font_weight(FontWeight::SEMIBOLD).child("文件"))
-            .child(badge("SFTP", palette, mono.clone()))
+            .child(badge(
+                if local { "本地" } else { "SFTP" },
+                palette,
+                mono.clone(),
+            ))
             .child(
                 div()
                     .flex_1()
@@ -185,7 +190,7 @@ impl Workbench {
                     .text_color(palette.muted)
                     .text_size(px(12.))
                     .child(
-                        tab.filter(|tab| !tab.is_local())
+                        tab.filter(|tab| local || !tab.is_local())
                             .map_or_else(String::new, |tab| tab.name().to_owned()),
                     ),
             )
@@ -200,8 +205,9 @@ impl Workbench {
             .border_r_1()
             .border_color(palette.line)
             .child(heading);
-        let Some(tab) = tab.filter(|tab| tab.connection.is_some()) else {
-            let connecting = tab.filter(|tab| !tab.is_local() && tab.phase == Phase::Connecting);
+        let Some(tab) = tab.filter(|tab| tab.has_file_browser()) else {
+            let connecting =
+                tab.filter(|tab| (local || !tab.is_local()) && tab.phase == Phase::Connecting);
             return pane
                 .child(
                     col()
@@ -229,7 +235,7 @@ impl Workbench {
                             if connecting.is_some() {
                                 "连接建立后会自动打开登录目录。"
                             } else {
-                                "连接会话后，这里显示远程主机的文件。"
+                                "连接 SSH 或打开 PowerShell 后，这里显示会话文件。"
                             },
                         )),
                 )
@@ -239,7 +245,8 @@ impl Workbench {
         let files = &tab.files;
         let directory = files.directory.clone();
         let can_operate = !directory.is_empty();
-        let crumb_values = breadcrumbs(&directory, width);
+        let crumb_values = breadcrumbs(&directory, width, local);
+        let separator = if local { "\\" } else { "/" };
         let pathbar = row()
             .h(px(32.))
             .flex_shrink_0()
@@ -262,7 +269,7 @@ impl Workbench {
                     .gap(px(3.))
                     .overflow_hidden()
                     .text_color(palette.muted)
-                    .child("/")
+                    .when(!local, |path| path.child("/"))
                     .children(
                         crumb_values
                             .into_iter()
@@ -272,7 +279,7 @@ impl Workbench {
                                 row()
                                     .min_w_0()
                                     .gap(px(3.))
-                                    .when(i > 0, |crumb| crumb.child("/"))
+                                    .when(i > 0, |crumb| crumb.child(separator))
                                     .child(
                                         div()
                                             .id(("file-crumb", i))
@@ -321,7 +328,7 @@ impl Workbench {
                         cx.notify();
                     })),
             );
-        let parent = parent_path(&directory);
+        let parent = file_parent(&directory, local);
         let selected = files.selected.clone().filter(|entry| !entry.is_dir);
         let toolbar = row()
             .h(px(32.))
@@ -332,43 +339,68 @@ impl Workbench {
             .border_color(palette.line)
             .child(
                 file_tool("file-parent", IconName::ArrowUp, "上一级", palette)
-                    .disabled(!can_operate || directory == "/")
-                    .on_click(cx.listener(move |this, _, _, cx| this.list(id, parent.clone(), cx))),
-            )
-            .child(
-                file_tool("file-new", IconName::FilePlus, "新建文件", palette)
-                    .disabled(!can_operate)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(path) = this.upload_directory(id) {
-                            this.file_name_dialog(id, NameAction::File(path), window, cx);
-                        }
-                    })),
-            )
-            .child(
-                file_tool("file-mkdir", IconName::FolderPlus, "新建文件夹", palette)
-                    .disabled(!can_operate)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(path) = this.upload_directory(id) {
-                            this.file_name_dialog(id, NameAction::Directory(path), window, cx);
-                        }
-                    })),
-            )
-            .child(
-                file_tool("file-upload", IconName::Upload, "上传文件…", palette)
-                    .disabled(!can_operate)
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.pick_upload(id, window, cx)),
-                    ),
-            )
-            .child(
-                file_tool("file-download", IconName::Download, "下载所选文件", palette)
-                    .disabled(selected.is_none())
+                    .disabled(!can_operate || parent.is_none())
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(entry) = selected.clone() {
-                            this.download_to_default(id, entry, cx);
+                        if let Some(path) = &parent {
+                            this.list(id, path.clone(), cx);
                         }
                     })),
             )
+            .when(local, |toolbar| {
+                toolbar.child(
+                    file_tool(
+                        "file-pick-folder",
+                        IconName::FolderOpen,
+                        "选择本地文件夹…",
+                        palette,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.pick_local_directory(id, window, cx);
+                    })),
+                )
+            })
+            .when(!local, |toolbar| {
+                toolbar
+                    .child(
+                        file_tool("file-new", IconName::FilePlus, "新建文件", palette)
+                            .disabled(!can_operate)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(path) = this.upload_directory(id) {
+                                    this.file_name_dialog(id, NameAction::File(path), window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        file_tool("file-mkdir", IconName::FolderPlus, "新建文件夹", palette)
+                            .disabled(!can_operate)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(path) = this.upload_directory(id) {
+                                    this.file_name_dialog(
+                                        id,
+                                        NameAction::Directory(path),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
+                    .child(
+                        file_tool("file-upload", IconName::Upload, "上传文件…", palette)
+                            .disabled(!can_operate)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.pick_upload(id, window, cx)
+                            })),
+                    )
+                    .child(
+                        file_tool("file-download", IconName::Download, "下载所选文件", palette)
+                            .disabled(selected.is_none())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(entry) = selected.clone() {
+                                    this.download_to_default(id, entry, cx);
+                                }
+                            })),
+                    )
+            })
             .child(div().flex_1())
             .child(
                 file_tool(
@@ -438,9 +470,9 @@ impl Workbench {
             .unwrap_or_default();
         let mut visible = Vec::new();
         visible_entries(files, &files.entries, &query, 0, &mut visible);
-        let rows = visible.into_iter().map(|(entry, depth)| {
-            self.render_file_row(id, files, entry, depth, palette, &mono, cx)
-        });
+        let rows = visible
+            .into_iter()
+            .map(|(entry, depth)| self.render_file_row(tab, entry, depth, palette, &mono, cx));
         let drop_destination = directory.clone();
         let scroll = div()
             .id(("file-rows", id))
@@ -449,7 +481,7 @@ impl Workbench {
             .pt(px(3.))
             .overflow_y_scroll()
             .when(files.loading && files.entries.is_empty(), |list| {
-                list.child(file_message("正在读取远端目录…", palette.muted))
+                list.child(file_message("正在读取目录…", palette.muted))
             })
             .when(
                 !files.loading && files.entries.is_empty() && files.error.is_none(),
@@ -457,12 +489,12 @@ impl Workbench {
             )
             .when_some(files.error.as_ref(), |list, error| {
                 list.child(file_message(
-                    format!("无法读取远端文件 · {error}"),
+                    format!("无法读取目录 · {error}"),
                     palette.warn,
                 ))
             })
             .children(rows)
-            .when(can_operate, |list| {
+            .when(!local && can_operate, |list| {
                 list.on_drag_move::<ExternalPaths>(cx.listener(
                     move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
                         let count = event.drag(cx).paths().len();
@@ -549,14 +581,14 @@ impl Workbench {
             .child(scroll)
             .children(drop_hint)
             .children(self.render_transfers(id, files, palette, window, cx))
-            .when(platform::drag_supported(), |pane| {
+            .when(!local && platform::drag_supported(), |pane| {
                 pane.child(self.track_native_file_drag(id, cx))
             })
             .into_any_element()
     }
 
     pub(in crate::workbench) fn refresh_files(&mut self, id: u64, cx: &mut Context<Self>) {
-        let directory = self.upload_directory(id).unwrap_or_else(|| ".".into());
+        let directory = self.file_directory(id).unwrap_or_else(|| ".".into());
         let branches: Vec<_> = self
             .tab(id)
             .into_iter()
@@ -566,6 +598,32 @@ impl Workbench {
         for path in branches {
             self.refresh_file_directory(id, directory.clone(), path, cx);
         }
+    }
+
+    fn pick_local_directory(&mut self, id: u64, window: &Window, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择本地文件夹".into()),
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = prompt.await;
+            let _ = view.update_in(cx, |this, _, cx| match result {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.first() {
+                        if let Some(path) = path.to_str() {
+                            this.list(id, path.into(), cx);
+                        } else {
+                            this.announce("无法读取该文件夹路径", cx);
+                        }
+                    }
+                }
+                Ok(Err(error)) => this.announce(format!("无法选择文件夹 · {error:#}"), cx),
+                _ => {}
+            });
+        })
+        .detach();
     }
 
     fn toggle_file_filter(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -590,14 +648,16 @@ impl Workbench {
 
     fn render_file_row(
         &self,
-        id: u64,
-        files: &FilePane,
+        tab: &Tab,
         entry: &RemoteEntry,
         depth: usize,
         palette: Palette,
         mono: &SharedString,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let id = tab.id;
+        let files = &tab.files;
+        let local = tab.browses_local_files();
         let open = files.branches.contains_key(&entry.path);
         let selected = files
             .selected
@@ -673,7 +733,7 @@ impl Workbench {
                         div()
                             .truncate()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(if entry.name.starts_with('.') {
+                            .text_color(if entry.hidden {
                                 palette.muted
                             } else {
                                 palette.ink
@@ -730,19 +790,21 @@ impl Workbench {
             entry: entry.clone(),
         };
         let view = cx.weak_entity();
-        let file_row = file_row.on_drag(drag, move |drag, _, _, cx| {
-            if !drag.entry.is_dir && platform::drag_supported() {
-                let _ = view.update(cx, |this, _| {
-                    if let Some(tab) = this.tab_mut(drag.tab) {
-                        tab.files.native_drag = Some(drag.entry.clone());
-                    }
-                });
-            }
-            cx.new(|_| FileDragPreview(drag.entry.name.clone(), palette))
+        let file_row = file_row.when(!local, |row| {
+            row.on_drag(drag, move |drag, _, _, cx| {
+                if !drag.entry.is_dir && platform::drag_supported() {
+                    let _ = view.update(cx, |this, _| {
+                        if let Some(tab) = this.tab_mut(drag.tab) {
+                            tab.files.native_drag = Some(drag.entry.clone());
+                        }
+                    });
+                }
+                cx.new(|_| FileDragPreview(drag.entry.name.clone(), palette))
+            })
         });
         let destination = entry.path.clone();
         let drop_target = destination.clone();
-        let file_row = file_row.when(entry.is_dir, |row| {
+        let file_row = file_row.when(!local && entry.is_dir, |row| {
             row.drag_over::<ExternalPaths>(move |style, _, _, _| {
                 style
                     .bg(palette.tint)
@@ -776,6 +838,50 @@ impl Workbench {
         file_row
             .context_menu(move |menu, _, _| {
                 let open = entry.clone();
+                if local {
+                    let path = entry.path.clone();
+                    let menu = menu.item(menu_action(
+                        if entry.is_dir {
+                            "打开文件夹"
+                        } else {
+                            "打开 / 编辑"
+                        },
+                        &view,
+                        move |this, window, cx| {
+                            this.open_entry(id, open.clone(), true, TextEncoding::Utf8, window, cx);
+                        },
+                    ));
+                    let menu = if entry.is_dir {
+                        menu
+                    } else {
+                        let gbk = entry.clone();
+                        let external = entry.clone();
+                        menu.item(menu_action(
+                            "用 GBK 编码打开",
+                            &view,
+                            move |this, window, cx| {
+                                this.open_entry(
+                                    id,
+                                    gbk.clone(),
+                                    true,
+                                    TextEncoding::Gbk,
+                                    window,
+                                    cx,
+                                );
+                            },
+                        ))
+                        .item(menu_action(
+                            "使用系统程序打开",
+                            &view,
+                            move |this, _, cx| {
+                                this.open_system_entry(&external, cx);
+                            },
+                        ))
+                    };
+                    return menu.item(menu_action("复制路径", &view, move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()))
+                    }));
+                }
                 let download = entry.clone();
                 let gbk = entry.clone();
                 let path = entry.path.clone();
@@ -1506,7 +1612,7 @@ fn visible_entries<'a>(
 ) {
     for entry in entries
         .iter()
-        .filter(|entry| !files.hide_hidden || !entry.name.starts_with('.'))
+        .filter(|entry| !files.hide_hidden || !entry.hidden)
     {
         if query.is_empty() || entry.name.to_lowercase().contains(query) || entry.is_dir {
             visible.push((entry, depth));
@@ -1517,17 +1623,34 @@ fn visible_entries<'a>(
     }
 }
 
-fn breadcrumbs(directory: &str, width: Pixels) -> Vec<(String, String)> {
+fn breadcrumbs(directory: &str, width: Pixels, local: bool) -> Vec<(String, String)> {
     let mut path = String::new();
-    let mut parts: Vec<_> = directory
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            path.push('/');
-            path.push_str(part);
-            (part.to_owned(), path.clone())
-        })
-        .collect();
+    let mut parts: Vec<_> = if local {
+        let mut parts = Path::new(directory)
+            .ancestors()
+            .filter(|path| path.is_absolute())
+            .filter_map(|path| {
+                let value = path.to_str()?;
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_else(|| value.trim_end_matches(['\\', '/']));
+                Some((name.to_owned(), value.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        parts.reverse();
+        parts
+    } else {
+        directory
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                path.push('/');
+                path.push_str(part);
+                (part.to_owned(), path.clone())
+            })
+            .collect()
+    };
     let max_chars = (f32::from(width) - 108.).max(16.) as usize / 7;
     let mut chars = parts
         .iter()

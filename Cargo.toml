@@ -45,6 +45,7 @@ portable-pty = "=0.9.0"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_Marshal",
     "Win32_System_Com_StructuredStorage",

@@ -78,6 +78,12 @@ impl Timeline {
     pub(super) fn latest_prompt(&self) -> Option<u64> {
         self.commands.last_key_value().map(|(&number, _)| number)
     }
+
+    pub(super) fn powershell_prompt(&self, number: u64) -> Option<&str> {
+        let text = self.commands.get(&number)?.prompt.as_ref()?.text();
+        is_powershell_prompt(text).then_some(text)
+    }
+
     pub(super) fn touch(
         &mut self,
         grid: &Grid<Cell>,

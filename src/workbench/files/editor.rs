@@ -15,10 +15,11 @@ use crate::workbench::ui::{Palette, button, col, primary, row, tab_close_tool};
 pub(in crate::workbench) struct FileEditor {
     pub(in crate::workbench) id: u64,
     terminal: u64,
+    local: bool,
     hostname: String,
     entry: RemoteEntry,
     state: Entity<EditorState>,
-    original: RemoteText,
+    original: FileText,
     pinned: bool,
     dirty: bool,
     busy: bool,
@@ -31,7 +32,7 @@ pub(in crate::workbench) struct FileEditor {
 }
 
 struct EditorConflict {
-    remote: Option<RemoteText>,
+    current: Option<FileText>,
 }
 
 impl Workbench {
@@ -76,14 +77,18 @@ impl Workbench {
         &mut self,
         terminal: u64,
         entry: RemoteEntry,
-        original: RemoteText,
+        original: FileText,
         pinned: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hostname = self
-            .tab(terminal)
-            .map_or_else(String::new, |tab| tab.name().to_owned());
+        let local = self.tab(terminal).is_some_and(Tab::browses_local_files);
+        let hostname = if local {
+            "本地".into()
+        } else {
+            self.tab(terminal)
+                .map_or_else(String::new, |tab| tab.name().to_owned())
+        };
         let id = self.new_id();
         let language = editor_language(&entry.name).1;
         let normalized = normalize(&original.text).into_owned();
@@ -128,6 +133,7 @@ impl Workbench {
         let editor = FileEditor {
             id,
             terminal,
+            local,
             hostname,
             entry,
             state,
@@ -230,13 +236,17 @@ impl Workbench {
             return;
         }
         let terminal = editor.terminal;
-        let connection = self.tab(terminal).and_then(|tab| tab.connection.clone());
+        let source = if editor.local {
+            Some(FileSource::Local)
+        } else {
+            self.tab(terminal).and_then(FileSource::for_tab)
+        };
         let editor = self
             .file_editors
             .iter_mut()
             .find(|editor| editor.id == id)
             .unwrap();
-        let Some(connection) = connection else {
+        let Some(source) = source else {
             editor.error = Some("SSH 会话已断开，请恢复连接后重试。".into());
             cx.notify();
             return;
@@ -248,8 +258,8 @@ impl Workbench {
         let path = editor.entry.path.clone();
         let events = self.events.clone();
         self.runtime.spawn(async move {
-            let result = connection
-                .save_remote_text(&path, &original, &edited, force)
+            let result = source
+                .save_text(&path, &original, &edited, force)
                 .await
                 .map_err(report_error);
             let _ = events
@@ -281,14 +291,19 @@ impl Workbench {
                 editor.diff = None;
                 let path = editor.entry.path.clone();
                 let terminal = editor.terminal;
-                if let Some(current) = self.upload_directory(terminal) {
-                    self.refresh_file_directory(terminal, current, parent_path(&path), cx);
+                let parent = file_parent(&path, editor.local);
+                if let Some((current, parent)) = self.file_directory(terminal).zip(parent) {
+                    self.refresh_file_directory(terminal, current, parent, cx);
                 }
             }
-            Ok(SaveTextResult::Conflict(remote)) => {
-                editor.conflict = Some(EditorConflict { remote })
+            Ok(SaveTextResult::Conflict(current)) => {
+                editor.conflict = Some(EditorConflict { current });
+                editor.diff = None;
             }
-            Err(error) => editor.error = Some(format!("保存到远端失败 · {error}")),
+            Err(error) => {
+                let target = if editor.local { "本地" } else { "远端" };
+                editor.error = Some(format!("保存到{target}失败 · {error}"));
+            }
         }
         cx.notify();
     }
@@ -297,11 +312,11 @@ impl Workbench {
         let Some(editor) = self.file_editors.iter_mut().find(|editor| editor.id == id) else {
             return;
         };
-        let Some(remote) = editor.conflict.take().and_then(|conflict| conflict.remote) else {
+        let Some(current) = editor.conflict.take().and_then(|conflict| conflict.current) else {
             return;
         };
-        let text = normalize(&remote.text).into_owned();
-        editor.original = remote;
+        let text = normalize(&current.text).into_owned();
+        editor.original = current;
         editor.dirty = false;
         editor.diff = None;
         editor.error = None;
@@ -320,21 +335,21 @@ impl Workbench {
             cx.notify();
             return;
         }
-        let Some(remote) = editor
+        let Some(current) = editor
             .conflict
             .as_ref()
-            .and_then(|conflict| conflict.remote.as_ref())
+            .and_then(|conflict| conflict.current.as_ref())
         else {
             return;
         };
-        let remote = normalize(&remote.text);
+        let current = normalize(&current.text);
         let local = editor.state.read(cx).value();
         let diff = TextDiff::configure()
             .timeout(Duration::from_millis(200))
-            .diff_lines(remote.as_ref(), local.as_ref());
+            .diff_lines(current.as_ref(), local.as_ref());
         let patch = diff
             .unified_diff()
-            .header("a/remote", "b/editor")
+            .header(if editor.local { "a/disk" } else { "a/remote" }, "b/editor")
             .to_string();
         let files = DiffFile::parse(&patch).unwrap_or_default();
         editor.diff = Some(cx.new(|cx| DiffState::new(files, cx)));
@@ -452,6 +467,7 @@ impl Workbench {
         let editor = self.active_editor()?;
         let id = editor.id;
         let terminal = editor.terminal;
+        let local = editor.local;
         let entry = editor.entry.clone();
         let download = entry.clone();
         let connected = self
@@ -483,7 +499,11 @@ impl Workbench {
         .icon(small_icon(IconName::Save, palette.primary_text))
         .child(Kbd::new(Keystroke::parse("ctrl-s").unwrap()))
         .disabled(
-            !connected || readonly || editor.busy || !editor.dirty || editor.conflict.is_some(),
+            !(local || connected)
+                || readonly
+                || editor.busy
+                || !editor.dirty
+                || editor.conflict.is_some(),
         )
         .on_click(cx.listener(move |this, _, _, cx| this.save_file_editor(id, false, cx)));
         let toolbar = row()
@@ -517,7 +537,14 @@ impl Workbench {
                             .font_family(mono.clone())
                             .text_size(px(12.))
                             .text_color(palette.muted)
-                            .child(small_icon(IconName::Server, palette.muted))
+                            .child(small_icon(
+                                if local {
+                                    IconName::Laptop
+                                } else {
+                                    IconName::Server
+                                },
+                                palette.muted,
+                            ))
                             .child(
                                 div()
                                     .max_w(px(100.))
@@ -541,7 +568,7 @@ impl Workbench {
                     .child("空格：2"),
             )
             .child(div().w(px(1.)).h(px(16.)).bg(palette.line))
-            .child(download_button)
+            .when(!local, |toolbar| toolbar.child(download_button))
             .child(save);
         let panel = col()
             .flex_1()
@@ -549,7 +576,7 @@ impl Workbench {
             .min_h_0()
             .bg(palette.base)
             .child(toolbar)
-            .when(!connected, |panel| {
+            .when(!local && !connected, |panel| {
                 panel.child(
                     row()
                         .min_h(px(32.))
@@ -562,19 +589,30 @@ impl Workbench {
                 )
             });
         let panel = if let Some(conflict) = &editor.conflict {
-            let changed = conflict.remote.as_ref().map_or_else(
-                || "直接保存会覆盖远端的修改。".into(),
-                |remote| {
-                    let time = file_time(remote.mtime)
+            let target = if local {
+                "本地文件"
+            } else {
+                "远端文件"
+            };
+            let changed = conflict.current.as_ref().map_or_else(
+                || {
+                    if local {
+                        "原文件已删除或无法作为文本读取。".into()
+                    } else {
+                        "继续保存会覆盖文件中的修改。".into()
+                    }
+                },
+                |current| {
+                    let time = file_time(current.mtime)
                         .map(|time| short_time(&time))
                         .unwrap_or_default();
-                    match (editor.original.size, remote.size) {
+                    match (editor.original.size, current.size) {
                         (Some(before), Some(after)) => format!(
-                            "{time} 远端文件被修改（{} → {}），直接保存会覆盖对方的修改。",
+                            "{time} 文件大小从 {} 变为 {}，继续保存会覆盖文件中的修改。",
                             byte_size(before),
                             byte_size(after)
                         ),
-                        _ => format!("{time} 远端文件被修改，直接保存会覆盖对方的修改。"),
+                        _ => format!("{time} 继续保存会覆盖文件中的修改。"),
                     }
                 },
             );
@@ -590,13 +628,13 @@ impl Workbench {
             .h(px(24.))
             .text_size(px(12.))
             .font_weight(FontWeight::MEDIUM)
-            .disabled(conflict.remote.is_none())
+            .disabled(conflict.current.is_none())
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_file_diff(id, cx)));
             let reload = button(("editor-reload", id), "重新加载", palette)
                 .h(px(24.))
                 .text_size(px(12.))
                 .font_weight(FontWeight::MEDIUM)
-                .disabled(conflict.remote.is_none() || editor.busy)
+                .disabled(conflict.current.is_none() || editor.busy)
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.reload_file_editor(id, window, cx)),
                 );
@@ -604,7 +642,10 @@ impl Workbench {
                 .h(px(24.))
                 .text_size(px(12.))
                 .font_weight(FontWeight::MEDIUM)
-                .disabled(editor.busy)
+                .disabled(
+                    editor.busy
+                        || (local && conflict.current.as_ref().is_none_or(|file| file.readonly)),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| this.save_file_editor(id, true, cx)));
             panel.child(
                 row()
@@ -624,7 +665,7 @@ impl Workbench {
                             .child(
                                 div()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("远端文件已更新。"),
+                                    .child(format!("{target}已更新。")),
                             )
                             .child(
                                 div()
@@ -651,17 +692,33 @@ impl Workbench {
                         div()
                             .flex_1()
                             .text_size(px(12.))
-                            .child("只读预览，显示文件的前 1 MB。"),
+                            .child(if editor.original.truncated {
+                                "只读预览，显示文件的前 1 MB。"
+                            } else {
+                                "此文件为只读。"
+                            }),
                     )
                     .child(
-                        button(("editor-open-local", id), "下载后用本机程序打开", palette)
-                            .h(px(24.))
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .disabled(!connected)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.download_and_open(terminal, entry.clone(), cx)
-                            })),
+                        button(
+                            ("editor-open-local", id),
+                            if local {
+                                "使用系统程序打开"
+                            } else {
+                                "下载后用本机程序打开"
+                            },
+                            palette,
+                        )
+                        .h(px(24.))
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .disabled(!local && !connected)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if local {
+                                this.open_system_entry(&entry, cx);
+                            } else {
+                                this.download_and_open(terminal, entry.clone(), cx);
+                            }
+                        })),
                     ),
             )
         } else {
@@ -705,8 +762,8 @@ impl Workbench {
 }
 
 fn normalize(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains("\r\n") {
-        text.replace("\r\n", "\n").into()
+    if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n").into()
     } else {
         text.into()
     }
@@ -742,7 +799,13 @@ fn changed_lines(original: &str, edited: &str, color: Hsla) -> Vec<GutterDecorat
 }
 
 fn line_endings(text: &str) -> &'static str {
-    if text.contains("\r\n") { "CRLF" } else { "LF" }
+    if text.contains("\r\n") {
+        "CRLF"
+    } else if text.contains('\r') && !text.contains('\n') {
+        "CR"
+    } else {
+        "LF"
+    }
 }
 
 fn editor_language(name: &str) -> (&'static str, &'static str) {

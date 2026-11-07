@@ -1,8 +1,10 @@
 mod browser;
 mod editor;
+mod local;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::InputState;
@@ -12,14 +14,73 @@ use tokio::task::AbortHandle;
 
 pub(super) use editor::FileEditor;
 
-use super::{Event, Phase, Workbench};
+use super::{Event, Phase, Tab, Workbench};
 use crate::config::TransferConflictPreference;
+use crate::file_text::{FileText, SaveTextResult, TextEncoding};
 use crate::ssh::{
-    RemoteEntry, RemoteMutation, RemoteText, SaveTextResult, TextEncoding, TransferChoice,
-    TransferConflict, TransferOptions, TransferOutcome, TransferSignal,
+    Connection, RemoteEntry, RemoteMutation, TransferChoice, TransferConflict, TransferOptions,
+    TransferOutcome, TransferSignal,
 };
 
 const CLIPBOARD_DIRECTORY: &str = "/tmp/capterm";
+
+enum FileSource {
+    Ssh(Arc<Connection>),
+    Local,
+}
+
+impl FileSource {
+    fn for_tab(tab: &Tab) -> Option<Self> {
+        if !tab.has_file_browser() {
+            return None;
+        }
+        if tab.browses_local_files() {
+            Some(Self::Local)
+        } else {
+            tab.connection.clone().map(Self::Ssh)
+        }
+    }
+
+    async fn list(&self, directory: &str) -> anyhow::Result<(String, Vec<RemoteEntry>)> {
+        match self {
+            Self::Ssh(connection) => connection.list(directory).await,
+            Self::Local => local::list(directory).await,
+        }
+    }
+
+    async fn open_text(
+        &self,
+        path: &str,
+        encoding: TextEncoding,
+        edit_limit_mb: u64,
+    ) -> anyhow::Result<Option<FileText>> {
+        match self {
+            Self::Ssh(connection) => {
+                connection
+                    .open_remote_text(path, encoding, edit_limit_mb)
+                    .await
+            }
+            Self::Local => local::open_text(path, encoding, edit_limit_mb).await,
+        }
+    }
+
+    async fn save_text(
+        &self,
+        path: &str,
+        original: &FileText,
+        edited: &str,
+        force: bool,
+    ) -> anyhow::Result<SaveTextResult> {
+        match self {
+            Self::Ssh(connection) => {
+                connection
+                    .save_remote_text(path, original, edited, force)
+                    .await
+            }
+            Self::Local => local::save_text(path, original, edited, force).await,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct FilePane {
@@ -135,7 +196,7 @@ pub(super) enum FileEvent {
     List(u64, Result<(String, Vec<RemoteEntry>), String>),
     Branch(u64, String, Result<Vec<RemoteEntry>, String>),
     Directory(Result<String, String>),
-    Text(u64, RemoteEntry, Result<Option<RemoteText>, String>),
+    Text(u64, RemoteEntry, Result<Option<FileText>, String>),
     ClipboardReady(Result<(tempfile::TempDir, PathBuf), String>),
     Saved(u64, String, Result<SaveTextResult, String>),
     Mutation(Result<(), String>),
@@ -150,7 +211,7 @@ fn report_error(error: anyhow::Error) -> String {
 impl Workbench {
     pub(super) fn list(&mut self, id: u64, directory: String, cx: &mut Context<Self>) {
         let Some(tab) = self.tab_mut(id) else { return };
-        let Some(connection) = tab.connection.clone() else {
+        let Some(source) = FileSource::for_tab(tab) else {
             return;
         };
         tab.files.listing += 1;
@@ -160,7 +221,7 @@ impl Workbench {
         let listing = tab.files.listing;
         let events = self.events.clone();
         self.runtime.spawn(async move {
-            let result = connection.list(&directory).await.map_err(report_error);
+            let result = source.list(&directory).await.map_err(report_error);
             let _ = events
                 .send(Event::File(id, FileEvent::List(listing, result)))
                 .await;
@@ -170,20 +231,26 @@ impl Workbench {
 
     fn toggle_directory(&mut self, id: u64, entry: RemoteEntry, cx: &mut Context<Self>) {
         let Some(tab) = self.tab_mut(id) else { return };
-        let Some(connection) = tab.connection.clone() else {
+        let Some(source) = FileSource::for_tab(tab) else {
             return;
         };
         tab.files.selected = Some(entry.clone());
         if tab.files.branches.remove(&entry.path).is_some() {
-            tab.files
-                .branches
-                .retain(|path, _| !path.starts_with(&format!("{}/", entry.path)));
+            let local = tab.browses_local_files();
+            let remote_prefix = format!("{}/", entry.path);
+            tab.files.branches.retain(|path, _| {
+                if local {
+                    !Path::new(path).starts_with(&entry.path)
+                } else {
+                    !path.starts_with(&remote_prefix)
+                }
+            });
         } else {
             tab.files.branches.insert(entry.path.clone(), None);
             let listing = tab.files.listing;
             let events = self.events.clone();
             self.runtime.spawn(async move {
-                let result = connection
+                let result = source
                     .list(&entry.path)
                     .await
                     .map(|(_, entries)| entries)
@@ -205,10 +272,19 @@ impl Workbench {
         directory: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.tab_mut(id) else { return };
-        if !directory.starts_with('/') || directory.contains('\0') {
+        let Some(tab) = self.tab_mut(id).filter(|tab| tab.has_file_browser()) else {
             return;
-        }
+        };
+        let directory = if tab.browses_local_files() {
+            let Some(path) = local::osc_directory(&directory) else {
+                return;
+            };
+            path
+        } else if directory.starts_with('/') && !directory.contains('\0') {
+            directory
+        } else {
+            return;
+        };
         tab.files.osc_directory = true;
         self.set_terminal_directory(id, directory, cx);
     }
@@ -217,22 +293,31 @@ impl Workbench {
         let Some(tab) = self.tab_mut(id) else { return };
         let changed = tab.files.terminal_directory.as_ref() != Some(&directory);
         tab.files.terminal_directory = Some(directory.clone());
-        if changed && !tab.files.follow_disabled && tab.files.directory != directory {
+        let current = tab
+            .files
+            .navigation
+            .as_deref()
+            .unwrap_or(&tab.files.directory);
+        if changed && !tab.files.follow_disabled && current != directory {
             self.list(id, directory, cx);
         }
     }
 
     pub(super) fn file_prompt_ready(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(tab) = self.tab_mut(id) else { return };
+        let Some(tab) = self.tab_mut(id).filter(|tab| tab.has_file_browser()) else {
+            return;
+        };
         if tab.files.osc_directory {
             return;
         }
-        if let Some(directory) = tab
-            .terminal
-            .read(cx)
-            .prompt_text()
-            .and_then(|line| prompt_directory(line, &tab.files.home))
-        {
+        let prompt = tab.terminal.read(cx).prompt_text();
+        if tab.browses_local_files() {
+            if let Some(directory) = prompt.and_then(local::prompt_directory) {
+                self.set_terminal_directory(id, directory, cx);
+            }
+            return;
+        }
+        if let Some(directory) = prompt.and_then(|line| prompt_directory(line, &tab.files.home)) {
             self.set_terminal_directory(id, directory, cx);
             return;
         }
@@ -287,6 +372,11 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         if entry.is_dir {
+            if let Some(tab) = self.tab_mut(id)
+                && tab.files.pending_editor.take().is_some()
+            {
+                tab.files.editor_request += 1;
+            }
             if pinned {
                 self.list(id, entry.path, cx);
             } else {
@@ -305,7 +395,7 @@ impl Workbench {
             return;
         }
         let Some(tab) = self.tab_mut(id) else { return };
-        let Some(connection) = tab.connection.clone() else {
+        let Some(source) = FileSource::for_tab(tab) else {
             return;
         };
         if let Some((path, requested, pin)) = &mut tab.files.pending_editor
@@ -322,8 +412,8 @@ impl Workbench {
         let edit_limit_mb = self.settings.file_edit_limit_mb;
         let events = self.events.clone();
         self.runtime.spawn(async move {
-            let result = connection
-                .open_remote_text(&entry.path, encoding, edit_limit_mb)
+            let result = source
+                .open_text(&entry.path, encoding, edit_limit_mb)
                 .await
                 .map_err(report_error);
             let _ = events
@@ -331,6 +421,12 @@ impl Workbench {
                 .await;
         });
         cx.notify();
+    }
+
+    fn open_system_entry(&mut self, entry: &RemoteEntry, cx: &mut Context<Self>) {
+        if let Err(error) = open_local_file(Path::new(&entry.path)) {
+            self.announce(format!("无法打开 {} · {error:#}", entry.name), cx);
+        }
     }
 
     fn pick_upload(&mut self, id: u64, window: &Window, cx: &mut Context<Self>) {
@@ -354,11 +450,15 @@ impl Workbench {
         .detach();
     }
 
-    fn upload_directory(&self, id: u64) -> Option<String> {
+    fn file_directory(&self, id: u64) -> Option<String> {
         let tab = self.tab(id)?;
-        tab.connection.as_ref()?;
-        (!tab.files.directory.is_empty() && tab.phase == Phase::Connected)
+        (tab.has_file_browser() && !tab.files.directory.is_empty())
             .then(|| tab.files.directory.clone())
+    }
+
+    fn upload_directory(&self, id: u64) -> Option<String> {
+        self.tab(id)?.connection.as_ref()?;
+        self.file_directory(id)
     }
 
     pub(super) fn upload_terminal_clipboard(
@@ -885,13 +985,13 @@ impl Workbench {
         else {
             return;
         };
-        let Some(connection) = tab.connection.clone() else {
+        let Some(source) = FileSource::for_tab(tab) else {
             return;
         };
         let listing = tab.files.listing;
         let events = self.events.clone();
         self.runtime.spawn(async move {
-            let result = connection
+            let result = source
                 .list(&updated)
                 .await
                 .map(|(_, entries)| entries)
@@ -946,7 +1046,8 @@ impl Workbench {
                             tab.files.branches.clear();
                             tab.files.selected = None;
                         } else if let Some(selected) = &tab.files.selected
-                            && parent_path(&selected.path) == directory
+                            && file_parent(&selected.path, tab.browses_local_files()).as_deref()
+                                == Some(directory.as_str())
                         {
                             tab.files.selected = entries
                                 .iter()
@@ -979,6 +1080,7 @@ impl Workbench {
                 self.set_terminal_directory(id, directory, cx);
             }
             FileEvent::Text(request, entry, result) if request == tab.files.editor_request => {
+                let local = tab.browses_local_files();
                 let pinned = tab
                     .files
                     .pending_editor
@@ -989,6 +1091,9 @@ impl Workbench {
                 }
                 match result {
                     Ok(Some(text)) => self.install_file_editor(id, entry, text, pinned, window, cx),
+                    Ok(None) if pinned && local => {
+                        self.open_system_entry(&entry, cx);
+                    }
                     Ok(None) if pinned => self.download_and_open(id, entry, cx),
                     Ok(None) => {}
                     Err(error) => self.announce(format!("无法打开 {} · {error}", entry.name), cx),
@@ -1096,6 +1201,14 @@ pub(super) fn parent_path(path: &str) -> String {
     match path.rsplit_once('/') {
         Some(("", _)) | None => "/".into(),
         Some((parent, _)) => parent.into(),
+    }
+}
+
+fn file_parent(path: &str, local: bool) -> Option<String> {
+    if local {
+        Path::new(path).parent()?.to_str().map(str::to_owned)
+    } else {
+        (path != "/").then(|| parent_path(path))
     }
 }
 

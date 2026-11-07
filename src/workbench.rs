@@ -209,6 +209,14 @@ impl Tab {
         matches!(self.session, Session::Local(_))
     }
 
+    fn browses_local_files(&self) -> bool {
+        matches!(self.session, Session::Local(LocalShell::PowerShell))
+    }
+
+    fn has_file_browser(&self) -> bool {
+        self.phase == Phase::Connected && (self.browses_local_files() || self.connection.is_some())
+    }
+
     fn bind_shell(&mut self, commands: ShellInput) {
         self.phase = Phase::Connected;
         let size = self.link.size.get();
@@ -958,6 +966,9 @@ impl Workbench {
             Event::LocalStarted(id, commands) => {
                 if let Some(tab) = self.tab_mut(id) {
                     tab.bind_shell(ShellInput::Local(commands));
+                    if tab.browses_local_files() {
+                        self.list(id, ".".into(), cx);
+                    }
                     cx.notify();
                 }
             }

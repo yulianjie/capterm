@@ -6,44 +6,14 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
+use crate::file_text::{
+    FileText, MEBIBYTE, PREVIEW_BYTES, SaveTextResult, TEXT_PROBE_BYTES, TextEncoding, decode_text,
+    encode_text, preserve_line_endings, strip_bom,
+};
+
 use super::*;
 
-const MEBIBYTE: u64 = 1024 * 1024;
-const PREVIEW_LIMIT: u64 = 50 * 1024 * 1024;
-const PREVIEW_BYTES: u64 = 1024 * 1024;
-const TEXT_PROBE_BYTES: usize = 8192;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum TextEncoding {
-    #[default]
-    Utf8,
-    Gbk,
-}
-
-impl TextEncoding {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Utf8 => "UTF-8",
-            Self::Gbk => "GBK",
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct RemoteText {
-    pub text: String,
-    pub readonly: bool,
-    pub encoding: TextEncoding,
-    pub size: Option<u64>,
-    pub mtime: Option<u32>,
-    bom: bool,
-    edit_limit: u64,
-}
-
-pub(crate) enum SaveTextResult {
-    Saved(RemoteText),
-    Conflict(Option<RemoteText>),
-}
+const PREVIEW_LIMIT: u64 = 50 * MEBIBYTE;
 
 pub(crate) enum RemoteMutation {
     CreateFile(String),
@@ -112,7 +82,7 @@ impl Connection {
         path: &str,
         encoding: TextEncoding,
         edit_limit_mb: u64,
-    ) -> Result<Option<RemoteText>> {
+    ) -> Result<Option<FileText>> {
         let edit_limit = edit_limit_mb.clamp(1, 50) * MEBIBYTE;
         read_text(self.sftp().await?.as_ref(), path, encoding, edit_limit).await
     }
@@ -120,7 +90,7 @@ impl Connection {
     pub(crate) async fn save_remote_text(
         &self,
         path: &str,
-        original: &RemoteText,
+        original: &FileText,
         edited: &str,
         force: bool,
     ) -> Result<SaveTextResult> {
@@ -185,9 +155,10 @@ impl Connection {
         }
         posix_rename(&replacement.0, &staged.path, path).await?;
         staged.commit();
-        Ok(SaveTextResult::Saved(RemoteText {
+        Ok(SaveTextResult::Saved(FileText {
             text,
             readonly: false,
+            truncated: false,
             encoding: original.encoding,
             size: written.size,
             mtime: written.mtime,
@@ -459,7 +430,7 @@ async fn read_text(
     path: &str,
     encoding: TextEncoding,
     edit_limit: u64,
-) -> Result<Option<RemoteText>> {
+) -> Result<Option<FileText>> {
     let metadata = sftp.symlink_metadata(path).await?;
     if !metadata.file_type().is_file() || metadata.size.is_some_and(|size| size > PREVIEW_LIMIT) {
         return Ok(None);
@@ -497,61 +468,20 @@ async fn read_text(
     if readonly {
         data.truncate(PREVIEW_BYTES as usize);
     }
-    let bom = encoding == TextEncoding::Utf8 && data.starts_with(b"\xef\xbb\xbf");
-    let data = if bom { &data[3..] } else { &data };
+    let (data, bom) = strip_bom(&data, encoding);
     let Some(text) = decode_text(data, encoding, readonly) else {
         return Ok(None);
     };
-    Ok(Some(RemoteText {
+    Ok(Some(FileText {
         text,
         readonly,
+        truncated: readonly,
         encoding,
         size: metadata.size,
         mtime: metadata.mtime,
         bom,
         edit_limit,
     }))
-}
-
-fn decode_text(data: &[u8], encoding: TextEncoding, truncated: bool) -> Option<String> {
-    match encoding {
-        TextEncoding::Utf8 => match std::str::from_utf8(data) {
-            Ok(text) => Some(text.into()),
-            Err(error) if truncated && error.error_len().is_none() => {
-                std::str::from_utf8(&data[..error.valid_up_to()])
-                    .ok()
-                    .map(str::to_owned)
-            }
-            Err(_) => None,
-        },
-        TextEncoding::Gbk => encoding_rs::GBK
-            .decode_without_bom_handling_and_without_replacement(data)
-            .or_else(|| {
-                truncated
-                    .then(|| data.split_last())
-                    .flatten()
-                    .and_then(|(_, data)| {
-                        encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(data)
-                    })
-            })
-            .map(|text| text.into_owned()),
-    }
-}
-
-fn encode_text(text: &str, encoding: TextEncoding, bom: bool) -> Result<Vec<u8>> {
-    match encoding {
-        TextEncoding::Utf8 if bom => {
-            let mut bytes = b"\xef\xbb\xbf".to_vec();
-            bytes.extend_from_slice(text.as_bytes());
-            Ok(bytes)
-        }
-        TextEncoding::Utf8 => Ok(text.as_bytes().to_vec()),
-        TextEncoding::Gbk => {
-            let (bytes, _, had_errors) = encoding_rs::GBK.encode(text);
-            ensure!(!had_errors, "编辑内容包含 GBK 无法表示的字符");
-            Ok(bytes.into_owned())
-        }
-    }
 }
 
 fn validate_path_name(path: &str) -> Result<()> {

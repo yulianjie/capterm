@@ -544,6 +544,17 @@ mod tests {
     }
 
     #[test]
+    fn captures_the_full_powershell_path_when_the_prompt_wraps() {
+        let mut terminal = TerminalFixture::new(16, 6);
+        terminal.feed(b"PS C:\\Users\\fixture\\Project Files> ", 1);
+        let number = terminal.timeline.latest_prompt().unwrap();
+        assert_eq!(
+            terminal.timeline.powershell_prompt(number),
+            Some(r"PS C:\Users\fixture\Project Files>")
+        );
+    }
+
+    #[test]
     fn negotiates_only_implemented_keyboard_flags_and_restores_primary() {
         let events = TerminalEvents::default();
         let mut term = Term::new(Config::default(), &TerminalSize::default(), events.clone());

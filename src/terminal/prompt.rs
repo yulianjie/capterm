@@ -41,6 +41,10 @@ impl PromptColors {
 }
 
 impl Prompt {
+    pub(super) fn text(&self) -> &str {
+        &self.prefix[self.start..]
+    }
+
     pub(super) fn capture(grid: &Grid<Cell>, first: Line, start_column: usize) -> Option<Self> {
         let cursor = grid.cursor.point;
         let mut prefix = String::new();
