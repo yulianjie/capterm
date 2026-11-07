@@ -26,9 +26,9 @@ cargo build --release --locked
 
 ## 自动出包
 
-[Windows build and release](https://github.com/yulianjie/capterm/actions/workflows/windows.yml) 会在推送到 `main`、提交面向 `main` 的 PR 或手动运行时检查格式、运行测试并生成安装版和便携版。通过后可以从对应运行的 **Artifacts** 下载。
+[Windows build and release](https://github.com/yulianjie/capterm/actions/workflows/windows.yml) 会在推送到 `main`、提交面向 `main` 的 PR 或手动运行时检查格式、运行测试，并验证便携包及安装、卸载流程。
 
-发布新版本时，更新 `Cargo.toml` 中的版本号和 `Cargo.lock`，将提交推送到 `main`，再推送同版本的 `vX.Y.Z` 标签。工作流验证标签与项目版本一致后，自动将安装版、便携版和校验文件发布到 **Releases**。
+发布新版本时，更新 `Cargo.toml` 中的版本号和 `Cargo.lock`，将提交推送到 `main`，再推送同版本的 `vX.Y.Z` 标签。工作流验证标签与项目版本一致后，自动将安装版、便携版和校验文件直接发布到 **Releases**。
 
 ```powershell
 git tag -a v0.1.0 -m "CapTerm v0.1.0"
