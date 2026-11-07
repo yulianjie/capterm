@@ -1,25 +1,46 @@
 # CapTerm
 
-CapTerm 是用 Rust 和 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构建的 SSH 工作台。左侧是 SFTP 文件管理，中间是多标签终端和命令输入栏，右侧是保存的会话和主机监控。深色主题采用石墨黑，浅色主题采用暖白，界面以灰紫色标记当前操作。
+CapTerm 是用 Rust 和 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构建的 SSH 工作台。左侧管理 SFTP 文件与传输，中间运行终端和远程编辑器，右侧管理会话并监控当前主机。夜航和白昼主题共用同一布局，用品红标记 SSH 航线、用青色标记交互。
 
-[打开交互设计稿](docs/design/workbench.html)。设计稿包含示例数据，可以切换主题、打开文件编辑器，并通过缩放浏览器窗口查看折叠侧栏。
+[设计说明、交互原型和导出画板](design/README.md) · [Linux 终端输出高亮规则](docs/linux-highlights.md)
+
+## 下载
+
+从 [GitHub Releases](https://github.com/yulianjie/capterm/releases) 下载 Windows x64 版本。运行 `*-setup.exe` 可为当前用户安装并创建开始菜单快捷方式。也可以解压 `*-portable.zip` 后直接运行 `capterm.exe`。同页提供 `SHA256SUMS.txt`，可用 `Get-FileHash -Algorithm SHA256` 核对下载文件。
 
 ## 构建和运行
 
-Windows 使用 Rust 1.95 或更高版本的 MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK。
+Windows x64 使用 Rust 1.95 或更高版本的 MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK。
 
 ```powershell
 cargo run --locked
 cargo test --locked
 ```
 
+要在本地打包，先安装 Inno Setup 6.3 或以上的 6.x 版本，再用 PowerShell 7 运行以下命令。将 `-Version` 的值设为 `Cargo.toml` 中的版本号，产物位于 `dist/`。
+
+```powershell
+cargo build --release --locked
+./scripts/package-windows.ps1 -Version 0.1.0 -Executable target/release/capterm.exe
+```
+
+## 自动出包
+
+[Windows build and release](https://github.com/yulianjie/capterm/actions/workflows/windows.yml) 会在推送到 `main`、提交面向 `main` 的 PR 或手动运行时检查格式、运行测试并生成安装版和便携版。通过后可以从对应运行的 **Artifacts** 下载。
+
+发布新版本时，更新 `Cargo.toml` 中的版本号和 `Cargo.lock`，将提交推送到 `main`，再推送同版本的 `vX.Y.Z` 标签。工作流验证标签与项目版本一致后，自动将安装版、便携版和校验文件发布到 **Releases**。
+
+```powershell
+git tag -a v0.1.0 -m "CapTerm v0.1.0"
+git push origin v0.1.0
+```
+
 ## 使用
 
-- **会话** · 通过 **New session** 保存连接信息，通过右侧的测试按钮验证 SSH 握手与认证。右键菜单提供编辑、删除和密码连接。首次连接显示主机密钥指纹，已信任的主机密钥发生变化时，连接会中止。
-- **跳板和导入** · 跳板可填写 `user@host:port`，多跳用逗号分隔。**Import SSH config** 支持自选路径和重新导入，涵盖 `Host`、`HostName`、`User`、`Port`、`IdentityFile`、`ProxyJump` 和 `Include`。导入使用配置文件的静态子集。条件 `Match` 和可执行指令会跳过或提示，依赖 `ProxyCommand` 的会话需要改为 `ProxyJump`。
-- **终端** · 点击终端即可直接操作远程 PTY。全屏程序进入备用屏幕时自动收起行号和时间，也可以用 **TUI** 手动切换。**# Time** 控制行号与时间列。行号对应保留的物理行，时间按本地时区显示该行最近一次可识别的输出更新。滚动历史淘汰或调整窗口重排时，行号可能变化，无法归属的时间留空。
-- **本地 Shell** · Windows 上点击 **Local shell** 直接打开 PowerShell，旁边的菜单可以选择 Command Prompt（cmd）或 WSL。WSL 使用系统配置的默认发行版。本地 Shell 各自使用独立的终端标签。
-- **SFTP** · 点击目录进入，点击 UTF-8 文本文件打开编辑器。覆盖保存需要服务端支持 OpenSSH 的原子重命名扩展，并会检查编辑期间远端文件是否已变化。将本地文件拖到左侧上传。在 Windows 上将远程文件从左侧列表直接拖到资源管理器文件夹，松开鼠标即可下载，也可以使用右键下载。
-- **监控** · 右侧底部显示当前会话的 CPU、内存、磁盘和 SSH 往返延迟。资源采样针对 Linux 主机，延迟来自 SSH 协议探测。窄窗口通过顶部 **Files** 和 **Sessions** 按钮打开侧栏。
+- **会话与跳板**。双击保存的会话即可连接，也可按 `Ctrl+Shift+P` 输入 `user@host[:port]` 快速连接。航线逐跳显示握手和认证状态。会话支持跳板排序与复用、连接测试、网络代理以及本地、远程和动态 TCP 转发。
+- **SSH 配置**。选择配置文件后逐项预览，再链接并同步或复制为本地会话。预览会标明跳过的配置和不适用的选项。本地会话可以导出 OpenSSH 配置片段。首次遇到主机密钥时，可仅本次信任或保存密钥。替换已有密钥需要输入对应主机名。
+- **终端与发送栏**。直接操作远程 PTY，或在发送栏编辑后逐行执行、整段粘贴。已保存会话的发送历史随本机设置保存。终端显示逻辑行号、写入时间和命令块，备用屏幕改用屏幕行号。按 `Ctrl+Shift+F` 搜索输出。Windows 仍可通过新标签菜单打开 PowerShell、cmd 或 WSL。
+- **远程文件**。单击文本文件打开预览，开始编辑后固定标签。保存前检查远端版本，可比较差异或重新加载。覆盖保存需要服务端支持 OpenSSH 的原子重命名扩展。上传与下载在传输队列显示进度和冲突，Windows 支持把远程文件拖到资源管理器。
+- **监控与布局**。监控通过现有 SSH 连接采集目标主机的 CPU、内存、磁盘、网络、负载和进程。宽度低于 1200 px 时右侧缩为图标栏，低于 900 px 时左侧也收起。按 `Ctrl+Shift+Enter` 切换专注模式。
 
-密码仅在连接目标主机时使用。跳板使用私钥或 SSH agent。加密私钥可先加载到本机 SSH agent，再由 CapTerm 使用。应用使用独立的 `known_hosts` 保存已确认的主机密钥。
+应用使用独立的 `known_hosts`。密码用于目标主机认证，跳板使用私钥或 SSH Agent。可将加密私钥先加载到本机 SSH Agent。

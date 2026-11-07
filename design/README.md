@@ -7,6 +7,10 @@ CapTerm 是一个用 Rust 和 [gpui-kit](https://github.com/longbridge/gpui-kit)
 | 全部画板与设计要点 | [`index.html`](index.html) |
 | 可点击的交互原型 | [`prototype/index.html`](prototype/index.html) |
 | 导出的 PNG 画板（2 倍图） | [`exports/`](exports/) |
+| 默认应用图标「破浪船艏」 | [SVG 源稿](icon/capterm.svg) · [512 px PNG](icon/capterm.png) · [Windows ICO](icon/capterm.ico) |
+| 新图标「舵轮」：黄铜舵轮，轮毂是终端屏幕 | [设计说明](icon/helm/README.md) · [SVG 源稿](icon/helm/capterm-helm.svg) · [预览](icon/helm/preview.png) · [Windows ICO](icon/helm/capterm-helm.ico) |
+| 全部六个图标方案 | [图标方案](icon/concepts/README.md) |
+| 原船长帽图标 | [SVG 源稿](icon/archive/captain-cap.svg) · [512 px PNG](icon/archive/captain-cap.png) · [Windows ICO](icon/archive/captain-cap.ico) |
 | gpui-kit 主题（深色 / 浅色） | [`theme/capterm.theme.json`](theme/capterm.theme.json) |
 | 终端配色（ANSI 16 色、行号列等） | [`theme/terminal-colors.json`](theme/terminal-colors.json) |
 | 重新导出画板 | `node design/tools/export.mjs`（需要本机装有 Chrome 或 Edge） |
@@ -19,8 +23,9 @@ design/
 ├── index.html             画板总览
 ├── prototype/             交互原型：index.html、tokens.css、styles.css、app.js、data.js、icons.js
 ├── exports/               11 张 PNG 画板
+├── icon/                  应用图标（SVG、PNG、ICO）与备选方案
 ├── theme/                 capterm.theme.json、terminal-colors.json
-└── tools/export.mjs       画板导出脚本
+└── tools/                 export.mjs 导出画板，export-icon.mjs 导出舵轮图标
 ```
 
 ---

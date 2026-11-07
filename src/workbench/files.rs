@@ -1,35 +1,146 @@
-use std::path::PathBuf;
+mod browser;
+mod editor;
 
-use gpui_kit::component::WindowExt;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use gpui_kit::component::input::InputState;
 use gpui_kit::*;
+use tokio::sync::watch;
+use tokio::task::AbortHandle;
 
-use super::dialogs::FormStatus;
+pub(super) use editor::FileEditor;
+
 use super::{Event, Phase, Workbench};
-use crate::platform;
-use crate::ssh::RemoteEntry;
+use crate::config::TransferConflictPreference;
+use crate::ssh::{
+    RemoteEntry, RemoteMutation, RemoteText, SaveTextResult, TextEncoding, TransferChoice,
+    TransferConflict, TransferOptions, TransferOutcome, TransferSignal,
+};
+
+const CLIPBOARD_DIRECTORY: &str = "/tmp/capterm";
 
 #[derive(Default)]
 pub(super) struct FilePane {
-    pub(super) directory: String,
-    pub(super) entries: Vec<RemoteEntry>,
-    pub(super) selected: Option<String>,
-    pub(super) loading: bool,
-    pub(super) error: Option<String>,
+    directory: String,
+    home: String,
+    terminal_directory: Option<String>,
+    osc_directory: bool,
+    queried_login_directory: bool,
+    entries: Vec<RemoteEntry>,
+    branches: HashMap<String, Option<Vec<RemoteEntry>>>,
+    selected: Option<RemoteEntry>,
+    loading: bool,
+    error: Option<String>,
     listing: u64,
+    navigation: Option<String>,
     editor_request: u64,
+    pending_editor: Option<(String, TextEncoding, bool)>,
+    follow_disabled: bool,
+    hide_hidden: bool,
+    filter_open: bool,
+    filter: Option<(Entity<InputState>, Subscription)>,
+    drop_hover: Option<(Point<Pixels>, String, usize)>,
+    native_drag: Option<RemoteEntry>,
+    transfers_open: bool,
+    transfers: Vec<Transfer>,
+    conflict_all: bool,
+    conflict_choices: HashMap<u64, TransferChoice>,
+    local_previews: Vec<tempfile::TempDir>,
 }
 
+#[derive(Clone)]
 pub(super) struct FileDrag {
-    pub(super) tab: u64,
-    pub(super) entry: RemoteEntry,
-    pub(super) origin: Point<Pixels>,
-    pub(super) started: bool,
+    tab: u64,
+    entry: RemoteEntry,
+}
+
+#[derive(Clone)]
+enum TransferSource {
+    Upload {
+        local: PathBuf,
+        directory: String,
+        insert: bool,
+    },
+    Clipboard(PathBuf),
+    Download {
+        remote: String,
+        local: PathBuf,
+        open: bool,
+    },
+}
+
+impl TransferSource {
+    fn destination(&self) -> String {
+        match self {
+            Self::Upload { directory, .. } => directory.clone(),
+            Self::Clipboard(_) => CLIPBOARD_DIRECTORY.to_owned(),
+            Self::Download { local, .. } => local.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn is_upload(&self) -> bool {
+        matches!(self, Self::Upload { .. } | Self::Clipboard(_))
+    }
+}
+
+enum TransferState {
+    Waiting,
+    Running,
+    Paused,
+    Cancelling,
+    Conflict(TransferConflict),
+    Complete(String),
+    Failed(String),
+    Cancelled,
+    Skipped,
+}
+
+impl TransferState {
+    fn pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Waiting | Self::Running | Self::Paused | Self::Cancelling | Self::Conflict(_)
+        )
+    }
+}
+
+struct TransferHandle {
+    abort: AbortHandle,
+    signal: watch::Sender<TransferSignal>,
+}
+
+impl Drop for TransferHandle {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+struct Transfer {
+    id: u64,
+    batch: u64,
+    name: String,
+    source: TransferSource,
+    state: TransferState,
+    options: TransferOptions,
+    handle: Option<TransferHandle>,
+    copied: u64,
+    total: u64,
+    speed: f64,
+    measured: Instant,
 }
 
 pub(super) enum FileEvent {
     List(u64, Result<(String, Vec<RemoteEntry>), String>),
-    Text(u64, RemoteEntry, Result<String, String>),
-    Transfer(String, Option<String>),
+    Branch(u64, String, Result<Vec<RemoteEntry>, String>),
+    Directory(Result<String, String>),
+    Text(u64, RemoteEntry, Result<Option<RemoteText>, String>),
+    ClipboardReady(Result<(tempfile::TempDir, PathBuf), String>),
+    Saved(u64, String, Result<SaveTextResult, String>),
+    Mutation(Result<(), String>),
+    Progress(u64, u64, u64),
+    Transfer(u64, u64, Result<TransferOutcome, String>),
 }
 
 fn report_error(error: anyhow::Error) -> String {
@@ -45,6 +156,7 @@ impl Workbench {
         tab.files.listing += 1;
         tab.files.loading = true;
         tab.files.error = None;
+        tab.files.navigation = Some(directory.clone());
         let listing = tab.files.listing;
         let events = self.events.clone();
         self.runtime.spawn(async move {
@@ -56,76 +168,172 @@ impl Workbench {
         cx.notify();
     }
 
-    pub(super) fn open_entry(&mut self, id: u64, entry: RemoteEntry, cx: &mut Context<Self>) {
+    fn toggle_directory(&mut self, id: u64, entry: RemoteEntry, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(id) else { return };
+        let Some(connection) = tab.connection.clone() else {
+            return;
+        };
+        tab.files.selected = Some(entry.clone());
+        if tab.files.branches.remove(&entry.path).is_some() {
+            tab.files
+                .branches
+                .retain(|path, _| !path.starts_with(&format!("{}/", entry.path)));
+        } else {
+            tab.files.branches.insert(entry.path.clone(), None);
+            let listing = tab.files.listing;
+            let events = self.events.clone();
+            self.runtime.spawn(async move {
+                let result = connection
+                    .list(&entry.path)
+                    .await
+                    .map(|(_, entries)| entries)
+                    .map_err(report_error);
+                let _ = events
+                    .send(Event::File(
+                        id,
+                        FileEvent::Branch(listing, entry.path, result),
+                    ))
+                    .await;
+            });
+        }
+        cx.notify();
+    }
+
+    pub(super) fn file_terminal_directory(
+        &mut self,
+        id: u64,
+        directory: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(id) else { return };
+        if !directory.starts_with('/') || directory.contains('\0') {
+            return;
+        }
+        tab.files.osc_directory = true;
+        self.set_terminal_directory(id, directory, cx);
+    }
+
+    fn set_terminal_directory(&mut self, id: u64, directory: String, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(id) else { return };
+        let changed = tab.files.terminal_directory.as_ref() != Some(&directory);
+        tab.files.terminal_directory = Some(directory.clone());
+        if changed && !tab.files.follow_disabled && tab.files.directory != directory {
+            self.list(id, directory, cx);
+        }
+    }
+
+    pub(super) fn file_prompt_ready(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(id) else { return };
+        if tab.files.osc_directory {
+            return;
+        }
+        if let Some(directory) = tab
+            .terminal
+            .read(cx)
+            .prompt_text()
+            .and_then(|line| prompt_directory(line, &tab.files.home))
+        {
+            self.set_terminal_directory(id, directory, cx);
+            return;
+        }
+        if tab.files.terminal_directory.is_some() || tab.files.queried_login_directory {
+            return;
+        }
+        let Some(connection) = tab.connection.clone() else {
+            return;
+        };
+        tab.files.queried_login_directory = true;
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            let result = connection
+                .exec("pwd -P")
+                .await
+                .and_then(|output| {
+                    Ok(String::from_utf8(output)?
+                        .trim_end_matches(['\n', '\r'])
+                        .to_owned())
+                })
+                .map_err(report_error);
+            let _ = events
+                .send(Event::File(id, FileEvent::Directory(result)))
+                .await;
+        });
+    }
+
+    fn mutate_file(&mut self, id: u64, operation: RemoteMutation, cx: &mut Context<Self>) {
+        let Some(connection) = self.tab(id).and_then(|tab| tab.connection.clone()) else {
+            return;
+        };
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            let result = connection
+                .mutate_remote(operation)
+                .await
+                .map_err(report_error);
+            let _ = events
+                .send(Event::File(id, FileEvent::Mutation(result)))
+                .await;
+        });
+        cx.notify();
+    }
+
+    fn open_entry(
+        &mut self,
+        id: u64,
+        entry: RemoteEntry,
+        pinned: bool,
+        encoding: TextEncoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if entry.is_dir {
-            self.list(id, entry.path, cx);
+            if pinned {
+                self.list(id, entry.path, cx);
+            } else {
+                self.toggle_directory(id, entry, cx);
+            }
+            return;
+        }
+        if let Some(tab) = self.tab_mut(id) {
+            tab.files.selected = Some(entry.clone());
+        }
+        if self.activate_open_editor(id, &entry.path, pinned, window, cx) {
+            if let Some(tab) = self.tab_mut(id) {
+                tab.files.editor_request += 1;
+                tab.files.pending_editor = None;
+            }
             return;
         }
         let Some(tab) = self.tab_mut(id) else { return };
         let Some(connection) = tab.connection.clone() else {
             return;
         };
-        tab.files.selected = Some(entry.path.clone());
+        if let Some((path, requested, pin)) = &mut tab.files.pending_editor
+            && *path == entry.path
+            && *requested == encoding
+        {
+            *pin |= pinned;
+            cx.notify();
+            return;
+        }
         tab.files.editor_request += 1;
+        tab.files.pending_editor = Some((entry.path.clone(), encoding, pinned));
         let request = tab.files.editor_request;
-        let notice = format!("Opening {}…", entry.name);
+        let edit_limit_mb = self.settings.file_edit_limit_mb;
         let events = self.events.clone();
         self.runtime.spawn(async move {
             let result = connection
-                .read_text(&entry.path)
+                .open_remote_text(&entry.path, encoding, edit_limit_mb)
                 .await
                 .map_err(report_error);
             let _ = events
                 .send(Event::File(id, FileEvent::Text(request, entry, result)))
                 .await;
         });
-        self.announce(notice, cx);
+        cx.notify();
     }
 
-    pub(super) fn save_entry(
-        &mut self,
-        id: u64,
-        path: String,
-        (original, edited): (String, String),
-        status: std::rc::Rc<FormStatus>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(connection) = self.tab(id).and_then(|tab| tab.connection.clone()) else {
-            status.fail(
-                "The SSH session closed before this file could be saved",
-                window,
-            );
-            return;
-        };
-        let remote_path = path.clone();
-        let operation = self.runtime.spawn(async move {
-            connection
-                .save_text(&remote_path, &original, &edited)
-                .await
-                .map_err(report_error)
-        });
-        cx.spawn_in(window, async move |view, cx| {
-            let result = operation
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-            let _ = view.update_in(cx, |this, window, cx| match result {
-                Ok(()) => {
-                    window.close_dialog(cx);
-                    let directory = this.tab(id).map(|tab| tab.files.directory.clone());
-                    this.announce(format!("Saved to host · {path}"), cx);
-                    if let Some(directory) = directory {
-                        this.list(id, directory, cx);
-                    }
-                }
-                Err(error) => status.fail(format!("Save failed · {error}"), window),
-            });
-        })
-        .detach();
-    }
-
-    pub(super) fn pick_upload(&mut self, id: u64, window: &Window, cx: &mut Context<Self>) {
+    fn pick_upload(&mut self, id: u64, window: &Window, cx: &mut Context<Self>) {
         let Some(directory) = self.upload_directory(id) else {
             return;
         };
@@ -133,66 +341,93 @@ impl Workbench {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("Select files to upload".into()),
+            prompt: Some("选择要上传的文件".into()),
         });
         cx.spawn_in(window, async move |view, cx| {
             let result = prompt.await;
             let _ = view.update_in(cx, |this, _, cx| match result {
-                Ok(Ok(Some(paths))) => this.upload(id, directory, paths, cx),
-                Ok(Err(error)) => this.announce(format!("File picker failed: {error:#}"), cx),
+                Ok(Ok(Some(paths))) => this.upload(id, directory, paths, false, cx),
+                Ok(Err(error)) => this.announce(format!("无法选择文件 · {error:#}"), cx),
                 _ => {}
             });
         })
         .detach();
     }
 
-    pub(super) fn upload_directory(&self, id: u64) -> Option<String> {
+    fn upload_directory(&self, id: u64) -> Option<String> {
         let tab = self.tab(id)?;
         tab.connection.as_ref()?;
         (!tab.files.directory.is_empty() && tab.phase == Phase::Connected)
             .then(|| tab.files.directory.clone())
     }
 
-    pub(super) fn upload(
+    pub(super) fn upload_terminal_clipboard(
+        &mut self,
+        id: u64,
+        bytes: Vec<u8>,
+        extension: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab(id) else { return };
+        let Some(connection) = tab.connection.clone() else {
+            self.announce("连接 SSH 会话后可上传剪贴板图片", cx);
+            return;
+        };
+        let extension = match extension {
+            "png" => "png",
+            "jpg" | "jpeg" => "jpg",
+            "gif" => "gif",
+            "webp" => "webp",
+            "bmp" => "bmp",
+            "tif" | "tiff" => "tiff",
+            _ => "img",
+        };
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            let prepare = async {
+                connection
+                    .prepare_clipboard_directory(CLIPBOARD_DIRECTORY)
+                    .await?;
+                let directory = tempfile::Builder::new()
+                    .prefix("capterm-clipboard-")
+                    .tempdir()?;
+                let path = directory
+                    .path()
+                    .join(format!("paste-{}.{extension}", uuid::Uuid::new_v4()));
+                tokio::fs::write(&path, bytes).await?;
+                Ok((directory, path))
+            };
+            let result = prepare.await.map_err(report_error);
+            let _ = events
+                .send(Event::File(id, FileEvent::ClipboardReady(result)))
+                .await;
+        });
+        self.announce("正在准备上传剪贴板图片…", cx);
+    }
+
+    fn upload(
         &mut self,
         id: u64,
         directory: String,
         paths: Vec<PathBuf>,
+        insert: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(connection) = self.tab(id).and_then(|tab| tab.connection.clone()) else {
-            return;
-        };
-        if paths.is_empty() {
-            return;
-        }
-        let events = self.events.clone();
-        let count = paths.len();
-        self.runtime.spawn(async move {
-            let mut finished = 0;
-            let mut failed = Vec::new();
-            for path in paths {
-                match connection.upload(&path, &directory).await {
-                    Ok(()) => finished += 1,
-                    Err(error) => failed.push(format!("{} · {error:#}", path.display())),
-                }
-            }
-            let notice = if failed.is_empty() {
-                format!("Uploaded {finished} file(s)")
-            } else {
-                format!("Uploaded {finished} of {count} · {}", failed.join(" · "))
-            };
-            let _ = events
-                .send(Event::File(
-                    id,
-                    FileEvent::Transfer(notice, Some(directory)),
-                ))
-                .await;
+        let transfers = paths.into_iter().filter_map(|local| {
+            let name = local.file_name()?.to_str()?.to_owned();
+            Some((
+                name,
+                TransferSource::Upload {
+                    local,
+                    directory: directory.clone(),
+                    insert,
+                },
+            ))
         });
-        self.announce(format!("Uploading {count} file(s)…"), cx);
+        self.enqueue_transfers(id, transfers, cx);
     }
 
-    pub(super) fn pick_download(
+    fn pick_download(
         &mut self,
         id: u64,
         entry: RemoteEntry,
@@ -200,81 +435,488 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         if self.tab(id).is_none_or(|tab| tab.connection.is_none()) {
-            self.announce("The SSH session is closed", cx);
+            self.announce("SSH 会话已断开", cx);
             return;
         }
-        let home = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let downloads = home.join("Downloads");
-        let directory = if downloads.is_dir() { downloads } else { home };
-        let prompt = cx.prompt_for_new_path(&directory, Some(&entry.name));
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择下载目录".into()),
+        });
         cx.spawn_in(window, async move |view, cx| {
             let result = prompt.await;
             let _ = view.update_in(cx, |this, _, cx| match result {
-                Ok(Ok(Some(path))) => this.download(id, entry, path, cx),
-                Ok(Err(error)) => this.announce(format!("Save dialog failed: {error:#}"), cx),
+                Ok(Ok(Some(directories))) => {
+                    if let Some(directory) = directories.into_iter().next() {
+                        this.download_entry(id, entry, directory, false, cx);
+                    }
+                }
+                Ok(Err(error)) => this.announce(format!("无法选择下载位置 · {error:#}"), cx),
                 _ => {}
             });
         })
         .detach();
     }
 
-    fn download(&mut self, id: u64, entry: RemoteEntry, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(connection) = self.tab(id).and_then(|tab| tab.connection.clone()) else {
-            return;
+    fn download_to_default(&mut self, id: u64, entry: RemoteEntry, cx: &mut Context<Self>) {
+        let directory = if self.settings.download_directory.is_empty() {
+            dirs::download_dir()
+                .filter(|path| path.is_dir())
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(std::env::temp_dir)
+        } else {
+            PathBuf::from(&self.settings.download_directory)
         };
-        let events = self.events.clone();
-        let notice = format!("Downloading {}…", entry.name);
-        self.runtime.spawn(async move {
-            let notice = match connection.download(&entry.path, &path).await {
-                Ok(()) => format!("Downloaded {}", path.display()),
-                Err(error) => format!("Download failed · {} · {error:#}", entry.name),
-            };
-            let _ = events
-                .send(Event::File(id, FileEvent::Transfer(notice, None)))
-                .await;
-        });
-        self.announce(notice, cx);
+        self.download_entry(id, entry, directory, false, cx);
     }
 
-    pub(super) fn drag_entry(&self, id: u64, entry: RemoteEntry, cx: &mut Context<Self>) {
-        if self.active != Some(id) || entry.is_dir || !platform::drag_supported() {
+    fn download_entry(
+        &mut self,
+        id: u64,
+        entry: RemoteEntry,
+        directory: PathBuf,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let name = if crate::ssh::valid_local_name(&entry.name) {
+            &entry.name
+        } else {
+            "远端文件"
+        };
+        self.enqueue_transfers(
+            id,
+            [(
+                entry.name.clone(),
+                TransferSource::Download {
+                    remote: entry.path,
+                    local: directory.join(name),
+                    open,
+                },
+            )],
+            cx,
+        );
+    }
+
+    fn download_and_open(&mut self, id: u64, entry: RemoteEntry, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(id) else { return };
+        let directory = match tempfile::Builder::new()
+            .prefix("capterm-preview-")
+            .tempdir()
+        {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.announce(format!("无法创建预览目录 · {error:#}"), cx);
+                return;
+            }
+        };
+        let local = directory.path().to_path_buf();
+        tab.files.local_previews.push(directory);
+        self.download_entry(id, entry, local, true, cx);
+    }
+
+    fn enqueue_transfers(
+        &mut self,
+        id: u64,
+        jobs: impl IntoIterator<Item = (String, TransferSource)>,
+        cx: &mut Context<Self>,
+    ) {
+        let batch = self.new_id();
+        let options = TransferOptions {
+            choice: match self.settings.transfer_conflict {
+                TransferConflictPreference::Ask => TransferChoice::Ask,
+                TransferConflictPreference::Overwrite => TransferChoice::Overwrite,
+                TransferConflictPreference::KeepBoth => TransferChoice::KeepBoth,
+                TransferConflictPreference::Skip => TransferChoice::Skip,
+            },
+            preserve_metadata: self.settings.transfer_preserve_metadata,
+        };
+        let transfers: Vec<_> = jobs
+            .into_iter()
+            .map(|(name, source)| Transfer {
+                id: self.new_id(),
+                batch,
+                name,
+                options: if matches!(source, TransferSource::Clipboard(_)) {
+                    TransferOptions {
+                        choice: TransferChoice::KeepBoth,
+                        preserve_metadata: false,
+                    }
+                } else {
+                    options
+                },
+                source,
+                state: TransferState::Waiting,
+                handle: None,
+                copied: 0,
+                total: 0,
+                speed: 0.,
+                measured: Instant::now(),
+            })
+            .collect();
+        if transfers.is_empty() {
             return;
         }
-        let Some(connection) = self.tab(id).and_then(|tab| tab.connection.clone()) else {
+        let Some(tab) = self.tab_mut(id).filter(|tab| tab.connection.is_some()) else {
             return;
         };
-        let runtime = self.runtime.handle().clone();
-        let events = self.events.clone();
-        // OLE can pump native messages during DoDragDrop. Run it after the
-        // entity and window update has returned.
-        cx.spawn(async move |view, cx| {
-            let notifications = runtime.clone();
-            let name = entry.name.clone();
-            let result = platform::drag_file(
-                &entry.name,
-                entry.size,
-                &runtime,
-                move |path| async move { connection.download(&entry.path, &path).await },
-                move |result| {
-                    let notice = match result {
-                        Ok(()) => format!("Downloaded {name}"),
-                        Err(error) => format!("Download failed · {name} · {error:#}"),
-                    };
-                    notifications.spawn(async move {
-                        let _ = events.send(Event::DragFinished(notice)).await;
-                    });
-                },
-            );
-            if let Err(error) = result {
-                let _ = view.update(cx, |this, cx| {
-                    this.announce(format!("Cannot drag {} · {error:#}", entry.name), cx);
-                });
+        tab.files.transfers.extend(transfers);
+        tab.files.transfers_open = true;
+        self.schedule_transfers(cx);
+    }
+
+    fn schedule_transfers(&mut self, cx: &mut Context<Self>) {
+        let limit = self.settings.transfer_concurrency.clamp(1, 16);
+        let mut running = self
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.files.transfers)
+            .filter(|item| {
+                matches!(
+                    item.state,
+                    TransferState::Running | TransferState::Cancelling
+                )
+            })
+            .count();
+        for tab in &mut self.tabs {
+            let Some(connection) = &tab.connection else {
+                continue;
+            };
+            for item in &mut tab.files.transfers {
+                if running >= limit {
+                    break;
+                }
+                if !matches!(item.state, TransferState::Waiting) {
+                    continue;
+                }
+                running += 1;
+                item.state = TransferState::Running;
+                item.measured = Instant::now();
+                if let Some(handle) = &item.handle {
+                    let _ = handle.signal.send(TransferSignal::Running);
+                    continue;
+                }
+                let (signal, watch) = watch::channel(TransferSignal::Running);
+                let (id, item_id) = (tab.id, item.id);
+                let source = item.source.clone();
+                let options = item.options;
+                let events = self.events.clone();
+                let connection = connection.clone();
+                let abort = self
+                    .runtime
+                    .spawn(async move {
+                        let mut last = Instant::now() - Duration::from_secs(1);
+                        let mut bytes_copied = 0;
+                        let progress = |copied, total| {
+                            bytes_copied = copied;
+                            if last.elapsed() >= Duration::from_millis(150) || copied == total {
+                                last = Instant::now();
+                                let _ = events.try_send(Event::File(
+                                    id,
+                                    FileEvent::Progress(item_id, copied, total),
+                                ));
+                            }
+                        };
+                        let result = match source {
+                            TransferSource::Upload {
+                                local, directory, ..
+                            } => {
+                                connection
+                                    .upload_file(&local, &directory, options, watch, progress)
+                                    .await
+                            }
+                            TransferSource::Clipboard(local) => {
+                                connection
+                                    .upload_file(
+                                        &local,
+                                        CLIPBOARD_DIRECTORY,
+                                        options,
+                                        watch,
+                                        progress,
+                                    )
+                                    .await
+                            }
+                            TransferSource::Download { remote, local, .. } => {
+                                connection
+                                    .download_file(&remote, &local, options, watch, progress)
+                                    .await
+                            }
+                        };
+                        let _ = events
+                            .send(Event::File(
+                                id,
+                                FileEvent::Transfer(
+                                    item_id,
+                                    bytes_copied,
+                                    result.map_err(report_error),
+                                ),
+                            ))
+                            .await;
+                    })
+                    .abort_handle();
+                item.handle = Some(TransferHandle { abort, signal });
             }
-        })
-        .detach();
+        }
+        cx.notify();
+    }
+
+    fn control_transfer(
+        &mut self,
+        tab: u64,
+        item: Option<u64>,
+        cancel: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(tab) else { return };
+        let resume_all =
+            item.is_none()
+                && !tab.files.transfers.iter().any(|item| {
+                    matches!(item.state, TransferState::Waiting | TransferState::Running)
+                });
+        for transfer in tab
+            .files
+            .transfers
+            .iter_mut()
+            .filter(|transfer| item.is_none_or(|id| transfer.id == id))
+        {
+            if cancel && transfer.state.pending() {
+                if let Some(handle) = &transfer.handle {
+                    let _ = handle.signal.send(TransferSignal::Cancelled);
+                    transfer.state = TransferState::Cancelling;
+                } else {
+                    transfer.state = TransferState::Cancelled;
+                }
+            } else if !cancel
+                && matches!(
+                    transfer.state,
+                    TransferState::Running | TransferState::Waiting
+                )
+            {
+                if let Some(handle) = &transfer.handle {
+                    let _ = handle.signal.send(TransferSignal::Paused);
+                }
+                transfer.state = TransferState::Paused;
+            } else if !cancel
+                && (resume_all || item.is_some())
+                && matches!(transfer.state, TransferState::Paused)
+            {
+                transfer.state = TransferState::Waiting;
+            }
+        }
+        self.schedule_transfers(cx);
+    }
+
+    fn resolve_transfer(
+        &mut self,
+        tab: u64,
+        id: u64,
+        choice: TransferChoice,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(tab) else { return };
+        let Some(batch) = tab
+            .files
+            .transfers
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.batch)
+        else {
+            return;
+        };
+        let apply_all = tab.files.conflict_all;
+        if apply_all {
+            tab.files.conflict_choices.insert(batch, choice);
+        }
+        for item in tab
+            .files
+            .transfers
+            .iter_mut()
+            .filter(|item| item.id == id || (apply_all && item.batch == batch))
+        {
+            if matches!(&item.state, TransferState::Conflict(conflict) if !(conflict.directory && choice == TransferChoice::Overwrite))
+            {
+                retry_transfer(item, choice);
+            }
+        }
+        self.schedule_transfers(cx);
+    }
+
+    pub(super) fn cancel_file_transfers(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab_mut(id) {
+            for transfer in tab
+                .files
+                .transfers
+                .iter_mut()
+                .filter(|transfer| transfer.state.pending())
+            {
+                transfer.state = TransferState::Cancelled;
+                transfer.handle = None;
+            }
+        }
+        self.schedule_transfers(cx);
+    }
+
+    pub(super) fn file_transfer_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .flat_map(|tab| &tab.files.transfers)
+            .filter(|item| item.state.pending())
+            .count()
+    }
+
+    pub(super) fn show_file_transfers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending =
+            |tab: &&super::Tab| tab.files.transfers.iter().any(|item| item.state.pending());
+        let target = self
+            .active_tab()
+            .filter(pending)
+            .or_else(|| self.tabs.iter().find(pending))
+            .map(|tab| tab.id)
+            .or(self.active);
+        if let Some(id) = target.filter(|id| Some(*id) != self.active) {
+            self.select_tab(id, window, cx);
+        }
+        if let Some(tab) = target.and_then(|id| self.tab_mut(id)) {
+            tab.files.transfers_open = true;
+            cx.notify();
+        }
+    }
+
+    fn apply_transfer_result(
+        &mut self,
+        id: u64,
+        transfer: u64,
+        bytes_copied: u64,
+        result: Result<TransferOutcome, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(id) else { return };
+        let Some(item) = tab
+            .files
+            .transfers
+            .iter_mut()
+            .find(|item| item.id == transfer && item.state.pending())
+        else {
+            return;
+        };
+        item.handle = None;
+        let source = item.source.clone();
+        let directory = tab.files.directory.clone();
+        let cancelling = matches!(item.state, TransferState::Cancelling);
+        item.state = match result {
+            Ok(TransferOutcome::Complete(path)) => TransferState::Complete(path),
+            _ if cancelling => TransferState::Cancelled,
+            Ok(TransferOutcome::Conflict(conflict)) => {
+                if let Some(choice) = tab.files.conflict_choices.get(&item.batch).copied()
+                    && choice != item.options.choice
+                    && !(conflict.directory && choice == TransferChoice::Overwrite)
+                {
+                    retry_transfer(item, choice);
+                    self.schedule_transfers(cx);
+                    return;
+                }
+                TransferState::Conflict(conflict)
+            }
+            Ok(TransferOutcome::Cancelled) => TransferState::Cancelled,
+            Ok(TransferOutcome::Skipped) => TransferState::Skipped,
+            Err(error) => TransferState::Failed(error),
+        };
+        if let TransferState::Complete(path) = &item.state {
+            let path = path.clone();
+            item.copied = bytes_copied;
+            item.total = bytes_copied;
+            match source {
+                TransferSource::Upload {
+                    directory: target,
+                    insert,
+                    ..
+                } => {
+                    if insert {
+                        self.append_file_path(id, &path, window, cx);
+                    }
+                    self.refresh_file_directory(id, directory, target, cx);
+                }
+                TransferSource::Clipboard(local) => {
+                    self.remove_local_preview(id, &local);
+                    if let Some(tab) = self.tab(id) {
+                        tab.terminal
+                            .update(cx, |terminal, cx| terminal.send_draft(&path, false, cx));
+                    }
+                    self.announce("已上传剪贴板图片并插入远端路径", cx);
+                }
+                TransferSource::Download { open: true, .. } => {
+                    if let Err(error) = open_local_file(Path::new(&path)) {
+                        self.announce(format!("无法打开已下载的文件 · {error:#}"), cx);
+                    }
+                }
+                TransferSource::Download { .. } => {}
+            }
+        } else if !item.state.pending()
+            && let TransferSource::Clipboard(local) = source
+        {
+            self.remove_local_preview(id, &local);
+        }
+        self.schedule_transfers(cx);
+    }
+
+    fn remove_local_preview(&mut self, id: u64, file: &Path) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.files
+                .local_previews
+                .retain(|directory| Some(directory.path()) != file.parent());
+        }
+    }
+
+    fn refresh_file_directory(
+        &mut self,
+        id: u64,
+        current: String,
+        updated: String,
+        cx: &mut Context<Self>,
+    ) {
+        if current == updated {
+            self.list(id, current, cx);
+            return;
+        }
+        let Some(tab) = self
+            .tab(id)
+            .filter(|tab| tab.files.branches.contains_key(&updated))
+        else {
+            return;
+        };
+        let Some(connection) = tab.connection.clone() else {
+            return;
+        };
+        let listing = tab.files.listing;
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            let result = connection
+                .list(&updated)
+                .await
+                .map(|(_, entries)| entries)
+                .map_err(report_error);
+            let _ = events
+                .send(Event::File(id, FileEvent::Branch(listing, updated, result)))
+                .await;
+        });
+    }
+
+    fn append_file_path(&self, id: u64, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab(id) else { return };
+        tab.draft.update(cx, |draft, cx| {
+            let value = draft.value();
+            let separator = if value.is_empty() || value.ends_with(char::is_whitespace) {
+                ""
+            } else {
+                " "
+            };
+            draft.set_value(
+                format!("{value}{separator}{}", shell_quote(path)),
+                window,
+                cx,
+            );
+        });
     }
 
     pub(super) fn apply_file_event(
@@ -284,53 +926,169 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let FileEvent::Saved(editor, edited, result) = event {
+            self.finish_editor_save(editor, edited, result, window, cx);
+            return;
+        }
         let Some(tab) = self.tab_mut(id).filter(|tab| tab.phase == Phase::Connected) else {
             return;
         };
         match event {
             FileEvent::List(request, result) if request == tab.files.listing => {
                 tab.files.loading = false;
+                let navigation = tab.files.navigation.take();
                 match result {
-                    Ok((directory, mut entries)) => {
-                        entries.retain(|entry| entry.name != "." && entry.name != "..");
-                        entries
-                            .sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+                    Ok((directory, entries)) => {
+                        if navigation.as_deref() == Some(".") {
+                            tab.files.home.clone_from(&directory);
+                        }
+                        if tab.files.directory != directory {
+                            tab.files.branches.clear();
+                            tab.files.selected = None;
+                        } else if let Some(selected) = &tab.files.selected
+                            && parent_path(&selected.path) == directory
+                        {
+                            tab.files.selected = entries
+                                .iter()
+                                .find(|entry| entry.path == selected.path)
+                                .cloned();
+                        }
                         tab.files.directory = directory;
                         tab.files.entries = entries;
                         tab.files.error = None;
                     }
                     Err(error) => tab.files.error = Some(error),
                 }
-                cx.notify();
+            }
+            FileEvent::Branch(listing, path, result) if listing == tab.files.listing => {
+                if let Some(branch) = tab.files.branches.get_mut(&path) {
+                    match result {
+                        Ok(entries) => *branch = Some(entries),
+                        Err(error) => {
+                            tab.files.branches.remove(&path);
+                            tab.files.error = Some(error);
+                        }
+                    }
+                }
+            }
+            FileEvent::Directory(Ok(directory))
+                if !tab.files.osc_directory
+                    && tab.files.terminal_directory.is_none()
+                    && directory.starts_with('/') =>
+            {
+                self.set_terminal_directory(id, directory, cx);
             }
             FileEvent::Text(request, entry, result) if request == tab.files.editor_request => {
+                let pinned = tab
+                    .files
+                    .pending_editor
+                    .take()
+                    .is_some_and(|(_, _, pinned)| pinned);
                 if self.active != Some(id) {
                     return;
                 }
                 match result {
-                    Ok(text) => {
-                        self.notice.clear();
-                        self.editor_dialog(id, entry, text, window, cx);
-                    }
-                    Err(error) => self.announce(
-                        format!(
-                            "Cannot edit {} · {error}. Download from the file menu.",
-                            entry.name
-                        ),
-                        cx,
-                    ),
+                    Ok(Some(text)) => self.install_file_editor(id, entry, text, pinned, window, cx),
+                    Ok(None) if pinned => self.download_and_open(id, entry, cx),
+                    Ok(None) => {}
+                    Err(error) => self.announce(format!("无法打开 {} · {error}", entry.name), cx),
                 }
             }
-            FileEvent::Transfer(notice, refresh) => {
-                let refresh = refresh.filter(|directory| *directory == tab.files.directory);
-                self.announce(notice, cx);
-                if let Some(directory) = refresh {
-                    self.list(id, directory, cx);
+            FileEvent::ClipboardReady(Ok((directory, path))) => {
+                tab.files.local_previews.push(directory);
+                self.enqueue_transfers(
+                    id,
+                    [("剪贴板图片".to_owned(), TransferSource::Clipboard(path))],
+                    cx,
+                );
+            }
+            FileEvent::ClipboardReady(Err(error)) => {
+                self.announce(format!("无法上传剪贴板图片 · {error}"), cx)
+            }
+            FileEvent::Mutation(result) => {
+                let directory = tab.files.directory.clone();
+                match result {
+                    Ok(()) => {
+                        let open: Vec<_> = tab.files.branches.keys().cloned().collect();
+                        self.list(id, directory.clone(), cx);
+                        for target in open {
+                            self.refresh_file_directory(id, directory.clone(), target, cx);
+                        }
+                    }
+                    Err(error) => self.announce(format!("远端文件操作失败 · {error}"), cx),
                 }
+            }
+            FileEvent::Progress(id, copied, total) => {
+                if let Some(item) = tab
+                    .files
+                    .transfers
+                    .iter_mut()
+                    .find(|item| item.id == id && matches!(item.state, TransferState::Running))
+                {
+                    let elapsed = item.measured.elapsed().as_secs_f64();
+                    if elapsed > 0. {
+                        item.speed = copied.saturating_sub(item.copied) as f64 / elapsed;
+                    }
+                    item.copied = copied;
+                    item.total = total;
+                    item.measured = Instant::now();
+                }
+            }
+            FileEvent::Transfer(transfer, bytes_copied, result) => {
+                self.apply_transfer_result(id, transfer, bytes_copied, result, window, cx)
             }
             _ => {}
         }
+        cx.notify();
     }
+}
+
+fn retry_transfer(item: &mut Transfer, choice: TransferChoice) {
+    item.options.choice = choice;
+    item.state = if choice == TransferChoice::Skip {
+        TransferState::Skipped
+    } else {
+        TransferState::Waiting
+    };
+    item.copied = 0;
+    item.speed = 0.;
+}
+
+fn open_local_file(path: &Path) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows::core::PCWSTR;
+
+        let path: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR::null(),
+                PCWSTR(path.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        anyhow::ensure!(
+            result.0 as isize > 32,
+            "系统无法打开该文件类型（{}）",
+            result.0 as isize
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let command = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(command).arg(path).spawn()?;
+    }
+    Ok(())
 }
 
 pub(super) fn parent_path(path: &str) -> String {
@@ -339,4 +1097,30 @@ pub(super) fn parent_path(path: &str) -> String {
         Some(("", _)) | None => "/".into(),
         Some((parent, _)) => parent.into(),
     }
+}
+
+fn remote_path(directory: &str, name: &str) -> String {
+    format!("{}/{name}", directory.trim_end_matches('/'))
+}
+
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+fn prompt_directory(line: &str, home: &str) -> Option<String> {
+    let line = line.trim().strip_suffix(['$', '#', '%'])?;
+    let (host, path) = line.split_once(':')?;
+    if !host.contains('@') {
+        return None;
+    }
+    if path.starts_with('/') {
+        return Some(path.to_owned());
+    }
+    if !home.is_empty() {
+        let relative = path.strip_prefix('~')?;
+        if relative.is_empty() || relative.starts_with('/') {
+            return Some(format!("{home}{relative}"));
+        }
+    }
+    None
 }

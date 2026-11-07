@@ -1,0 +1,118 @@
+name: Windows build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  package:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      CARGO_INCREMENTAL: '0'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt
+
+      - name: Check version
+        id: version
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'capterm').version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid release version: $version" }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME must match Cargo.toml version v$version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build executable
+        run: cargo build --release --locked
+
+      - name: Build installer and portable ZIP
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/package-windows.ps1 -Version $env:VERSION -Executable target/release/capterm.exe
+
+      - name: Verify portable and installed executables
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $base = "CapTerm-$env:VERSION-windows-x64"
+          $expected = (Get-FileHash -LiteralPath target/release/capterm.exe).Hash
+          $portable = Join-Path $env:RUNNER_TEMP 'capterm-portable'
+          Expand-Archive -LiteralPath "dist/$base-portable.zip" -DestinationPath $portable
+          if ((Get-FileHash -LiteralPath "$portable/capterm.exe").Hash -ne $expected) {
+            throw 'The portable executable differs from the build'
+          }
+          $install = Join-Path $env:RUNNER_TEMP 'capterm-install'
+          $silent = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+          $setup = (Resolve-Path -LiteralPath "dist/$base-setup.exe").Path
+          $result = Start-Process -FilePath $setup -ArgumentList ($silent + '/SP-' + "/DIR=`"$install`"") -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Installer exited with $($result.ExitCode)" }
+          if ((Get-FileHash -LiteralPath "$install/capterm.exe").Hash -ne $expected) {
+            throw 'The installed executable differs from the build'
+          }
+          $result = Start-Process -FilePath "$install/unins000.exe" -ArgumentList $silent -Wait -PassThru
+          if ($result.ExitCode -ne 0 -or (Test-Path -LiteralPath "$install/capterm.exe")) {
+            throw "Uninstall failed with exit code $($result.ExitCode)"
+          }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: CapTerm-${{ steps.version.outputs.version }}-windows-x64
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+          compression-level: 0
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: CapTerm-${{ needs.package.outputs.version }}-windows-x64
+          path: dist
+
+      - name: Verify checksums and publish GitHub Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          sha256sum --strict --check SHA256SUMS.txt
+          base="CapTerm-$VERSION-windows-x64"
+          gh release create "$GITHUB_REF_NAME" \
+            "$base-setup.exe" "$base-portable.zip" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "CapTerm $GITHUB_REF_NAME" \
+            --notes 'Windows x64 · `setup.exe` 为安装版，`portable.zip` 为便携版，`SHA256SUMS.txt` 用于校验文件。'

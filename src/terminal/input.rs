@@ -78,6 +78,7 @@ pub(super) fn key_bytes(key: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
         });
     } else {
         match key_name {
+            "enter" if m.shift || m.control || m.alt => return Some(b"\x1b\r".to_vec()),
             "enter" if mode.contains(TermMode::LINE_FEED_NEW_LINE) => b"\r\n".to_vec(),
             "enter" => vec![b'\r'],
             "tab" if m.shift => return Some(b"\x1b[Z".to_vec()),
@@ -211,7 +212,7 @@ mod tests {
         let mode = TermMode::DISAMBIGUATE_ESC_CODES;
         let key = Keystroke::parse("shift-enter").unwrap();
         assert_eq!(key_bytes(&key, mode).unwrap(), b"\x1b[13;2u");
-        assert_eq!(key_bytes(&key, TermMode::empty()).unwrap(), b"\r");
+        assert_eq!(key_bytes(&key, TermMode::empty()).unwrap(), b"\x1b\r");
         let key = Keystroke::parse("enter").unwrap();
         assert_eq!(key_bytes(&key, mode).unwrap(), b"\r");
         let key = Keystroke::parse("escape").unwrap();

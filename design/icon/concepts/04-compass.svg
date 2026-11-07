@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">CapTerm Command Compass</title>
+  <desc id="description">Two opposing code brackets form the needle of a nautical compass.</desc>
+  <defs>
+    <linearGradient id="tile" x1="31" y1="12" x2="219" y2="246" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#254455"/>
+      <stop offset=".56" stop-color="#142C3D"/>
+      <stop offset="1" stop-color="#0B1725"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="128" y1="8" x2="128" y2="248" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#668D9F" stop-opacity=".68"/>
+      <stop offset="1" stop-color="#2F4F64" stop-opacity=".49"/>
+    </linearGradient>
+    <linearGradient id="dial" x1="67" y1="52" x2="185" y2="205" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#678F9D"/>
+      <stop offset="1" stop-color="#3B6274"/>
+    </linearGradient>
+    <linearGradient id="head" x1="172" y1="90" x2="125" y2="154" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F4FFF9"/>
+      <stop offset="1" stop-color="#B7E9EE"/>
+    </linearGradient>
+    <linearGradient id="tail" x1="106" y1="102" x2="71" y2="147" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#82E2E8"/>
+      <stop offset="1" stop-color="#35A9CF"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="url(#rim)" stroke-width="2"/>
+  <path d="M52 158.7A82 82 0 0 1 171.5 58.5M204 97.3A82 82 0 0 1 84.5 197.5M128 46v14m82 68h-14m-68 82v-14m-82-68h14"
+        fill="none" stroke="url(#dial)" stroke-width="9" stroke-linecap="round"/>
+  <g transform="rotate(-41 128 128)">
+    <path d="M124 87 192 128 124 169V147L155 128 124 109Z" fill="url(#head)"/>
+    <path d="M110 100v20l-14 8 14 8v20l-49-28Z" fill="url(#tail)"/>
+  </g>
+</svg>

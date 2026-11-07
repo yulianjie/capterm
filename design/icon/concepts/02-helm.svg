@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">CapTerm Command Helm</title>
+  <desc id="description">A six-handled ship's wheel framing a terminal prompt with a magenta cursor.</desc>
+  <defs>
+    <radialGradient id="ocean" cx="103" cy="67" r="193" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#234657"/>
+      <stop offset=".56" stop-color="#172D40"/>
+      <stop offset="1" stop-color="#101925"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="86" y1="9" x2="176" y2="248" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7BA7B6" stop-opacity=".65"/>
+      <stop offset="1" stop-color="#4E6684" stop-opacity=".28"/>
+    </linearGradient>
+    <linearGradient id="wheel" x1="86" y1="42" x2="159" y2="216" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5FDFF"/>
+      <stop offset=".52" stop-color="#C7EFF4"/>
+      <stop offset="1" stop-color="#80CDD9"/>
+    </linearGradient>
+    <path id="handle" d="M119 49c0-6 4-10 9-10s9 4 9 10c0 5-2 10-3 15v10a6 6 0 0 1-12 0V64c-1-5-3-10-3-15Z"/>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#ocean)"/>
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="url(#rim)" stroke-width="2"/>
+  <g fill="url(#wheel)">
+    <use href="#handle"/>
+    <use href="#handle" transform="rotate(60 128 128)"/>
+    <use href="#handle" transform="rotate(120 128 128)"/>
+    <use href="#handle" transform="rotate(180 128 128)"/>
+    <use href="#handle" transform="rotate(240 128 128)"/>
+    <use href="#handle" transform="rotate(300 128 128)"/>
+  </g>
+  <circle cx="128" cy="128" r="62" fill="none" stroke="url(#wheel)" stroke-width="15"/>
+  <path d="m101 112 20 16-20 16" fill="none" stroke="#F5FDFF" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M141 144h15" fill="none" stroke="#E07AE0" stroke-width="14" stroke-linecap="round"/>
+</svg>

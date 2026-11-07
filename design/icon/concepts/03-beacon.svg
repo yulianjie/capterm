@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">CapTerm Beacon</title>
+  <desc id="description">A lighthouse with a cyan lantern and a terminal prompt on its tower.</desc>
+  <defs>
+    <radialGradient id="harbor" cx=".36" cy=".25" r=".88">
+      <stop stop-color="#224450"/>
+      <stop offset="1" stop-color="#0B1A29"/>
+    </radialGradient>
+    <linearGradient id="rim" x2="0" y2="1">
+      <stop stop-color="#7BA8B3" stop-opacity=".52"/>
+      <stop offset="1" stop-color="#446373" stop-opacity=".25"/>
+    </linearGradient>
+    <linearGradient id="porcelain" x2=".12" y2="1">
+      <stop stop-color="#FBFFF9"/>
+      <stop offset="1" stop-color="#CDDFDE"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="40" y1="91" x2="216" y2="91" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#48BBC3"/>
+      <stop offset=".5" stop-color="#92F4E5"/>
+      <stop offset="1" stop-color="#48BBC3"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#harbor)"/>
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="url(#rim)" stroke-width="2"/>
+  <path d="M91 90v10l-44 16a5 5 0 0 1-7-5V79a5 5 0 0 1 7-5Zm74 0 44-16a5 5 0 0 1 7 5v32a5 5 0 0 1-7 5l-44-16ZM103 79h50v31h-50z" fill="url(#beam)"/>
+  <g fill="url(#porcelain)">
+    <path d="m88 75 35-25a9 9 0 0 1 10 0l35 25a6 6 0 0 1-4 11H92a6 6 0 0 1-4-11Z"/>
+    <path d="M96 106h64a6 6 0 0 1 0 12h-6l15 70h7a8 8 0 0 1 0 16H80a8 8 0 0 1 0-16h7l15-70h-6a6 6 0 0 1 0-12Z"/>
+  </g>
+  <path d="m110 140 15 12-15 12m27 0h11" fill="none" stroke="#183443" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

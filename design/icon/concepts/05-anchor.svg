@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">CapTerm Anchor Key</title>
+  <desc id="description">A ship's anchor whose eye, shaft, and magenta bit also form an SSH key.</desc>
+  <defs>
+    <linearGradient id="dusk" x1="50" y1="8" x2="190" y2="248" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#363250"/>
+      <stop offset=".56" stop-color="#22283F"/>
+      <stop offset="1" stop-color="#141C2C"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="70" y1="8" x2="180" y2="248" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9D87BB" stop-opacity=".59"/>
+      <stop offset="1" stop-color="#536A90" stop-opacity=".32"/>
+    </linearGradient>
+    <linearGradient id="pearl" x1="113" y1="38" x2="150" y2="211" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFAF1"/>
+      <stop offset=".55" stop-color="#F3EEF4"/>
+      <stop offset="1" stop-color="#BFCBE9"/>
+    </linearGradient>
+    <linearGradient id="bit" x1="149" y1="105" x2="155" y2="142" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F9ACEF"/>
+      <stop offset="1" stop-color="#DF79DE"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#dusk)"/>
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="url(#rim)" stroke-width="2"/>
+  <path d="M129 104h34a4 4 0 0 1 4 4v11a4 4 0 0 1-4 4h-11v12a4 4 0 0 1-4 4h-19Z" fill="url(#bit)"/>
+  <g fill="none" stroke="url(#pearl)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="128" cy="62" r="19"/>
+    <path d="M128 82v120m-65-45c8 28 34 45 65 45s57-17 65-45"/>
+  </g>
+  <path d="M47 138q0-5 5-3l33 17q5 3 0 6l-31 19q-5 3-6-3Zm162 0q0-5-5-3l-33 17q-5 3 0 6l31 19q5 3 6-3Z" fill="url(#pearl)"/>
+</svg>

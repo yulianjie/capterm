@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">CapTerm Jump Route</title>
+  <desc id="description">A magenta route links a local port, a jump host, and a remote port.</desc>
+  <defs>
+    <linearGradient id="tile" x1="28" y1="18" x2="223" y2="238" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#29344C"/>
+      <stop offset=".58" stop-color="#17243B"/>
+      <stop offset="1" stop-color="#11172A"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="128" y1="8" x2="128" y2="248" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7D88AA" stop-opacity=".64"/>
+      <stop offset="1" stop-color="#4A526F" stop-opacity=".4"/>
+    </linearGradient>
+    <linearGradient id="route" x1="76" y1="176" x2="182" y2="76" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B96BE1"/>
+      <stop offset=".58" stop-color="#E07AE0"/>
+      <stop offset="1" stop-color="#F6A5D7"/>
+    </linearGradient>
+    <linearGradient id="local" x1="56" y1="154" x2="78" y2="198" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#94E7F3"/>
+      <stop offset="1" stop-color="#56B7D5"/>
+    </linearGradient>
+    <linearGradient id="remote" x1="190" y1="53" x2="211" y2="100" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FAFDFF"/>
+      <stop offset="1" stop-color="#BADEE9"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="url(#rim)" stroke-width="2"/>
+  <path d="M80 176h24a24 24 0 0 0 24-24v-12m0-28v-12a24 24 0 0 1 24-24h26"
+        fill="none" stroke="url(#route)" stroke-width="14" stroke-linecap="round"/>
+  <rect x="39" y="155" width="46" height="42" rx="11" fill="url(#local)"/>
+  <rect x="52" y="169" width="20" height="14" rx="3" fill="#18243B"/>
+  <path d="m128 108 18 18-18 18-18-18Z" fill="#20243B" stroke="url(#route)" stroke-width="10" stroke-linejoin="round"/>
+  <rect x="170" y="52" width="53" height="48" rx="12" fill="url(#remote)"/>
+  <rect x="185" y="68" width="23" height="16" rx="3" fill="#202B43"/>
+</svg>

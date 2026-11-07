@@ -1,43 +1,51 @@
+mod import;
+mod profile;
+mod settings;
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use anyhow::{anyhow, ensure};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
-use gpui_kit::component::input::{InputContentType, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{InputContentType, InputEvent, InputState};
 use gpui_kit::component::{Disableable, Theme, WindowExt};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::Workbench;
-use super::ui::{Palette, badge, button, col, input, pane_head, primary, row, target, tool};
-use crate::config::{self, ConnectionProfile, Hop};
-use crate::ssh::{RemoteEntry, TrustRequest};
+use super::ui::{Palette, button, chrome_icon_tool, col, icon, input, primary, row, target, tool};
+use crate::config::ConnectionProfile;
+use crate::ssh::{ProxyCommandRequest, TrustDecision, TrustRequest};
 
 #[derive(Default)]
 pub(super) struct FormStatus {
     busy: Cell<bool>,
-    error: RefCell<Option<String>>,
+    message: RefCell<Option<(String, bool)>>,
 }
 
 impl FormStatus {
     fn start(&self, window: &mut Window) {
         self.busy.set(true);
-        self.error.borrow_mut().take();
+        self.message.borrow_mut().take();
         window.refresh();
     }
 
     pub(super) fn fail(&self, error: impl Into<String>, window: &mut Window) {
+        self.finish(error.into(), false, window);
+    }
+
+    pub(super) fn finish(&self, message: String, ok: bool, window: &mut Window) {
         self.busy.set(false);
-        self.error.replace(Some(error.into()));
+        self.message.replace(Some((message, ok)));
         window.refresh();
     }
 
     fn error(&self, palette: Palette) -> Option<Div> {
-        self.error.borrow().as_ref().map(|error| {
+        self.message.borrow().as_ref().map(|(message, ok)| {
             div()
                 .text_size(px(12.))
-                .text_color(palette.warn)
-                .child(error.clone())
+                .text_color(if *ok { palette.green } else { palette.warn })
+                .child(message.clone())
         })
     }
 }
@@ -48,9 +56,14 @@ fn styled_dialog(dialog: Dialog, width: f32, palette: Palette) -> Dialog {
         .centered()
         .p_0()
         .gap_0()
-        .bg(palette.panel)
+        .bg(if palette.base.l > 0.5 {
+            rgb(0xffffff)
+        } else {
+            rgb(0x1b2129)
+        })
         .border_color(palette.line)
-        .rounded(px(11.))
+        .rounded(px(10.))
+        .shadow_lg()
         .close_button(false)
         .overlay_closable(false)
         .entrance(DialogEntrance::None)
@@ -59,10 +72,39 @@ fn styled_dialog(dialog: Dialog, width: f32, palette: Palette) -> Dialog {
 }
 
 fn dialog_head(title: impl Into<SharedString>, palette: Palette, busy: bool) -> Div {
-    pane_head(palette)
-        .child(div().truncate().child(title.into()))
+    detailed_head(title, "", palette, busy)
+}
+
+fn detailed_head(
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    palette: Palette,
+    busy: bool,
+) -> Div {
+    let description = description.into();
+    row()
+        .justify_between()
+        .gap(px(10.))
+        .px(px(20.))
+        .py(px(14.))
+        .border_b_1()
+        .border_color(palette.line)
+        .flex_shrink_0()
         .child(
-            tool("dialog-x", "×", "Close", palette)
+            col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(px(17.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.into()),
+                )
+                .when(!description.is_empty(), |head| {
+                    head.child(description_text(description, palette))
+                }),
+        )
+        .child(
+            chrome_icon_tool("dialog-x", IconName::X, "关闭", palette)
                 .disabled(busy)
                 .on_click(|_, window, cx| window.close_dialog(cx)),
         )
@@ -72,14 +114,15 @@ fn dialog_actions(palette: Palette) -> Div {
     row()
         .justify_end()
         .gap(px(8.))
-        .px(px(15.))
-        .py(px(11.))
+        .px(px(20.))
+        .py(px(12.))
+        .flex_shrink_0()
         .border_t_1()
         .border_color(palette.line)
 }
 
 fn cancel(palette: Palette, busy: bool) -> gpui_kit::component::button::Button {
-    button("dialog-cancel", "Cancel", palette)
+    button("dialog-cancel", "取消", palette)
         .disabled(busy)
         .on_click(|_, window, cx| window.close_dialog(cx))
 }
@@ -91,355 +134,86 @@ fn field(label: &'static str, control: impl IntoElement, palette: Palette) -> Di
         .child(control)
 }
 
-const PROFILE_FIELDS: [(&str, &str); 6] = [
-    ("Display name", "Session name"),
-    ("Host or SSH config alias", "host.example.com"),
-    ("User", "SSH username"),
-    ("Port", "22"),
-    ("Jump host", "user@jump.example.com"),
-    ("Identity file", "~/.ssh/id_ed25519"),
-];
+fn description_text(text: impl Into<SharedString>, palette: Palette) -> Div {
+    div()
+        .text_color(palette.muted)
+        .text_size(px(12.))
+        .line_height(px(19.))
+        .child(text.into())
+}
+
+fn section(title: &'static str, description: &'static str, palette: Palette) -> Div {
+    col()
+        .flex_shrink_0()
+        .gap(px(9.))
+        .px(px(20.))
+        .py(px(15.))
+        .border_b_1()
+        .border_color(palette.line)
+        .child(
+            div()
+                .text_size(px(14.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .when(!description.is_empty(), |section| {
+            section.child(description_text(description, palette))
+        })
+}
+
+fn navigation(width: f32, palette: Palette) -> Div {
+    col()
+        .w(px(width))
+        .flex_shrink_0()
+        .gap(px(3.))
+        .p(px(10.))
+        .border_r_1()
+        .border_color(palette.line)
+        .bg(palette.panel)
+}
+
+fn nav_button(
+    id: usize,
+    symbol: IconName,
+    label: &'static str,
+    active: bool,
+    palette: Palette,
+) -> gpui_kit::component::button::Button {
+    button(("dialog-nav", id), label, palette)
+        .icon(icon(
+            symbol,
+            16.,
+            if active {
+                palette.accent
+            } else {
+                palette.muted
+            },
+        ))
+        .h(px(36.))
+        .flex_shrink_0()
+        .px(px(10.))
+        .border_0()
+        .justify_start()
+        .text_color(palette.muted)
+        .when(active, |nav| {
+            nav.text_color(palette.accent)
+                .bg(palette.accent.opacity(0.14))
+        })
+}
+
+fn refresh_on_change(
+    input: &Entity<InputState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Subscription {
+    window.subscribe(input, cx, |_, event: &InputEvent, window, _| {
+        if matches!(event, InputEvent::Change) {
+            window.refresh();
+        }
+    })
+}
 
 impl Workbench {
-    pub(super) fn profile_dialog(
-        &mut self,
-        profile: Option<ConnectionProfile>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let palette = Palette::new(self.settings.light);
-        let editing = profile.is_some();
-        let defaults = profile.as_ref().map_or_else(
-            || {
-                [
-                    "".into(),
-                    "".into(),
-                    "".into(),
-                    "22".into(),
-                    "".into(),
-                    "".into(),
-                ]
-            },
-            |profile| {
-                [
-                    profile.name.clone(),
-                    profile.host.clone(),
-                    profile.user.clone(),
-                    profile.port.to_string(),
-                    profile
-                        .jumps
-                        .iter()
-                        .map(format_hop)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    profile.identity_files.join("; "),
-                ]
-            },
-        );
-        let states = PROFILE_FIELDS
-            .into_iter()
-            .zip(defaults)
-            .map(|((_, placeholder), default)| {
-                cx.new(|cx| {
-                    InputState::new(window, cx)
-                        .placeholder(placeholder)
-                        .default_value(default)
-                })
-            })
-            .collect::<Vec<_>>();
-        let status = Rc::new(FormStatus::default());
-        let view = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let body = col()
-                .gap(px(12.))
-                .p(px(15.))
-                .children(
-                    PROFILE_FIELDS
-                        .into_iter()
-                        .zip(&states)
-                        .map(|((label, _), state)| {
-                            field(label, input(state, label, palette), palette)
-                        }),
-                )
-                .children(status.error(palette));
-            let view = view.clone();
-            let profile = profile.clone();
-            let states = states.clone();
-            let status = status.clone();
-            let save =
-                primary("save-profile", "Save session", palette).on_click(move |_, window, cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        match this.collect_profile(profile.as_ref(), &states, cx) {
-                            Ok(profile) => {
-                                let mut settings = this.settings.clone();
-                                let name = profile.name.clone();
-                                if let Some(existing) = settings
-                                    .profiles
-                                    .iter_mut()
-                                    .find(|item| item.id == profile.id)
-                                {
-                                    *existing = profile;
-                                } else {
-                                    settings.profiles.push(profile);
-                                }
-                                if this.persist(settings, cx) {
-                                    this.announce(format!("Saved session · {name}"), cx);
-                                    window.close_dialog(cx);
-                                } else {
-                                    status.fail(this.notice.clone(), window);
-                                }
-                            }
-                            Err(error) => status.fail(error.to_string(), window),
-                        }
-                    });
-                });
-            styled_dialog(dialog, 470., palette).child(
-                col()
-                    .child(dialog_head(
-                        if editing {
-                            "Edit SSH session"
-                        } else {
-                            "New SSH session"
-                        },
-                        palette,
-                        false,
-                    ))
-                    .child(body)
-                    .child(
-                        dialog_actions(palette)
-                            .child(cancel(palette, false))
-                            .child(save),
-                    ),
-            )
-        });
-    }
-
-    fn collect_profile(
-        &self,
-        previous: Option<&ConnectionProfile>,
-        fields: &[Entity<InputState>],
-        cx: &App,
-    ) -> anyhow::Result<ConnectionProfile> {
-        let values = fields
-            .iter()
-            .map(|field| field.read(cx).value().trim().to_owned())
-            .collect::<Vec<_>>();
-        let [name, host, user, port, jumps, keys] = values.as_slice() else {
-            unreachable!()
-        };
-        ensure!(
-            !host.is_empty(),
-            "Enter a hostname or an imported SSH alias."
-        );
-        let (resolved_host, host_user, host_port) = config::parse_hop(host)?;
-        let port = port
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port > 0)
-            .ok_or_else(|| anyhow!("Port must be between 1 and 65535."))?;
-        ensure!(
-            !user.contains(['/', '@', ':']) && !user.contains(char::is_whitespace),
-            "Invalid SSH username."
-        );
-        let local_user = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_default();
-        let alias = previous
-            .is_none()
-            .then(|| {
-                self.settings.profiles.iter().find(|profile| {
-                    profile.source.is_some() && profile.name.eq_ignore_ascii_case(resolved_host)
-                })
-            })
-            .flatten();
-        let user = if user.is_empty() {
-            host_user
-                .or_else(|| alias.map(|alias| alias.user.as_str()))
-                .unwrap_or(&local_user)
-        } else {
-            user
-        };
-        ensure!(!user.is_empty(), "Enter an SSH username.");
-        let host = alias.map_or(resolved_host, |alias| &alias.host).to_owned();
-        let port = host_port
-            .or_else(|| alias.filter(|_| port == 22).map(|alias| alias.port))
-            .unwrap_or(port);
-        let identity_files = if keys.is_empty() {
-            alias.map_or_else(Vec::new, |alias| alias.identity_files.clone())
-        } else {
-            keys.split(';')
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(str::to_owned)
-                .collect()
-        };
-        let jumps = if jumps.is_empty() {
-            alias.map_or_else(Vec::new, |alias| alias.jumps.clone())
-        } else {
-            jumps
-                .split(',')
-                .map(|jump| {
-                    let (host, user, port) = config::parse_hop(jump)?;
-                    let alias = self.settings.profiles.iter().find(|profile| {
-                        profile.source.is_some() && profile.name.eq_ignore_ascii_case(host)
-                    });
-                    let host = alias.map_or(host, |alias| &alias.host);
-                    let user = user
-                        .or_else(|| alias.map(|alias| alias.user.as_str()))
-                        .unwrap_or(&local_user);
-                    let port = port.or_else(|| alias.map(|alias| alias.port)).unwrap_or(22);
-                    let identity_files = previous
-                        .and_then(|previous| {
-                            previous.jumps.iter().find(|hop| {
-                                hop.host == host && hop.user == user && hop.port == port
-                            })
-                        })
-                        .map(|hop| hop.identity_files.clone())
-                        .or_else(|| alias.map(|alias| alias.identity_files.clone()))
-                        .unwrap_or_default();
-                    Ok(Hop {
-                        host: host.to_owned(),
-                        user: user.to_owned(),
-                        port,
-                        identity_files,
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?
-        };
-        ensure!(jumps.len() <= 8, "Use at most eight jump hosts.");
-        Ok(ConnectionProfile {
-            id: previous.map_or_else(
-                || uuid::Uuid::new_v4().to_string(),
-                |profile| profile.id.clone(),
-            ),
-            name: if name.is_empty() {
-                resolved_host.to_owned()
-            } else {
-                name.clone()
-            },
-            host,
-            user: user.to_owned(),
-            port,
-            identity_files,
-            jumps,
-            source: previous.and_then(|profile| profile.source.clone()),
-        })
-    }
-
-    pub(super) fn import_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let palette = Palette::new(self.settings.light);
-        let path = cx
-            .new(|cx| InputState::new(window, cx).default_value(self.settings.config_path.clone()));
-        let view = cx.weak_entity();
-        let status = Rc::new(FormStatus::default());
-        window.open_dialog(cx, move |dialog, _, _| {
-            let busy = status.busy.get();
-            let body = col()
-                .gap(px(12.))
-                .p(px(15.))
-                .child(field(
-                    "OpenSSH config path",
-                    input(&path, "OpenSSH config path", palette).disabled(busy),
-                    palette,
-                ))
-                .child(
-                    div()
-                        .text_color(palette.dim)
-                        .child("Named hosts and their jump routes will appear in Saved sessions."),
-                )
-                .children(status.error(palette));
-            let on_cancel_status = status.clone();
-            let on_import_status = status.clone();
-            let view = view.clone();
-            let path = path.clone();
-            let import = primary(
-                "import-sessions",
-                if busy {
-                    "Importing…"
-                } else {
-                    "Import sessions"
-                },
-                palette,
-            )
-            .disabled(busy)
-            .on_click(move |_, window, cx| {
-                let entered = path.read(cx).value().trim().to_owned();
-                if entered.is_empty() {
-                    on_import_status.fail("Enter the path to an OpenSSH config file.", window);
-                    return;
-                }
-                let status = on_import_status.clone();
-                status.start(window);
-                let _ = view.update(cx, |this, cx| {
-                    this.import_profiles(entered, status, window, cx)
-                });
-            });
-            styled_dialog(dialog, 470., palette)
-                .on_cancel(move |_, _, _| !on_cancel_status.busy.get())
-                .child(
-                    col()
-                        .child(dialog_head("Import SSH config", palette, busy))
-                        .child(body)
-                        .child(
-                            dialog_actions(palette)
-                                .child(cancel(palette, busy))
-                                .child(import),
-                        ),
-                )
-        });
-    }
-
-    fn import_profiles(
-        &mut self,
-        path: String,
-        status: Rc<FormStatus>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        let import_path = path.clone();
-        let operation = cx
-            .background_executor()
-            .spawn(async move { config::import(&import_path) });
-        cx.spawn_in(window, async move |view, cx| {
-            let result = operation.await;
-            let _ = view.update_in(cx, |this, window, cx| match result {
-                Ok(result) => {
-                    let count = result.profiles.len();
-                    if count == 0 {
-                        let detail = result.warnings.join(" · ");
-                        status.fail(format!("No supported named hosts found. {detail}"), window);
-                        return;
-                    }
-                    let mut settings = this.settings.clone();
-                    settings.config_path = path;
-                    for profile in result.profiles {
-                        if let Some(existing) = settings
-                            .profiles
-                            .iter_mut()
-                            .find(|saved| saved.id == profile.id)
-                        {
-                            *existing = profile;
-                        } else {
-                            settings.profiles.push(profile);
-                        }
-                    }
-                    if this.persist(settings, cx) {
-                        let mut notice = format!("Imported {count} session(s)");
-                        if !result.warnings.is_empty() {
-                            notice.push_str(&format!(" · {}", result.warnings.join(" · ")));
-                        }
-                        this.announce(notice, cx);
-                        window.close_dialog(cx);
-                    } else {
-                        status.fail(this.notice.clone(), window);
-                    }
-                }
-                Err(error) => status.fail(format!("Import failed · {error:#}"), window),
-            });
-        })
-        .detach();
-    }
-
     pub(super) fn password_dialog(
         &mut self,
         profile: ConnectionProfile,
@@ -469,7 +243,7 @@ impl Workbench {
         let password = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
-                .placeholder("SSH password")
+                .placeholder("SSH 密码")
         });
         let view = cx.weak_entity();
         let status = Rc::new(FormStatus::default());
@@ -479,17 +253,12 @@ impl Workbench {
                 .p(px(15.))
                 .child(div().text_color(palette.muted).child(format!(
                     "{} {}",
-                    if test {
-                        "Test connection to"
-                    } else {
-                        "Connect to"
-                    },
+                    if test { "测试连接到" } else { "连接到" },
                     target(&profile)
                 )))
                 .child(field(
-                    "Password",
-                    input(&password, "SSH password", palette)
-                        .content_type(InputContentType::Password),
+                    "密码",
+                    input(&password, "SSH 密码", palette).content_type(InputContentType::Password),
                     palette,
                 ))
                 .children(status.error(palette));
@@ -499,13 +268,13 @@ impl Workbench {
             let status = status.clone();
             let connect = primary(
                 "connect-password",
-                if test { "Test connection" } else { "Connect" },
+                if test { "测试连接" } else { "连接" },
                 palette,
             )
             .on_click(move |_, window, cx| {
                 let credential = password.read(cx).value().to_string();
                 if credential.is_empty() {
-                    status.fail("Enter the SSH password.", window);
+                    status.fail("请输入 SSH 密码。", window);
                     return;
                 }
                 password.update(cx, |password, cx| password.clean(window, cx));
@@ -520,7 +289,7 @@ impl Workbench {
             });
             styled_dialog(dialog, 470., palette).child(
                 col()
-                    .child(dialog_head("SSH password", palette, false))
+                    .child(dialog_head("SSH 密码", palette, false))
                     .child(body)
                     .child(
                         dialog_actions(palette)
@@ -543,21 +312,28 @@ impl Workbench {
             let profile = profile.clone();
             let name = profile.name.clone();
             let view = view.clone();
-            let delete = primary("delete-saved-profile", "Delete session", palette).on_click(
+            let delete = primary("delete-saved-profile", "删除会话", palette).on_click(
                 move |_, window, cx| {
                     let _ = view.update(cx, |this, cx| {
                         let mut settings = this.settings.clone();
                         settings.profiles.retain(|item| item.id != profile.id);
+                        if let Some(source) = settings
+                            .linked_configs
+                            .iter_mut()
+                            .find(|entry| profile.source.as_ref() == Some(&entry.path))
+                        {
+                            source.excluded.insert(profile.name.clone());
+                        }
                         if this.persist(settings, cx) {
-                            this.tests.retain(|_, (id, task)| {
-                                if *id == profile.id {
-                                    task.abort();
+                            this.tests.retain(|_, test| {
+                                if test.profile.id == profile.id {
+                                    test._task.abort();
                                     false
                                 } else {
                                     true
                                 }
                             });
-                            this.announce(format!("Deleted saved session · {}", profile.name), cx);
+                            this.announce(format!("已删除会话 · {}", profile.name), cx);
                             window.close_dialog(cx);
                         }
                     });
@@ -565,12 +341,8 @@ impl Workbench {
             );
             styled_dialog(dialog, 470., palette).child(
                 col()
-                    .child(dialog_head("Delete saved session", palette, false))
-                    .child(
-                        div()
-                            .p(px(15.))
-                            .child(format!("Remove {name} from Saved sessions?")),
-                    )
+                    .child(dialog_head("删除会话", palette, false))
+                    .child(div().p(px(15.)).child(format!("确定移除会话「{name}」？")))
                     .child(
                         dialog_actions(palette)
                             .child(cancel(palette, false))
@@ -580,28 +352,172 @@ impl Workbench {
         });
     }
 
+    pub(super) fn prompt_proxy_command(
+        &mut self,
+        request: ProxyCommandRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let palette = Palette::new(self.settings.light);
+        let reply = Rc::new(RefCell::new(Some(request.reply)));
+        let destination = request.destination;
+        let command = request.command;
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let mono = Theme::global(cx).mono_font_family.clone();
+            let cancel = reply.clone();
+            let approve = reply.clone();
+            styled_dialog(dialog, 620., palette)
+                .on_cancel(move |_, _, _| {
+                    if let Some(reply) = cancel.borrow_mut().take() {
+                        let _ = reply.send(false);
+                    }
+                    true
+                })
+                .child(
+                    col()
+                        .child(detailed_head(
+                            "确认运行 ProxyCommand",
+                            "本次 SSH 连接将启动以下本地程序。仅在认可程序和参数时继续。",
+                            palette,
+                            false,
+                        ))
+                        .child(
+                            col()
+                                .gap(px(10.))
+                                .p(px(20.))
+                                .child(description_text(format!("目标：{destination}"), palette))
+                                .child(
+                                    div()
+                                        .font_family(mono)
+                                        .p(px(10.))
+                                        .rounded(px(6.))
+                                        .bg(palette.input)
+                                        .child(command.clone()),
+                                ),
+                        )
+                        .child(
+                            dialog_actions(palette)
+                                .child(
+                                    button("cancel-proxy-command", "取消连接", palette)
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    primary("approve-proxy-command", "运行并连接", palette)
+                                        .on_click(move |_, window, cx| {
+                                            if let Some(reply) = approve.borrow_mut().take() {
+                                                let _ = reply.send(true);
+                                            }
+                                            window.close_dialog(cx);
+                                        }),
+                                ),
+                        ),
+                )
+        });
+    }
+
     pub(super) fn prompt_trust(
         &mut self,
         request: TrustRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text = format!(
-            "{}:{}\n\n{}\n\nVerify this fingerprint with the server administrator before trusting the host.",
-            request.host, request.port, request.fingerprint
-        );
-        let result = window.prompt(
-            PromptLevel::Warning,
-            "Verify SSH host key",
-            Some(&text),
-            &["Cancel", "Trust host"],
-            cx,
-        );
-        cx.spawn(async move |_, _| {
-            let trusted = matches!(result.await, Ok(1));
-            let _ = request.reply.send(trusted);
-        })
-        .detach();
+        let TrustRequest {
+            host,
+            port,
+            fingerprint,
+            algorithm,
+            known_hosts,
+            previous_fingerprints,
+            route,
+            index,
+            reply,
+        } = request;
+        let reply = Rc::new(RefCell::new(Some(reply)));
+        let changed = !previous_fingerprints.is_empty();
+        let palette = Palette::new(self.settings.light);
+        let color = if changed {
+            palette.danger
+        } else {
+            palette.warn
+        };
+        let confirmation = cx.new(|cx| InputState::new(window, cx).placeholder("输入主机名"));
+        let refresh = refresh_on_change(&confirmation, window, cx);
+        let algorithm = match algorithm.as_str() {
+            "ssh-ed25519" => "ED25519（256 位）".into(),
+            "ssh-rsa" => "RSA".into(),
+            _ => algorithm,
+        };
+        let title = if changed {
+            format!("{host} 的主机密钥已变化")
+        } else {
+            format!("确认 {host} 的主机密钥")
+        };
+        let address = route
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format!("{host}:{port}"));
+        let location = crate::config::display_path(&known_hosts.to_string_lossy());
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let _ = &refresh;
+            let mono = Theme::global(cx).mono_font_family.clone();
+            let text = if changed {
+                "服务器可能更换了密钥，也可能存在中间人攻击。请通过可信渠道核对新指纹，确认后输入主机名更新记录。"
+            } else {
+                "首次连接这台主机，known_hosts 里还没有它的记录。请通过可信渠道（运维文档、云控制台）核对下面的指纹，一致后再继续。"
+            };
+            let make_line = |label, text: String, strong| row().items_start().gap(px(8.))
+                .min_h(px(32.)).py(px(5.)).border_b_1().border_color(palette.line)
+                .child(div().w(px(93.)).flex_shrink_0().text_color(palette.muted).child(label))
+                .child(div().flex_1().min_w_0().font_family(mono.clone()).when(strong, |line| line.text_color(color)).child(text));
+            let route_display = row().min_h(px(32.)).border_b_1().border_color(palette.line)
+                .child(div().w(px(101.)).flex_shrink_0().text_color(palette.muted).child("链路"))
+                .child(div().flex_1().min_w_0().text_color(palette.route).font_family(mono.clone())
+                    .child(format!("本机 ─ {}", route.iter().enumerate().map(|(hop_index, address)| {
+                        if hop_index == index { format!("◉ {address}") } else { format!("● {address}") }
+                    }).collect::<Vec<_>>().join(" ─ "))));
+            let body = col().px(px(20.)).py(px(12.))
+                .child(make_line("主机", address.clone(), false))
+                .child(route_display)
+                .child(make_line("密钥类型", algorithm.clone(), false))
+                .when(changed, |body| body.child(make_line("原 SHA256 指纹", previous_fingerprints.join("\n"), false)))
+                .child(make_line("SHA256 指纹", fingerprint.clone(), true))
+                .child(make_line("写入位置", location.clone(), false))
+                .when(changed, |body| body.child(col().gap(px(5.)).mt(px(10.))
+                    .child(description_text(format!("请输入 {host} 以确认更新"), palette))
+                    .child(input(&confirmation, "输入主机名以确认", palette))));
+            let decision = |value| {
+                let reply = reply.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    if let Some(reply) = reply.borrow_mut().take() {
+                        let _ = reply.send(value);
+                    }
+                    window.close_dialog(cx);
+                }
+            };
+            let dismiss = reply.clone();
+            let reject = button("cancel-trust", if changed { "断开" } else { "取消连接" }, palette)
+                .on_click(decision(TrustDecision::Reject));
+            let approved = !changed || confirmation.read(cx).value().trim() == host;
+            let save = primary("save-host-key", if changed { "更新密钥并连接" } else { "信任并保存" }, palette)
+                .disabled(!approved).on_click(decision(TrustDecision::Save));
+            styled_dialog(dialog, 620., palette)
+                .on_cancel(move |_, _, _| {
+                    if let Some(reply) = dismiss.borrow_mut().take() { let _ = reply.send(TrustDecision::Reject); }
+                    true
+                })
+                .child(col()
+                    .child(row().items_start().gap(px(13.)).px(px(20.)).pt(px(20.))
+                        .child(row().size(px(42.)).justify_center().flex_shrink_0().rounded(px(8.)).bg(color.opacity(0.16))
+                            .child(icon(if changed { IconName::ShieldAlert } else { IconName::Shield }, 23., color)))
+                        .child(col().gap(px(3.)).flex_1()
+                            .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(title.clone()))
+                            .child(description_text(text, palette))))
+                    .child(body)
+                    .child(dialog_actions(palette).child(reject).child(div().flex_1())
+                        .when(!changed, |actions| actions.child(button("trust-once", "仅本次信任", palette)
+                            .on_click(decision(TrustDecision::Once))))
+                        .child(save)))
+        });
     }
 
     pub(super) fn notice_dialog(
@@ -614,133 +530,15 @@ impl Workbench {
         window.open_dialog(cx, move |dialog, _, _| {
             styled_dialog(dialog, 600., palette).child(
                 col()
-                    .child(dialog_head("CapTerm activity", palette, false))
+                    .child(dialog_head("CapTerm 活动", palette, false))
                     .child(div().p(px(15.)).child(detail.clone()))
                     .child(
                         dialog_actions(palette).child(
-                            button("close-activity", "Close", palette)
+                            button("close-activity", "关闭", palette)
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         ),
                     ),
             )
         });
     }
-
-    pub(super) fn editor_dialog(
-        &mut self,
-        id: u64,
-        entry: RemoteEntry,
-        original: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let palette = Palette::new(self.settings.light);
-        let mono = Theme::global(cx).mono_font_family.clone();
-        let text = cx.new(|cx| TextareaState::new(window, cx).default_value(original.clone()));
-        let status = Rc::new(FormStatus::default());
-        let view = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let busy = status.busy.get();
-            let heading = pane_head(palette)
-                .child(
-                    row()
-                        .gap(px(8.))
-                        .child(div().truncate().child(entry.name.clone()))
-                        .child(badge("UTF-8", palette, mono.clone())),
-                )
-                .child(
-                    tool("editor-x", "×", "Close", palette)
-                        .disabled(busy)
-                        .on_click(|_, window, cx| window.close_dialog(cx)),
-                );
-            let body = col()
-                .gap(px(12.))
-                .p(px(15.))
-                .child(
-                    div()
-                        .font_family(mono.clone())
-                        .text_color(palette.dim)
-                        .truncate()
-                        .child(entry.path.clone()),
-                )
-                .child(
-                    Textarea::new(&text)
-                        .aria_label("Remote text file")
-                        .w_full()
-                        .h(px(250.))
-                        .disabled(busy)
-                        .font_family(mono.clone())
-                        .text_size(px(13.))
-                        .line_height(px(21.))
-                        .bg(palette.base)
-                        .border_color(palette.line)
-                        .rounded(px(6.)),
-                )
-                .children(status.error(palette));
-            let on_cancel_status = status.clone();
-            let save_status = status.clone();
-            let download_view = view.clone();
-            let download_entry = entry.clone();
-            let save_view = view.clone();
-            let save_path = entry.path.clone();
-            let original = original.clone();
-            let text = text.clone();
-            let save = primary(
-                "save-remote-text",
-                if busy { "Saving…" } else { "Save to host" },
-                palette,
-            )
-            .disabled(busy)
-            .on_click(move |_, window, cx| {
-                let edited = text.read(cx).value().to_string();
-                if edited == original {
-                    window.close_dialog(cx);
-                    return;
-                }
-                save_status.start(window);
-                let _ = save_view.update(cx, |this, cx| {
-                    this.save_entry(
-                        id,
-                        save_path.clone(),
-                        (original.clone(), edited),
-                        save_status.clone(),
-                        window,
-                        cx,
-                    );
-                });
-            });
-            styled_dialog(dialog, 760., palette)
-                .on_cancel(move |_, _, _| !on_cancel_status.busy.get())
-                .child(
-                    col().child(heading).child(body).child(
-                        dialog_actions(palette)
-                            .child(
-                                button("download-editor-file", "Download", palette)
-                                    .disabled(busy)
-                                    .on_click(move |_, window, cx| {
-                                        let _ = download_view.update(cx, |this, cx| {
-                                            this.pick_download(
-                                                id,
-                                                download_entry.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                        });
-                                    }),
-                            )
-                            .child(cancel(palette, busy))
-                            .child(save),
-                    ),
-                )
-        });
-    }
-}
-
-fn format_hop(hop: &Hop) -> String {
-    let host = if hop.host.contains(':') {
-        format!("[{}]", hop.host)
-    } else {
-        hop.host.clone()
-    };
-    format!("{}@{}:{}", hop.user, host, hop.port)
 }

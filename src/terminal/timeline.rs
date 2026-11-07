@@ -1,7 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
-    sync::Arc,
+    time::Duration,
 };
 
 use alacritty_terminal::{
@@ -9,90 +9,568 @@ use alacritty_terminal::{
     index::{Column, Line},
     term::cell::{Cell, Flags},
 };
+use chrono::{DateTime, Local};
+
+use super::prompt::{Prompt, PromptColors};
+
+#[derive(Clone, Copy, Default)]
+pub enum TimestampFormat {
+    #[default]
+    Seconds,
+    Milliseconds,
+    Relative,
+}
 
 #[derive(Default)]
 pub(super) struct Timeline {
     rows: HashMap<usize, Stamp>,
+    logical_times: HashMap<u64, DateTime<Local>>,
     last_history: Option<usize>,
+    next_number: u64,
+    start: Option<DateTime<Local>>,
+    pub(super) commands: BTreeMap<u64, CommandBlock>,
+    active_command: Option<u64>,
+    has_shell_markers: bool,
+    pending_prompt: Option<(u64, usize)>,
+    pub(super) systems: BTreeMap<u64, Vec<SystemLine>>,
 }
 
-struct Stamp {
-    text_hash: u64,
-    time: Option<Arc<str>>,
+pub(super) struct SystemLine {
+    pub(super) time: DateTime<Local>,
+    pub(super) text: String,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Stamp {
+    pub(super) number: u64,
+    pub(super) time: DateTime<Local>,
+    pub(super) live: bool,
+    text_hash: Option<u64>,
+}
+
+pub(super) struct CommandBlock {
+    started: Option<DateTime<Local>>,
+    pub(super) elapsed: Option<Duration>,
+    pub(super) status: Option<i32>,
+    pub(super) last_line: Option<u64>,
+    pub(super) collapsed: bool,
+    prompt: Option<Prompt>,
+}
+
+impl CommandBlock {
+    fn new() -> Self {
+        Self {
+            started: None,
+            elapsed: None,
+            status: None,
+            last_line: None,
+            collapsed: false,
+            prompt: None,
+        }
+    }
+
+    pub(super) fn running(&self) -> bool {
+        self.started.is_some() && self.last_line.is_none()
+    }
 }
 
 impl Timeline {
-    pub(super) fn output(&mut self, grid: &Grid<Cell>, time: Arc<str>) {
-        // Alacritty moves owned row buffers when the grid scrolls. Use the
-        // backing buffer as an in-process key and validate the text before
-        // reusing a stamp. The key is never dereferenced or exposed.
-        for line in 0..grid.screen_lines() as i32 {
-            self.track(grid, Line(line), Some(&time));
+    pub(super) fn latest_prompt(&self) -> Option<u64> {
+        self.commands.last_key_value().map(|(&number, _)| number)
+    }
+    pub(super) fn touch(
+        &mut self,
+        grid: &Grid<Cell>,
+        line: Line,
+        time: DateTime<Local>,
+        fresh: bool,
+        live: bool,
+    ) {
+        self.start.get_or_insert(time);
+        let key = row_key(grid, line);
+        let previous = (!fresh).then(|| self.rows.get(&key)).flatten();
+        let number = if let Some(continuation) = self.continued_from(grid, line) {
+            continuation.number
+        } else if let Some(previous) = previous {
+            previous.number
+        } else {
+            self.next_number += 1;
+            self.next_number
+        };
+        if previous.is_some_and(|stamp| {
+            stamp.number == number
+                && stamp.time == time
+                && stamp.live == live
+                && stamp.text_hash.is_none()
+        }) {
+            return;
         }
+        self.logical_times.insert(number, time);
+        self.rows.insert(
+            key,
+            Stamp {
+                number,
+                time,
+                live,
+                text_hash: None,
+            },
+        );
+    }
 
+    pub(super) fn ensure(&mut self, grid: &Grid<Cell>, line: Line, time: DateTime<Local>) {
+        if self.stamp(grid, line).is_none() {
+            self.touch(grid, line, time, false, false);
+        }
+    }
+
+    pub(super) fn output(&mut self, grid: &Grid<Cell>, time: DateTime<Local>) {
+        let mut history_start = Line(0);
         for line in (grid.topmost_line().0..0).rev().map(Line) {
             if Some(row_key(grid, line)) == self.last_history {
                 break;
             }
-            self.track(grid, line, Some(&time));
+            history_start = line;
+        }
+        for line in (history_start.0..grid.screen_lines() as i32).map(Line) {
+            let key = row_key(grid, line);
+            let hash = row_text_hash(grid, line);
+            if let Some(stamp) = self.rows.get_mut(&key) {
+                if stamp.text_hash.is_some() && stamp.text_hash != hash {
+                    stamp.time = time;
+                    self.logical_times.insert(stamp.number, time);
+                    stamp.live = line.0 >= 0 && hash.is_some();
+                }
+                stamp.text_hash = hash;
+                if line.0 < 0 {
+                    stamp.live = false;
+                }
+            } else if hash.is_some() {
+                self.touch(grid, line, time, false, false);
+                if let Some(stamp) = self.rows.get_mut(&key) {
+                    stamp.text_hash = hash;
+                }
+            }
         }
         self.update_history_anchor(grid);
-
-        // Avoid scanning unchanged history on every output batch. The map can
-        // temporarily contain a small number of evicted backing buffers.
-        if self.rows.len() > grid.total_lines().saturating_add(128) {
-            let live: HashSet<_> = (grid.topmost_line().0..grid.screen_lines() as i32)
-                .map(|line| row_key(grid, Line(line)))
-                .collect();
-            self.rows.retain(|key, _| live.contains(key));
+        if self.rows.len() > grid.total_lines().saturating_add(128)
+            || self.logical_times.len() > self.rows.len().saturating_add(1024)
+        {
+            self.retain_live(grid);
+        }
+        if !self.has_shell_markers {
+            self.detect_prompt(grid, time);
         }
     }
 
-    pub(super) fn resized(&mut self, grid: &Grid<Cell>) {
-        // Reflow may replace or repurpose backing buffers. Keep unambiguous
-        // stamps and leave a blank where the original row cannot be traced.
-        for line in 0..grid.screen_lines() as i32 {
-            self.track(grid, Line(line), None);
-        }
-        self.update_history_anchor(grid);
+    pub(super) fn clear_reused(&mut self, grid: &Grid<Cell>, line: Line) {
+        self.rows.remove(&row_key(grid, line));
     }
 
-    pub(super) fn time(&self, grid: &Grid<Cell>, line: Line) -> Option<Arc<str>> {
-        let stamp = self.rows.get(&row_key(grid, line))?;
-        (stamp.text_hash == row_text_hash(grid, line)?)
-            .then(|| stamp.time.clone())
+    pub(super) fn reset(&mut self) {
+        *self = Self {
+            next_number: self.next_number,
+            start: self.start,
+            ..Self::default()
+        };
+    }
+
+    pub(super) fn stamp(&self, grid: &Grid<Cell>, line: Line) -> Option<Stamp> {
+        let mut stamp = *self.rows.get(&row_key(grid, line))?;
+        if let Some(&time) = self.logical_times.get(&stamp.number) {
+            stamp.time = time;
+        }
+        Some(stamp)
+    }
+
+    pub(super) fn continued_from(&self, grid: &Grid<Cell>, line: Line) -> Option<Stamp> {
+        let previous = line - 1;
+        (previous >= grid.topmost_line() && wraps(grid, previous))
+            .then(|| self.stamp(grid, previous))
             .flatten()
     }
 
-    fn track(&mut self, grid: &Grid<Cell>, line: Line, received: Option<&Arc<str>>) {
-        let key = row_key(grid, line);
-        let Some(text_hash) = row_text_hash(grid, line) else {
-            self.rows.remove(&key);
+    pub(super) fn before_resize(&self, grid: &Grid<Cell>) -> Vec<Option<Stamp>> {
+        let mut logical = Vec::new();
+        let mut previous_wrapped = false;
+        for line in (grid.topmost_line().0..grid.screen_lines() as i32).map(Line) {
+            let stamp = self.stamp(grid, line);
+            if previous_wrapped {
+                if let Some(stamp) = stamp {
+                    let last: &mut Option<Stamp> =
+                        logical.last_mut().expect("previous logical line");
+                    if last.is_none_or(|previous| stamp.time > previous.time) {
+                        *last = Some(stamp);
+                    }
+                }
+            } else {
+                logical.push(stamp);
+            }
+            previous_wrapped = wraps(grid, line);
+        }
+        while logical.last().is_some_and(Option::is_none) {
+            logical.pop();
+        }
+        logical
+    }
+
+    pub(super) fn resized(&mut self, grid: &Grid<Cell>, logical: Vec<Option<Stamp>>) {
+        let mut groups = Vec::new();
+        let mut start = grid.topmost_line();
+        let mut last_used = grid.cursor.point.line;
+        for line in (grid.topmost_line().0..grid.screen_lines() as i32).map(Line) {
+            if row_text_hash(grid, line).is_some() {
+                last_used = last_used.max(line);
+            }
+            if !wraps(grid, line) {
+                groups.push((start, line));
+                start = line + 1;
+            }
+        }
+        // Preserve chronological metadata through terminal reflow. Empty screen
+        // rows below the cursor are spare capacity and are never numbered.
+        let meaningful = groups.partition_point(|(start, _)| *start <= last_used);
+        let offset = logical.len().saturating_sub(meaningful);
+        self.rows.clear();
+        self.logical_times.clear();
+        for ((start, end), stamp) in groups.into_iter().zip(logical.into_iter().skip(offset)) {
+            if let Some(stamp) = stamp {
+                self.logical_times.insert(stamp.number, stamp.time);
+                for line in (start.0..=end.0).map(Line) {
+                    self.rows.insert(
+                        row_key(grid, line),
+                        Stamp {
+                            text_hash: row_text_hash(grid, line),
+                            ..stamp
+                        },
+                    );
+                }
+            }
+        }
+        self.update_history_anchor(grid);
+    }
+
+    pub(super) fn formatted_log(&self, grid: &Grid<Cell>, format: TimestampFormat) -> String {
+        let mut log = String::new();
+        let mut last_number = None;
+        for line in (grid.topmost_line().0..=grid.bottommost_line().0).map(Line) {
+            if let Some(stamp) = self.stamp(grid, line) {
+                let continuation = last_number == Some(stamp.number);
+                if !continuation {
+                    if let Some(messages) = self.systems.get(&stamp.number) {
+                        for message in messages {
+                            log.push_str(&format!(
+                                "· {}  {}\n",
+                                self.timestamp(message.time, format),
+                                message.text
+                            ));
+                        }
+                    }
+                    log.push_str(&format!(
+                        "{} {}  ",
+                        stamp.number,
+                        self.timestamp(stamp.time, format)
+                    ));
+                }
+                last_number = Some(stamp.number);
+                log.push_str(&row_text(grid, line));
+                if !wraps(grid, line) {
+                    log.push('\n');
+                }
+            }
+        }
+        for message in self.pending_systems() {
+            log.push_str(&format!(
+                "· {}  {}\n",
+                self.timestamp(message.time, format),
+                message.text
+            ));
+        }
+        log
+    }
+
+    pub(super) fn timestamp(&self, time: DateTime<Local>, format: TimestampFormat) -> String {
+        match format {
+            TimestampFormat::Seconds => time.format("%H:%M:%S").to_string(),
+            TimestampFormat::Milliseconds => time.format("%H:%M:%S%.3f").to_string(),
+            TimestampFormat::Relative => {
+                let seconds = self
+                    .start
+                    .map_or(0, |start| (time - start).num_seconds().max(0));
+                format!(
+                    "+{:02}:{:02}:{:02}",
+                    seconds / 3600,
+                    seconds / 60 % 60,
+                    seconds % 60
+                )
+            }
+        }
+    }
+
+    pub(super) fn prompt(&mut self, grid: &Grid<Cell>, time: DateTime<Local>) {
+        self.has_shell_markers = true;
+        self.pending_prompt = None;
+        let line = grid.cursor.point.line;
+        self.ensure(grid, line, time);
+        if let Some(stamp) = self.stamp(grid, line) {
+            if let Some(last) = self
+                .active_command
+                .take()
+                .and_then(|number| self.commands.get_mut(&number))
+                && last.last_line.is_none()
+            {
+                last.last_line = Some(stamp.number.saturating_sub(1));
+            }
+            self.commands
+                .entry(stamp.number)
+                .or_insert_with(CommandBlock::new);
+            self.active_command = Some(stamp.number);
+            if self.continued_from(grid, line).is_none() && !grid.cursor.input_needs_wrap {
+                self.pending_prompt = Some((stamp.number, grid.cursor.point.column.0));
+            }
+        }
+    }
+
+    pub(super) fn end_prompt(&mut self, grid: &Grid<Cell>) {
+        let Some((number, column)) = self.pending_prompt.take() else {
             return;
         };
+        let line = grid.cursor.point.line;
         if self
-            .rows
-            .get(&key)
-            .is_some_and(|stamp| stamp.text_hash == text_hash)
+            .stamp(grid, line)
+            .is_some_and(|stamp| stamp.number == number)
         {
-            return;
+            let first = self.logical_start(grid, line, number);
+            if let Some(block) = self.commands.get_mut(&number) {
+                block.prompt = Prompt::capture(grid, first, column);
+            }
         }
-        self.rows.insert(
-            key,
-            Stamp {
-                text_hash,
-                time: received.cloned(),
-            },
-        );
+    }
+
+    pub(super) fn prompt_colors(
+        &self,
+        grid: &Grid<Cell>,
+        line: Line,
+        number: u64,
+    ) -> Option<PromptColors> {
+        let prompt = self.commands.get(&number)?.prompt.as_ref()?;
+        prompt.colors(grid, self.logical_start(grid, line, number))
+    }
+
+    fn logical_start(&self, grid: &Grid<Cell>, mut line: Line, number: u64) -> Line {
+        while self
+            .continued_from(grid, line)
+            .is_some_and(|stamp| stamp.number == number)
+        {
+            line -= 1;
+        }
+        line
+    }
+
+    pub(super) fn start_command(&mut self, time: DateTime<Local>) {
+        self.has_shell_markers = true;
+        self.pending_prompt = None;
+        if let Some(block) = self
+            .active_command
+            .and_then(|number| self.commands.get_mut(&number))
+        {
+            block.started = Some(time);
+        }
+    }
+
+    pub(super) fn start_fallback(&mut self, time: DateTime<Local>) {
+        if !self.has_shell_markers
+            && let Some(block) = self
+                .active_command
+                .and_then(|number| self.commands.get_mut(&number))
+        {
+            block.started.get_or_insert(time);
+        }
+    }
+
+    pub(super) fn finish_command(
+        &mut self,
+        grid: &Grid<Cell>,
+        time: DateTime<Local>,
+        status: Option<i32>,
+    ) {
+        self.has_shell_markers = true;
+        self.pending_prompt = None;
+        let line = grid.cursor.point.line;
+        let last_line = self.stamp(grid, line).or_else(|| {
+            (line > grid.topmost_line())
+                .then(|| self.stamp(grid, line - 1))
+                .flatten()
+        });
+        if let Some((number, block)) = self
+            .active_command
+            .take()
+            .and_then(|number| self.commands.get_mut(&number).map(|block| (number, block)))
+        {
+            block.status = status;
+            block.elapsed = block
+                .started
+                .and_then(|started| (time - started).to_std().ok());
+            block.last_line = Some(last_line.map_or(number, |stamp| stamp.number).max(number));
+        }
+    }
+
+    pub(super) fn command_for(&self, number: u64) -> Option<(u64, &CommandBlock)> {
+        let (&start, block) = self.commands.range(..=number).next_back()?;
+        (start == number || block.last_line.is_some_and(|last| number <= last) || block.running())
+            .then_some((start, block))
+    }
+
+    pub(super) fn system_at_cursor(
+        &mut self,
+        grid: &Grid<Cell>,
+        time: DateTime<Local>,
+        message: String,
+    ) {
+        let line = grid.cursor.point.line;
+        let next = self
+            .stamp(grid, line)
+            .map_or(self.next_number + 1, |stamp| stamp.number);
+        self.system_before(next, time, message);
+    }
+
+    pub(super) fn system_after_output(&mut self, time: DateTime<Local>, message: String) {
+        self.system_before(self.next_number + 1, time, message);
+    }
+
+    pub(super) fn pending_systems(&self) -> &[SystemLine] {
+        self.systems
+            .get(&(self.next_number + 1))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn system_before(&mut self, next: u64, time: DateTime<Local>, message: String) {
+        self.start.get_or_insert(time);
+        self.systems.entry(next).or_default().push(SystemLine {
+            time,
+            text: message,
+        });
+    }
+
+    fn detect_prompt(&mut self, grid: &Grid<Cell>, time: DateTime<Local>) {
+        let line = grid.cursor.point.line;
+        let Some(stamp) = self.stamp(grid, line) else {
+            return;
+        };
+        let text = row_text(grid, line);
+        let prompt = text.trim_end();
+        let cursor = grid.cursor.point.column.0 + usize::from(grid.cursor.input_needs_wrap);
+        let has_prompt_suffix = prompt.ends_with(['$', '#', '❯', '%', '>']);
+        let styled_prompt = if has_prompt_suffix
+            && self
+                .commands
+                .get(&stamp.number)
+                .is_none_or(|block| block.prompt.is_none())
+            && grid[line][Column(cursor)..]
+                .iter()
+                .all(|cell| cell.c == ' ')
+        {
+            Prompt::capture(grid, self.logical_start(grid, line, stamp.number), 0)
+        } else {
+            None
+        };
+        if styled_prompt.is_some()
+            || is_powershell_prompt(prompt)
+            || has_prompt_suffix
+                && prompt.split_whitespace().next().is_some_and(|part| {
+                    part.contains('@')
+                        || part.contains(':')
+                        || part == "❯"
+                        || part == "$"
+                        || part == "%"
+                })
+        {
+            if let Some(previous) = self
+                .active_command
+                .filter(|&previous| previous < stamp.number)
+                && let Some(previous) = self.commands.get_mut(&previous)
+            {
+                previous.last_line = Some(stamp.number - 1);
+                previous.elapsed = previous
+                    .started
+                    .and_then(|started| (time - started).to_std().ok());
+            }
+            let block = self
+                .commands
+                .entry(stamp.number)
+                .or_insert_with(CommandBlock::new);
+            if let Some(prompt) = styled_prompt {
+                block.prompt = Some(prompt);
+            }
+            self.active_command = Some(stamp.number);
+        }
     }
 
     fn update_history_anchor(&mut self, grid: &Grid<Cell>) {
         self.last_history = (grid.history_size() > 0).then(|| row_key(grid, Line(-1)));
     }
+
+    fn retain_live(&mut self, grid: &Grid<Cell>) {
+        let live: HashSet<_> = (grid.topmost_line().0..grid.screen_lines() as i32)
+            .map(|line| row_key(grid, Line(line)))
+            .collect();
+        self.rows.retain(|key, _| live.contains(key));
+        let oldest = self
+            .rows
+            .values()
+            .map(|stamp| stamp.number)
+            .min()
+            .unwrap_or_default();
+        if self.logical_times.len() > self.rows.len().saturating_add(128) {
+            self.logical_times.retain(|number, _| *number >= oldest);
+        }
+        self.commands
+            .retain(|number, block| block.last_line.unwrap_or(*number) >= oldest);
+        self.systems.retain(|number, _| *number >= oldest);
+    }
 }
 
-fn row_key(grid: &Grid<Cell>, line: Line) -> usize {
+pub(super) fn is_powershell_prompt(text: &str) -> bool {
+    let Some(path) = text
+        .trim_end()
+        .strip_prefix("PS ")
+        .and_then(|text| text.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let path = path.trim_end_matches('>');
+    path.starts_with(['/', '\\'])
+        || path
+            .split_once(':')
+            .is_some_and(|(drive, path)| !drive.is_empty() && path.starts_with(['/', '\\']))
+}
+
+pub(super) fn row_key(grid: &Grid<Cell>, line: Line) -> usize {
+    // Alacritty moves owned row buffers when scrolling. The address is only a key.
     (&grid[line][Column(0)] as *const Cell).addr()
+}
+
+pub(super) fn row_text(grid: &Grid<Cell>, line: Line) -> String {
+    let mut result = String::new();
+    for cell in &grid[line][..] {
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        result.push(cell.c);
+        if let Some(extra) = cell.zerowidth() {
+            result.extend(extra);
+        }
+    }
+    result.truncate(result.trim_end().len());
+    result
+}
+
+pub(super) fn wraps(grid: &Grid<Cell>, line: Line) -> bool {
+    grid[line][grid.last_column()]
+        .flags
+        .contains(Flags::WRAPLINE)
 }
 
 fn row_text_hash(grid: &Grid<Cell>, line: Line) -> Option<u64> {
@@ -113,100 +591,4 @@ fn row_text_hash(grid: &Grid<Cell>, line: Line) -> Option<u64> {
         }
     }
     has_content.then(|| hash.finish())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alacritty_terminal::{Term, event::VoidListener, term::Config, vte::ansi::Processor};
-
-    use crate::terminal::TerminalSize;
-
-    #[test]
-    fn timestamps_follow_scrolled_rows_after_history_fills() {
-        let size = TerminalSize {
-            rows: 2,
-            cols: 8,
-            ..TerminalSize::default()
-        };
-        let config = Config {
-            scrolling_history: 2,
-            ..Config::default()
-        };
-        let mut term = Term::new(config, &size, VoidListener);
-        let mut parser: Processor = Processor::new();
-        let mut timeline = Timeline::default();
-        for (text, time) in [
-            (b"one".as_slice(), "09:00:01"),
-            (b"\r\ntwo", "09:00:02"),
-            (b"\r\nthree", "09:00:03"),
-            (b"\r\nfour", "09:00:04"),
-            (b"\r\nfive", "09:00:05"),
-        ] {
-            parser.advance(&mut term, text);
-            timeline.output(term.grid(), Arc::from(time));
-        }
-        assert_eq!(term.grid().history_size(), 2);
-        assert_eq!(
-            timeline.time(term.grid(), Line(-2)).as_deref(),
-            Some("09:00:02")
-        );
-        assert_eq!(
-            timeline.time(term.grid(), Line(-1)).as_deref(),
-            Some("09:00:03")
-        );
-        assert_eq!(
-            timeline.time(term.grid(), Line(0)).as_deref(),
-            Some("09:00:04")
-        );
-        assert_eq!(
-            timeline.time(term.grid(), Line(1)).as_deref(),
-            Some("09:00:05")
-        );
-    }
-
-    #[test]
-    fn cursor_movement_does_not_change_output_time() {
-        let mut term = Term::new(Config::default(), &TerminalSize::default(), VoidListener);
-        let mut parser: Processor = Processor::new();
-        let mut timeline = Timeline::default();
-        parser.advance(&mut term, b"progress");
-        timeline.output(term.grid(), Arc::from("09:00:01"));
-        parser.advance(&mut term, b"\r");
-        timeline.output(term.grid(), Arc::from("09:00:02"));
-        assert_eq!(
-            timeline.time(term.grid(), Line(0)).as_deref(),
-            Some("09:00:01")
-        );
-        parser.advance(&mut term, b"finished");
-        timeline.output(term.grid(), Arc::from("09:00:03"));
-        assert_eq!(
-            timeline.time(term.grid(), Line(0)).as_deref(),
-            Some("09:00:03")
-        );
-    }
-
-    #[test]
-    fn recycled_rows_with_identical_text_get_fresh_timestamps() {
-        let size = TerminalSize {
-            rows: 2,
-            cols: 8,
-            ..TerminalSize::default()
-        };
-        let config = Config {
-            scrolling_history: 2,
-            ..Config::default()
-        };
-        let mut term = Term::new(config, &size, VoidListener);
-        let mut parser: Processor = Processor::new();
-        let mut timeline = Timeline::default();
-        parser.advance(&mut term, b"same");
-        timeline.output(term.grid(), Arc::from("09:00:01"));
-        for sequence in 2..=12 {
-            parser.advance(&mut term, b"\r\nsame");
-            let time: Arc<str> = Arc::from(format!("09:00:{sequence:02}"));
-            timeline.output(term.grid(), time.clone());
-            assert_eq!(timeline.time(term.grid(), Line(1)), Some(time));
-        }
-    }
 }

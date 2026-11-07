@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">CapTerm</title>
+  <desc id="desc">A brass ship's helm. Its hub is a terminal screen showing a prompt: the captain steers remote hosts from the shell.</desc>
+  <defs>
+    <!-- Brass across a bar (dark edge, bright centre line). In bounding-box units, so it turns with each spoke and handle. -->
+    <linearGradient id="bar">
+      <stop offset="0" stop-color="#7A4614"/>
+      <stop offset=".24" stop-color="#C98A2E"/>
+      <stop offset=".5" stop-color="#FCE3A0"/>
+      <stop offset=".72" stop-color="#E2A33E"/>
+      <stop offset="1" stop-color="#8A5218"/>
+    </linearGradient>
+    <!-- Key light from the upper left, laid over all brass in canvas space. -->
+    <linearGradient id="light" x1="52" y1="28" x2="204" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity=".4"/>
+      <stop offset=".44" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset=".56" stop-color="#2A1000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#2A1000" stop-opacity=".45"/>
+    </linearGradient>
+    <!-- Rim and hub are tubes: the shading runs across their thickness. -->
+    <radialGradient id="rim" cx="128" cy="128" r="86" gradientUnits="userSpaceOnUse">
+      <stop offset="82.6%" stop-color="#8A5218"/>
+      <stop offset="87.8%" stop-color="#F6CD72"/>
+      <stop offset="90.9%" stop-color="#FFF0C4"/>
+      <stop offset="94.8%" stop-color="#E0A23F"/>
+      <stop offset="100%" stop-color="#7A4614"/>
+    </radialGradient>
+    <radialGradient id="hub" cx="128" cy="128" r="49" gradientUnits="userSpaceOnUse">
+      <stop offset="85.7%" stop-color="#6B3C10"/>
+      <stop offset="90.7%" stop-color="#F9DC8E"/>
+      <stop offset="94.6%" stop-color="#E5A944"/>
+      <stop offset="100%" stop-color="#8A5218"/>
+    </radialGradient>
+    <radialGradient id="sea" cx="128" cy="128" r="71" gradientUnits="userSpaceOnUse">
+      <stop offset=".45" stop-color="#15364E"/>
+      <stop offset="1" stop-color="#091725"/>
+    </radialGradient>
+    <radialGradient id="glass" cx="116" cy="112" r="54.6" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#215677"/>
+      <stop offset=".55" stop-color="#0C2233"/>
+      <stop offset="1" stop-color="#040A10"/>
+    </radialGradient>
+    <path id="handle" d="M132.6 48C134.1 46.8 132.2 42.2 132.6 40.5C133 38.8 134.5 39 134.9 38C135.3 37 135.3 35.5 134.9 34.5C134.5 33.5 132.7 32.9 132.3 32C131.9 31.1 132.2 30.2 132.6 29C133 27.8 134.1 26 134.6 24.5C135.1 23 135.5 21.3 135.4 20C135.3 18.7 134.6 17.4 134.2 16.5C133.8 15.6 133.8 15 133.1 14.5C132.4 13.9 131 13.5 130.1 13.2C129.3 13 128.7 13 128 13C127.3 13 126.7 13 125.9 13.2C125 13.5 123.6 13.9 122.9 14.5C122.2 15 122.2 15.6 121.8 16.5C121.4 17.4 120.7 18.7 120.6 20C120.5 21.3 120.9 23 121.4 24.5C121.9 26 123 27.8 123.4 29C123.8 30.2 124.1 31.1 123.7 32C123.3 32.9 121.5 33.5 121.1 34.5C120.7 35.5 120.7 37 121.1 38C121.5 39 123 38.8 123.4 40.5C123.8 42.2 121.9 46.8 123.4 48C124.9 49.2 131.1 49.2 132.6 48Z"/>
+    <path id="spoke" d="M122 88L134 88L132.4 54L123.6 54Z"/>
+    <path id="rim-ring" d="M128 42a86 86 0 1 1 0 172a86 86 0 1 1 0 -172ZM128 57a71 71 0 1 0 0 142a71 71 0 1 0 0 -142Z"/>
+    <path id="hub-ring" d="M128 79a49 49 0 1 1 0 98a49 49 0 1 1 0 -98ZM128 86a42 42 0 1 0 0 84a42 42 0 1 0 0 -84Z"/>
+    <clipPath id="brass">
+      <use xlink:href="#handle"/>
+      <use xlink:href="#handle" transform="rotate(45 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(90 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(135 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(180 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(225 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(270 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(315 128 128)"/>
+      <use xlink:href="#spoke"/>
+      <use xlink:href="#spoke" transform="rotate(45 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(90 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(135 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(180 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(225 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(270 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(315 128 128)"/>
+      <use xlink:href="#rim-ring"/>
+      <use xlink:href="#hub-ring"/>
+    </clipPath>
+    <clipPath id="well">
+      <circle cx="128" cy="128" r="72"/>
+    </clipPath>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3.5"/>
+      <feOffset dy="3" result="drop"/>
+      <feFlood flood-color="#000" flood-opacity=".35"/>
+      <feComposite in2="drop" operator="in"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="ao" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="2.2"/>
+    </filter>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3"/>
+    </filter>
+    <filter id="soft" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation=".9"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <circle cx="128" cy="128" r="72" fill="url(#sea)"/>
+    <!-- Spokes, hub and rim shade the water inside the wheel. -->
+    <g clip-path="url(#well)">
+      <g filter="url(#ao)" opacity=".55">
+        <g transform="translate(1.5 3)">
+          <use xlink:href="#spoke"/>
+          <use xlink:href="#spoke" transform="rotate(45 128 128)"/>
+          <use xlink:href="#spoke" transform="rotate(90 128 128)"/>
+          <use xlink:href="#spoke" transform="rotate(135 128 128)"/>
+          <use xlink:href="#spoke" transform="rotate(180 128 128)"/>
+          <use xlink:href="#spoke" transform="rotate(225 128 128)"/>
+          <use xlink:href="#spoke" transform="rotate(270 128 128)"/>
+          <use xlink:href="#spoke" transform="rotate(315 128 128)"/>
+          <circle cx="128" cy="128" r="49"/>
+        </g>
+        <circle cx="128" cy="128" r="72" fill="none" stroke="#000" stroke-width="7"/>
+      </g>
+    </g>
+    <g fill="url(#bar)">
+      <use xlink:href="#spoke"/>
+      <use xlink:href="#spoke" transform="rotate(45 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(90 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(135 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(180 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(225 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(270 128 128)"/>
+      <use xlink:href="#spoke" transform="rotate(315 128 128)"/>
+      <use xlink:href="#handle"/>
+      <use xlink:href="#handle" transform="rotate(45 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(90 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(135 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(180 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(225 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(270 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(315 128 128)"/>
+    </g>
+    <use xlink:href="#rim-ring" fill="url(#rim)"/>
+    <use xlink:href="#hub-ring" fill="url(#hub)"/>
+    <rect width="256" height="256" fill="url(#light)" clip-path="url(#brass)"/>
+  </g>
+  <path d="M51 159.1A83 83 0 0 1 72.5 66.3" fill="none" stroke="#FFF8E2" stroke-opacity=".8" stroke-width="2.4" stroke-linecap="round" filter="url(#soft)"/>
+  <path d="M199 147A73.5 73.5 0 0 1 153.1 197.1" fill="none" stroke="#FFE7A6" stroke-opacity=".5" stroke-width="2" stroke-linecap="round" filter="url(#soft)"/>
+  <path d="M81.7 134.5A46.8 46.8 0 0 1 96.7 93.2" fill="none" stroke="#FFF8E2" stroke-opacity=".7" stroke-width="1.8" stroke-linecap="round" filter="url(#soft)"/>
+
+  <!-- Terminal screen in the hub -->
+  <circle cx="128" cy="128" r="42" fill="url(#glass)"/>
+  <circle cx="128" cy="128" r="41" fill="none" stroke="#000" stroke-opacity=".6" stroke-width="2" filter="url(#soft)"/>
+  <path d="M91.5 129.3A36.5 36.5 0 0 1 105.5 99.2" fill="none" stroke="#FFFFFF" stroke-opacity=".18" stroke-width="3" stroke-linecap="round"/>
+  <g filter="url(#glow)" opacity=".55">
+    <path d="M109.3 110.5L128.3 127.5L109.3 144.5" fill="none" stroke="#5CC8E6" stroke-width="8.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="133.3" y="141.7" width="16" height="7.1" rx="2.3" fill="#E8B04A"/>
+  </g>
+  <path d="M109.3 110.5L128.3 127.5L109.3 144.5" fill="none" stroke="#6AD6F2" stroke-width="8.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="133.3" y="141.7" width="16" height="7.1" rx="2.3" fill="#F6C65B"/>
+</svg>

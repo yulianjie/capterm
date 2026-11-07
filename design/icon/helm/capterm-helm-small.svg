@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="48" height="48" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">CapTerm</title>
+  <desc id="desc">Small-size CapTerm helm for 16 to 48 pixels: heavier rim, stub handles and a larger prompt.</desc>
+  <defs>
+    <!-- Brass across a bar (dark edge, bright centre line). In bounding-box units, so it turns with each spoke and handle. -->
+    <linearGradient id="bar">
+      <stop offset="0" stop-color="#7A4614"/>
+      <stop offset=".24" stop-color="#C98A2E"/>
+      <stop offset=".5" stop-color="#FCE3A0"/>
+      <stop offset=".72" stop-color="#E2A33E"/>
+      <stop offset="1" stop-color="#8A5218"/>
+    </linearGradient>
+    <!-- Key light from the upper left, laid over all brass in canvas space. -->
+    <linearGradient id="light" x1="52" y1="28" x2="204" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity=".4"/>
+      <stop offset=".44" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset=".56" stop-color="#2A1000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#2A1000" stop-opacity=".45"/>
+    </linearGradient>
+    <radialGradient id="rim" cx="128" cy="128" r="88" gradientUnits="userSpaceOnUse">
+      <stop offset="72.7%" stop-color="#B97A26"/>
+      <stop offset="83.6%" stop-color="#FBDF92"/>
+      <stop offset="100%" stop-color="#C98A2E"/>
+    </radialGradient>
+    <radialGradient id="sea" cx="128" cy="128" r="64" gradientUnits="userSpaceOnUse">
+      <stop offset=".45" stop-color="#15364E"/>
+      <stop offset="1" stop-color="#0A1A29"/>
+    </radialGradient>
+    <path id="handle" d="M139 50C142.7 47 138.3 36.3 139 32C139.7 27.7 142.3 26.7 143 24C143.7 21.3 143.5 18.5 143 16C142.5 13.5 141.9 11 140.3 9.1C138.6 7.2 135.2 5.6 133.1 4.7C131.1 3.9 129.7 4 128 4C126.3 4 124.9 3.9 122.9 4.7C120.8 5.6 117.4 7.2 115.7 9.1C114.1 11 113.5 13.5 113 16C112.5 18.5 112.3 21.3 113 24C113.7 26.7 116.3 27.7 117 32C117.7 36.3 113.3 47 117 50C120.7 53 135.3 53 139 50Z"/>
+    <path id="rim-ring" d="M128 40a88 88 0 1 1 0 176a88 88 0 1 1 0 -176ZM128 64a64 64 0 1 0 0 128a64 64 0 1 0 0 -128Z"/>
+    <clipPath id="brass">
+      <use xlink:href="#handle"/>
+      <use xlink:href="#handle" transform="rotate(45 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(90 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(135 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(180 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(225 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(270 128 128)"/>
+      <use xlink:href="#handle" transform="rotate(315 128 128)"/>
+      <use xlink:href="#rim-ring"/>
+    </clipPath>
+  </defs>
+
+  <circle cx="128" cy="128" r="65" fill="url(#sea)"/>
+  <g fill="url(#bar)">
+    <use xlink:href="#handle"/>
+    <use xlink:href="#handle" transform="rotate(45 128 128)"/>
+    <use xlink:href="#handle" transform="rotate(90 128 128)"/>
+    <use xlink:href="#handle" transform="rotate(135 128 128)"/>
+    <use xlink:href="#handle" transform="rotate(180 128 128)"/>
+    <use xlink:href="#handle" transform="rotate(225 128 128)"/>
+    <use xlink:href="#handle" transform="rotate(270 128 128)"/>
+    <use xlink:href="#handle" transform="rotate(315 128 128)"/>
+  </g>
+  <use xlink:href="#rim-ring" fill="url(#rim)"/>
+  <rect width="256" height="256" fill="url(#light)" clip-path="url(#brass)"/>
+  <path d="M94.2 94L130.1 126L94.2 158" fill="none" stroke="#6AD6F2" stroke-width="21" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="138.1" y="151.3" width="30" height="17.2" rx="5.5" fill="#F6C65B"/>
+</svg>

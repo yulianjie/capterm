@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">CapTerm ship</title>
+  <desc id="description">A ship with a raised bow and a terminal prompt cut through its hull.</desc>
+  <defs>
+    <linearGradient id="ocean" x1="37" y1="14" x2="207" y2="247" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#283C53"/>
+      <stop offset="1" stop-color="#101926"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="128" y1="8" x2="128" y2="248" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7591AD" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#49617D" stop-opacity=".24"/>
+    </linearGradient>
+    <linearGradient id="bridge" x1="112" y1="61" x2="132" y2="117" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F4FAFF"/>
+      <stop offset="1" stop-color="#C9E0EA"/>
+    </linearGradient>
+    <linearGradient id="hull" x1="107" y1="107" x2="140" y2="182" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A9ECF0"/>
+      <stop offset="1" stop-color="#59C1E1"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#ocean)"/>
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="url(#rim)" stroke-width="2"/>
+  <path fill="url(#bridge)" fill-rule="evenodd" d="M66 115l9-26a8 8 0 0 1 8-6h14V69a8 8 0 0 1 8-8h15a8 8 0 0 1 8 8v14h25c6 0 11 2 15 7l21 25H66Zm54-23a5 5 0 0 0 0 10h33a5 5 0 0 0 0-10h-33Z"/>
+  <path fill="url(#hull)" fill-rule="evenodd" d="
+    M40 114h143c13 0 24-4 33-12 5-4 12-1 10 6l-9 33c-5 17-15 31-28 41H77c-13 0-23-7-28-19l-16-37c-3-7 0-12 7-12Z
+    M99 125l19 15q6 5 0 10l-19 15a7 7 0 0 1-9-11l12-9-12-9a7 7 0 0 1 9-11Z
+    M138 153h20a7 7 0 0 1 0 14h-20a7 7 0 0 1 0-14Z"/>
+  <path d="M66 201c15 0 22-6 36-6s23 6 38 6 23-6 38-6h11" fill="none" stroke="#5A9DBC" stroke-width="8" stroke-linecap="round"/>
+</svg>

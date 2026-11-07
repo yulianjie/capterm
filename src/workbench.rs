@@ -1,43 +1,54 @@
+mod commands;
 mod dialogs;
 mod files;
+mod monitor;
 mod ui;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::io::Write;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::TitleBar;
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::{Theme, TitleBar, WindowExt};
 use gpui_kit::*;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
-use crate::config::{self, ConnectionProfile, Settings};
+use crate::config::{self, ConnectionProfile, Settings, ThemePreference};
 use crate::local::{self, LocalShell};
-use crate::ssh::{Connection, Metrics, ShellCommand, ShellEvent, TrustRequest};
-use crate::terminal::{TerminalCommand, TerminalSize, TerminalView};
-use files::{FileDrag, FileEvent, FilePane};
+use crate::ssh::{
+    Connection, ConnectionPrompt, HopProgress, HopStage, Metrics, ShellCommand, ShellEvent,
+};
+use crate::terminal::highlight::{BUNDLED, LinuxHighlights};
+use crate::terminal::{ClipboardImage, TerminalCommand, TerminalSize, TerminalView};
+use files::{FileEvent, FilePane};
 
-const DRAFT_HINT: &str = "Send a command to this session…";
+const DRAFT_HINT: &str = "输入命令，Enter 发送，↑ 调出历史";
+const SENDER_HISTORY_LIMIT: usize = 200;
+const SENDER_HISTORY_ENTRY_BYTES: usize = 16 * 1024;
 
 pub fn open(cx: &mut App) {
     let (settings, load_error) = match Settings::load() {
         Ok(settings) => (settings, None),
         Err(error) => (
             Settings::default(),
-            Some(format!("Cannot load settings: {error:#}")),
+            Some(format!("无法读取设置：{error:#}")),
         ),
     };
-    ui::apply_theme(settings.light, cx);
+    ui::install_theme(cx);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_name("capterm-session")
         .enable_all()
         .build()
         .expect("start session runtime");
-    let window_bounds = Bounds::centered(None, size(px(1360.), px(840.)), cx);
+    let window_bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
     let mut options = TitleBar::window_options();
     options.window_bounds = Some(WindowBounds::Windowed(window_bounds));
     options.window_min_size = Some(size(px(500.), px(460.)));
@@ -62,14 +73,14 @@ enum Phase {
 impl Phase {
     fn label(self, local: bool) -> &'static str {
         match (self, local) {
-            (Self::Connecting, true) => "Starting",
-            (Self::Connected, true) => "Running",
-            (Self::Disconnected, true) => "Exited",
-            (Self::Failed, true) => "Shell failed",
-            (Self::Connecting, false) => "Connecting",
-            (Self::Connected, false) => "Connected",
-            (Self::Disconnected, false) => "Disconnected",
-            (Self::Failed, false) => "Connection failed",
+            (Self::Connecting, true) => "正在启动",
+            (Self::Connected, true) => "运行中",
+            (Self::Disconnected, true) => "已退出",
+            (Self::Failed, true) => "启动失败",
+            (Self::Connecting, false) => "正在连接",
+            (Self::Connected, false) => "已连接",
+            (Self::Disconnected, false) => "未连接",
+            (Self::Failed, false) => "连接失败",
         }
     }
 }
@@ -78,6 +89,39 @@ impl Phase {
 enum Drawer {
     Files,
     Sessions,
+    Monitor,
+}
+
+#[derive(Clone, Default)]
+enum SendTarget {
+    #[default]
+    Active,
+    All,
+    Selected(HashSet<u64>),
+}
+
+struct SessionNotice {
+    tab: u64,
+    label: String,
+    message: String,
+    time: chrono::DateTime<chrono::Local>,
+    read: bool,
+}
+
+#[derive(Default)]
+struct TerminalObservation {
+    directory: Option<String>,
+    prompt: u64,
+    notification: u64,
+    fullscreen: bool,
+}
+
+struct ConnectionTest {
+    profile: ConnectionProfile,
+    started: Instant,
+    hops: Vec<HopProgress>,
+    form: Option<Rc<dialogs::FormStatus>>,
+    _task: AbortHandle,
 }
 
 struct TerminalLink {
@@ -124,13 +168,23 @@ struct Tab {
     session: Session,
     phase: Phase,
     terminal: Entity<TerminalView>,
-    draft: Entity<InputState>,
+    draft: Entity<TextareaState>,
     link: Rc<TerminalLink>,
-    gutter: bool,
-    manual_raw: bool,
+    line_numbers: bool,
+    timestamps: bool,
+    show_sender: bool,
+    paste_mode: Option<bool>,
+    command_history: Rc<RefCell<VecDeque<String>>>,
+    history_index: Option<usize>,
+    history_draft: String,
+    pending_notification: bool,
+    observed_terminal: TerminalObservation,
+    route: Vec<HopProgress>,
     connection: Option<Arc<Connection>>,
     operation: AbortHandle,
     monitor: Option<AbortHandle>,
+    monitor_state: monitor::MonitorState,
+    monitor_active: Arc<AtomicBool>,
     sample: Option<(Metrics, Instant)>,
     files: FilePane,
     _subscriptions: Vec<Subscription>,
@@ -174,11 +228,12 @@ impl Drop for Tab {
 }
 
 enum Event {
-    Trust(u64, TrustRequest),
+    Trust(u64, ConnectionPrompt),
     Connected(u64, Arc<Connection>, mpsc::UnboundedSender<ShellCommand>),
     LocalStarted(u64, std::sync::mpsc::Sender<ShellCommand>),
     StartFailed(u64, String),
     TestFinished(u64, Result<(), String>),
+    Route(u64, HopProgress),
     Shell(u64, ShellEvent),
     Sample(u64, Option<Metrics>),
     File(u64, FileEvent),
@@ -187,27 +242,42 @@ enum Event {
 
 struct Workbench {
     settings: Settings,
+    linux_highlights: Rc<LinuxHighlights>,
     load_error: Option<String>,
     events: async_channel::Sender<Event>,
     tabs: Vec<Tab>,
     active: Option<u64>,
     next_id: u64,
     filter: Entity<InputState>,
-    empty_draft: Entity<InputState>,
-    raw_draft: Entity<InputState>,
+    empty_draft: Entity<TextareaState>,
+    send_target: SendTarget,
+    sender_histories: HashMap<String, Rc<RefCell<VecDeque<String>>>>,
+    left_visible: bool,
+    right_visible: bool,
+    focus_mode: bool,
+    left_width: Pixels,
+    right_width: Pixels,
+    monitor_height: Pixels,
+    collapsed_groups: HashSet<String>,
     drawer: Option<Drawer>,
     compact: bool,
     notice: String,
-    tests: HashMap<u64, (String, AbortHandle)>,
-    file_drag: Option<FileDrag>,
+    notifications: VecDeque<SessionNotice>,
+    notifications_open: bool,
+    tests: HashMap<u64, ConnectionTest>,
+    recent_tests: VecDeque<(String, Vec<HopProgress>)>,
+    window_active: Arc<AtomicBool>,
+    monitor_interval: Arc<AtomicU64>,
+    file_editors: Vec<files::FileEditor>,
+    active_file_editor: Option<u64>,
     _pump: Task<()>,
-    _filter_subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
     runtime: tokio::runtime::Runtime,
 }
 
 impl Workbench {
     fn new(
-        settings: Settings,
+        mut settings: Settings,
         load_error: Option<String>,
         runtime: tokio::runtime::Runtime,
         window: &mut Window,
@@ -224,33 +294,79 @@ impl Workbench {
                 }
             }
         });
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter sessions…"));
+        if settings.theme == ThemePreference::System {
+            Theme::sync_system_appearance(Some(window), cx);
+            settings.light = !Theme::global(cx).is_dark();
+        }
+        ui::apply_theme(&settings, cx);
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索名称、主机或用户"));
         let filter_subscription = cx.subscribe(&filter, |_, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
         });
-        Self {
-            notice: load_error.clone().unwrap_or_default(),
+        let activation = cx.observe_window_activation(window, |this, window, _| {
+            this.window_active
+                .store(window.is_window_active(), Ordering::Relaxed);
+        });
+        let appearance = cx.observe_window_appearance(window, |this, window, cx| {
+            if this.settings.theme == ThemePreference::System {
+                Theme::sync_system_appearance(Some(window), cx);
+                this.update_theme(!Theme::global(cx).is_dark(), cx);
+            }
+        });
+        let keys = Self::install_shortcuts(window, cx);
+        let monitor_interval = Arc::new(AtomicU64::new(settings.monitor_interval.clamp(1, 60)));
+        let (linux_highlights, highlight_error) =
+            match config::linux_highlights_path().and_then(|path| LinuxHighlights::load(&path)) {
+                Ok(rules) => (rules, None),
+                Err(error) => (
+                    LinuxHighlights::bundled(),
+                    Some(format!(
+                        "无法读取 Linux 高亮规则，已使用内置规则：{error:#}"
+                    )),
+                ),
+            };
+        let mut this = Self {
+            notice: load_error.clone().or(highlight_error).unwrap_or_default(),
             settings,
+            linux_highlights: Rc::new(linux_highlights),
             load_error,
             events,
             tabs: Vec::new(),
             active: None,
             next_id: 0,
             filter,
-            empty_draft: cx.new(|cx| InputState::new(window, cx).placeholder(DRAFT_HINT)),
-            raw_draft: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Keyboard goes directly to the terminal…")
+            empty_draft: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(1, 6)
+                    .placeholder(DRAFT_HINT)
             }),
+            send_target: SendTarget::default(),
+            sender_histories: HashMap::new(),
+            left_visible: true,
+            right_visible: true,
+            focus_mode: false,
+            left_width: px(272.),
+            right_width: px(296.),
+            monitor_height: px(424.),
+            collapsed_groups: HashSet::new(),
             drawer: None,
-            compact: window.viewport_size().width < px(760.),
+            compact: window.viewport_size().width < px(900.),
+            notifications: VecDeque::new(),
+            notifications_open: false,
             tests: HashMap::new(),
-            file_drag: None,
+            recent_tests: VecDeque::new(),
+            window_active: Arc::new(AtomicBool::new(true)),
+            monitor_interval,
+            file_editors: Vec::new(),
+            active_file_editor: None,
             _pump: pump,
-            _filter_subscription: filter_subscription,
+            _subscriptions: vec![filter_subscription, activation, appearance, keys],
             runtime,
-        }
+        };
+        this.start_linked_config_sync(window, cx);
+        this
     }
 
     fn active_tab(&self) -> Option<&Tab> {
@@ -275,7 +391,10 @@ impl Workbench {
         cx.notify();
     }
 
-    fn persist(&mut self, settings: Settings, cx: &mut Context<Self>) -> bool {
+    fn persist(&mut self, mut settings: Settings, cx: &mut Context<Self>) -> bool {
+        settings
+            .sender_history
+            .retain(|id, _| settings.profiles.iter().any(|profile| &profile.id == id));
         let result = match &self.load_error {
             Some(error) => Err(anyhow::anyhow!("{error}")),
             None => settings.save(),
@@ -283,27 +402,114 @@ impl Workbench {
         match result {
             Ok(()) => {
                 self.settings = settings;
+                self.monitor_interval.store(
+                    self.settings.monitor_interval.clamp(1, 60),
+                    Ordering::Relaxed,
+                );
                 cx.notify();
                 true
             }
             Err(error) => {
-                self.announce(format!("Cannot save settings: {error:#}"), cx);
+                self.announce(format!("无法保存设置：{error:#}"), cx);
                 false
             }
         }
     }
 
-    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+    fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let theme = if self.settings.light {
+            ThemePreference::Dark
+        } else {
+            ThemePreference::Light
+        };
+        self.set_theme_preference(theme, window, cx);
+    }
+
+    fn set_theme_preference(
+        &mut self,
+        theme: ThemePreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut settings = self.settings.clone();
-        settings.light = !settings.light;
+        settings.theme = theme;
+        settings.light = match theme {
+            ThemePreference::Legacy => settings.light,
+            ThemePreference::Dark => false,
+            ThemePreference::Light => true,
+            ThemePreference::System => {
+                !gpui_kit::component::ThemeMode::from(window.appearance()).is_dark()
+            }
+        };
         let light = settings.light;
         if self.persist(settings, cx) {
-            ui::apply_theme(light, cx);
-            for tab in &self.tabs {
-                tab.terminal
-                    .update(cx, |terminal, cx| terminal.set_light(light, cx));
-            }
+            self.update_theme(light, cx);
         }
+    }
+
+    fn update_theme(&mut self, light: bool, cx: &mut Context<Self>) {
+        self.settings.light = light;
+        ui::apply_theme(&self.settings, cx);
+        for tab in &self.tabs {
+            tab.terminal
+                .update(cx, |terminal, cx| terminal.set_light(light, cx));
+        }
+        cx.notify();
+    }
+
+    fn apply_terminal_preferences(&mut self, cx: &mut Context<Self>) {
+        for tab in &mut self.tabs {
+            tab.line_numbers = self.settings.show_line_numbers;
+            tab.timestamps = self.settings.show_timestamps;
+            tab.terminal.update(cx, |term, cx| {
+                configure_terminal(
+                    term,
+                    &self.settings,
+                    &self.linux_highlights,
+                    &tab.session,
+                    cx,
+                );
+            });
+        }
+        cx.notify();
+    }
+
+    fn edit_linux_highlights(&mut self, cx: &mut Context<Self>) {
+        let result = (|| -> anyhow::Result<_> {
+            let path = config::linux_highlights_path()?;
+            if !path.try_exists()? {
+                let directory = path.parent().expect("Linux highlights settings directory");
+                std::fs::create_dir_all(directory)?;
+                let mut file = tempfile::NamedTempFile::new_in(directory)?;
+                file.write_all(BUNDLED.as_bytes())?;
+                if let Err(error) = file.persist_noclobber(&path)
+                    && error.error.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(error.into());
+                }
+            }
+            Ok(path)
+        })();
+        match result {
+            Ok(path) => cx.open_with_system(&path),
+            Err(error) => self.announce(format!("无法打开 Linux 高亮规则：{error:#}"), cx),
+        }
+    }
+
+    fn reload_linux_highlights(&mut self, cx: &mut Context<Self>) {
+        match config::linux_highlights_path().and_then(|path| LinuxHighlights::load(&path)) {
+            Ok(rules) => {
+                self.linux_highlights = Rc::new(rules);
+                self.apply_terminal_preferences(cx);
+                self.announce("已重载 Linux 高亮规则", cx);
+            }
+            Err(error) => self.announce(format!("Linux 高亮规则未更新：{error:#}"), cx),
+        }
+    }
+
+    fn apply_font_preferences(&mut self, cx: &mut Context<Self>) {
+        ui::apply_theme(&self.settings, cx);
+        self.apply_terminal_preferences(cx);
     }
 
     fn select_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -311,8 +517,23 @@ impl Workbench {
             tab.terminal
                 .update(cx, |terminal, cx| terminal.focus(window, cx));
             self.active = Some(id);
+            self.active_file_editor = None;
+            self.set_monitored_tab(Some(id));
+            if let Some(tab) = self.tab_mut(id) {
+                tab.pending_notification = false;
+            }
+            for note in self.notifications.iter_mut().filter(|note| note.tab == id) {
+                note.read = true;
+            }
             self.drawer = None;
             cx.notify();
+        }
+    }
+
+    fn set_monitored_tab(&self, id: Option<u64>) {
+        for tab in &self.tabs {
+            tab.monitor_active
+                .store(Some(tab.id) == id, Ordering::Relaxed);
         }
     }
 
@@ -320,6 +541,7 @@ impl Workbench {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
+        self.cancel_file_transfers(id, cx);
         let mut tab = self.tabs.remove(index);
         if let Some(connection) = tab.connection.take() {
             self.disconnect(connection);
@@ -347,30 +569,47 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(tab) = self.tabs.iter().find(|tab| {
-            tab.ssh_profile()
-                .is_some_and(|connected| connected.id == profile.id)
-        }) {
-            if matches!(tab.phase, Phase::Connected | Phase::Connecting) {
-                self.select_tab(tab.id, window, cx);
-                return;
-            }
-            self.close_tab(tab.id, window, cx);
+        if let Some(tab) = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                tab.ssh_profile()
+                    .is_some_and(|saved| saved.id == profile.id)
+                    && matches!(tab.phase, Phase::Connected | Phase::Connecting)
+            })
+            .max_by_key(|tab| (Some(tab.id) == self.active, tab.phase == Phase::Connected))
+        {
+            self.select_tab(tab.id, window, cx);
+            return;
         }
+        self.connect_new(profile, password, window, cx);
+    }
+
+    fn connect_new(
+        &mut self,
+        mut profile: ConnectionProfile,
+        password: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let known_hosts = match config::known_hosts() {
             Ok(path) => path,
             Err(error) => {
-                self.announce(format!("Cannot open known hosts: {error:#}"), cx);
+                self.announce(format!("无法打开已知主机文件：{error:#}"), cx);
                 return;
             }
         };
-        let target = profile.clone();
+        self.settings.resolve_jump_references(&mut profile);
+        let mut target = profile.clone();
+        self.settings.apply_ssh_defaults(&mut target);
+        let reuse_jumps = self.settings.reuse_jumps;
         self.start_tab(
             Session::Ssh(profile),
             window,
             cx,
             |id, initial, events| async move {
-                let result = establish(id, &target, password, known_hosts, &events).await;
+                let result =
+                    establish(id, &target, password, known_hosts, reuse_jumps, &events).await;
                 match result {
                     Ok(connection) => run_shell(id, Arc::new(connection), initial, &events).await,
                     Err(error) => {
@@ -425,18 +664,53 @@ impl Workbench {
         terminal.update(cx, |terminal, cx| {
             terminal.set_light(self.settings.light, cx);
             terminal.set_compact(self.compact, cx);
-            terminal.set_gutter(true, cx);
+            configure_terminal(
+                terminal,
+                &self.settings,
+                &self.linux_highlights,
+                &session,
+                cx,
+            );
         });
-        let draft = cx.new(|cx| InputState::new(window, cx).placeholder(DRAFT_HINT));
+        let draft = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 6)
+                .submit_on_enter(true)
+                .placeholder(DRAFT_HINT)
+        });
         let draft_subscription =
             cx.subscribe_in(&draft, window, move |view, _, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        shift: false,
+                        secondary: false
+                    }
+                ) {
                     view.send_draft(id, window, cx);
                 }
             });
-        let terminal_subscription = cx.observe(&terminal, |_, _, cx| cx.notify());
+        let terminal_subscription = cx.observe_in(&terminal, window, move |view, _, window, cx| {
+            view.observe_terminal(id, window, cx);
+        });
+        let clipboard_subscription =
+            cx.subscribe(&terminal, move |view, _, image: &ClipboardImage, cx| {
+                view.upload_terminal_clipboard(id, image.bytes.clone(), image.extension, cx);
+            });
         let initial = terminal.read(cx).size();
         let operation = self.runtime.spawn(run(id, initial, self.events.clone()));
+        let (history_key, saved_history) = match &session {
+            Session::Ssh(profile) => (
+                format!("ssh:{}", profile.id),
+                self.settings.sender_history.get(&profile.id),
+            ),
+            Session::Local(shell) => (format!("local:{}", shell.label()), None),
+        };
+        let command_history = self
+            .sender_histories
+            .entry(history_key)
+            .or_insert_with(|| Rc::new(RefCell::new(saved_history.cloned().unwrap_or_default())))
+            .clone();
         self.tabs.push(Tab {
             id,
             session,
@@ -444,14 +718,28 @@ impl Workbench {
             terminal,
             draft,
             link,
-            gutter: true,
-            manual_raw: false,
+            line_numbers: self.settings.show_line_numbers,
+            timestamps: self.settings.show_timestamps,
+            show_sender: false,
+            paste_mode: None,
+            command_history,
+            history_index: None,
+            history_draft: String::new(),
+            pending_notification: false,
+            observed_terminal: TerminalObservation::default(),
+            route: Vec::new(),
             connection: None,
             operation: operation.abort_handle(),
             monitor: None,
+            monitor_state: monitor::MonitorState::default(),
+            monitor_active: Arc::new(AtomicBool::new(false)),
             sample: None,
             files: FilePane::default(),
-            _subscriptions: vec![draft_subscription, terminal_subscription],
+            _subscriptions: vec![
+                draft_subscription,
+                terminal_subscription,
+                clipboard_subscription,
+            ],
         });
         self.notice.clear();
         self.select_tab(id, window, cx);
@@ -463,21 +751,52 @@ impl Workbench {
         password: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.tests.values().any(|(id, _)| *id == profile.id) {
-            return;
+        self.begin_test(profile, password, None, cx);
+    }
+
+    fn test_form(
+        &mut self,
+        profile: ConnectionProfile,
+        form: Rc<dialogs::FormStatus>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.begin_test(profile, None, Some(form.clone()), cx) {
+            form.finish(self.notice.clone(), false, window);
+        }
+    }
+
+    fn begin_test(
+        &mut self,
+        mut profile: ConnectionProfile,
+        password: Option<String>,
+        form: Option<Rc<dialogs::FormStatus>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self
+            .tests
+            .values()
+            .any(|test| test.profile.id == profile.id)
+        {
+            self.announce("此会话正在测试连接", cx);
+            return false;
         }
         let known_hosts = match config::known_hosts() {
             Ok(path) => path,
             Err(error) => {
-                self.announce(format!("Cannot open known hosts: {error:#}"), cx);
-                return;
+                self.announce(format!("无法打开已知主机文件：{error:#}"), cx);
+                return false;
             }
         };
         let id = self.new_id();
-        let target = profile.clone();
+        self.settings.resolve_jump_references(&mut profile);
+        let mut target = profile.clone();
+        self.settings.apply_ssh_defaults(&mut target);
+        target.ssh.port_forwards.clear();
+        let reuse_jumps = self.settings.reuse_jumps;
         let events = self.events.clone();
         let task = self.runtime.spawn(async move {
-            let result = establish(id, &target, password, known_hosts, &events).await;
+            let result = establish(id, &target, password, known_hosts, reuse_jumps, &events).await;
             let result = match result {
                 Ok(connection) => {
                     let _ = connection.disconnect().await;
@@ -487,29 +806,112 @@ impl Workbench {
             };
             let _ = events.send(Event::TestFinished(id, result)).await;
         });
-        self.tests.insert(id, (profile.id, task.abort_handle()));
-        self.announce(format!("Testing {}…", profile.name), cx);
+        self.announce(format!("正在测试 {}…", profile.name), cx);
+        self.tests.insert(
+            id,
+            ConnectionTest {
+                profile,
+                started: Instant::now(),
+                hops: Vec::new(),
+                form,
+                _task: task.abort_handle(),
+            },
+        );
+        true
+    }
+
+    fn test_progress(&self, profile: &str, hop: usize) -> Option<&HopProgress> {
+        let active = self.tests.values().find(|test| test.profile.id == profile);
+        let route = if let Some(test) = active {
+            &test.hops
+        } else {
+            &self.recent_tests.iter().find(|(id, _)| id == profile)?.1
+        };
+        route.iter().find(|progress| progress.index == hop)
     }
 
     fn send_draft(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tab(id) else { return };
-        if tab.phase != Phase::Connected || tab.terminal.read(cx).raw() {
+        if tab.phase != Phase::Connected || (tab.terminal.read(cx).raw() && !tab.show_sender) {
             return;
         }
         let command = tab.draft.read(cx).value();
         if command.trim().is_empty() {
             return;
         }
-        tab.terminal
-            .update(cx, |terminal, cx| terminal.send_draft(&command, true, cx));
-        tab.draft.update(cx, |draft, cx| draft.clean(window, cx));
+        let execute = !tab
+            .paste_mode
+            .unwrap_or_else(|| tab.terminal.read(cx).agent_name().is_some());
+        let receivers = self.draft_receivers(id);
+        if receivers.is_empty() {
+            self.announce("请选择至少一个已连接的发送目标", cx);
+            return;
+        }
+        if !execute
+            && command.chars().any(char::is_control)
+            && let Some(receiver) = receivers
+                .iter()
+                .filter_map(|id| self.tab(*id))
+                .find(|tab| !tab.terminal.read(cx).bracketed_paste_enabled())
+        {
+            self.announce(
+                format!(
+                    "{} 尚未启用括号粘贴，无法安全发送含换行或控制字符的内容",
+                    receiver.name()
+                ),
+                cx,
+            );
+            return;
+        }
+        for receiver in receivers {
+            if let Some(tab) = self.tab(receiver) {
+                tab.terminal.update(cx, |terminal, cx| {
+                    terminal.send_draft(&command, execute, cx)
+                });
+            }
+        }
+        let history_update = {
+            let tab = self.tab_mut(id).expect("sender tab is still open");
+            tab.history_index = None;
+            tab.history_draft.clear();
+            tab.draft.update(cx, |draft, cx| draft.clean(window, cx));
+            let mut history = tab.command_history.borrow_mut();
+            if command.len() <= SENDER_HISTORY_ENTRY_BYTES
+                && history.front().is_none_or(|last| last != command.as_ref())
+            {
+                history.push_front(command.to_string());
+                history.truncate(SENDER_HISTORY_LIMIT);
+                tab.ssh_profile()
+                    .map(|profile| (profile.id.clone(), history.clone()))
+            } else {
+                None
+            }
+        };
+        if let Some((id, history)) = history_update
+            && self
+                .settings
+                .profiles
+                .iter()
+                .any(|profile| profile.id == id)
+        {
+            let mut settings = self.settings.clone();
+            settings.sender_history.insert(id, history);
+            self.persist(settings, cx);
+        }
     }
 
     fn apply_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Trust(id, request) => {
                 if self.tab(id).is_some() || self.tests.contains_key(&id) {
-                    self.prompt_trust(request, window, cx);
+                    match request {
+                        ConnectionPrompt::HostKey(request) => {
+                            self.prompt_trust(request, window, cx)
+                        }
+                        ConnectionPrompt::ProxyCommand(request) => {
+                            self.prompt_proxy_command(request, window, cx)
+                        }
+                    }
                 }
             }
             Event::Connected(id, connection, commands) => {
@@ -519,22 +921,39 @@ impl Workbench {
                 };
                 tab.connection = Some(connection.clone());
                 tab.bind_shell(ShellInput::Ssh(commands));
+                for rule in connection.forwardings() {
+                    tab.terminal.update(cx, |terminal, cx| {
+                        terminal.system_message(format!("已启用端口转发 · {rule}"), cx);
+                    });
+                }
+                let monitor_active = tab.monitor_active.clone();
+                let paused = tab.monitor_state.paused.clone();
+                let window_active = self.window_active.clone();
+                let interval = self.monitor_interval.clone();
                 let events = self.events.clone();
                 let monitor = self.runtime.spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(5));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut next = Instant::now();
                     loop {
-                        interval.tick().await;
-                        let result = connection.metrics().await.ok();
-                        if events.send(Event::Sample(id, result)).await.is_err() {
-                            break;
+                        if Instant::now() >= next
+                            && monitor_active.load(Ordering::Relaxed)
+                            && window_active.load(Ordering::Relaxed)
+                            && !paused.load(Ordering::Relaxed)
+                        {
+                            let result = connection.metrics().await.ok();
+                            next = Instant::now()
+                                + Duration::from_secs(interval.load(Ordering::Relaxed));
+                            if events.send(Event::Sample(id, result)).await.is_err() {
+                                break;
+                            }
                         }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 });
                 if let Some(tab) = self.tab_mut(id) {
                     tab.monitor = Some(monitor.abort_handle());
                 }
                 self.list(id, ".".into(), cx);
+                cx.notify();
             }
             Event::LocalStarted(id, commands) => {
                 if let Some(tab) = self.tab_mut(id) {
@@ -544,19 +963,76 @@ impl Workbench {
             }
             Event::StartFailed(id, error) => self.finish_tab(id, Phase::Failed, &error, cx),
             Event::TestFinished(id, result) => {
-                if let Some((profile, _)) = self.tests.remove(&id) {
-                    let name = self
-                        .settings
-                        .profiles
+                if let Some(test) = self.tests.remove(&id) {
+                    let ok = result.is_ok();
+                    let name = &test.profile.name;
+                    let times = test
+                        .hops
                         .iter()
-                        .find(|saved| saved.id == profile)
-                        .map(|saved| saved.name.as_str())
-                        .unwrap_or(&profile);
+                        .map(|hop| hop.rtt_ms)
+                        .collect::<Option<Vec<_>>>();
                     let notice = match result {
-                        Ok(()) => format!("Connection test passed · {name}"),
-                        Err(error) => format!("Connection test failed · {name} · {error}"),
+                        Ok(())
+                            if times.as_ref().is_some_and(|times| {
+                                times.len() == test.profile.jumps.len() + 1
+                            }) =>
+                        {
+                            let rtt: u64 = times.into_iter().flatten().sum();
+                            format!("连接测试通过 · {name} · 全链路往返 {rtt} ms")
+                        }
+                        Ok(()) => format!(
+                            "连接测试通过 · {name} · 建立用时 {} ms",
+                            test.started.elapsed().as_millis()
+                        ),
+                        Err(error) => format!("连接测试失败 · {name} · {error}"),
                     };
+                    self.recent_tests.retain(|(id, _)| id != &test.profile.id);
+                    self.recent_tests.push_front((test.profile.id, test.hops));
+                    self.recent_tests.truncate(64);
+                    if let Some(form) = test.form {
+                        form.finish(notice.clone(), ok, window);
+                    }
                     self.announce(notice, cx);
+                }
+            }
+            Event::Route(id, progress) => {
+                if let Some(test) = self.tests.get_mut(&id) {
+                    record_hop(&mut test.hops, progress);
+                    if test.form.is_some() {
+                        window.refresh();
+                    }
+                    return;
+                }
+                if let Some(tab) = self.tab_mut(id) {
+                    let node = tab
+                        .ssh_profile()
+                        .map(|profile| {
+                            profile
+                                .jumps
+                                .get(progress.index)
+                                .map(|hop| hop.host.as_str())
+                                .unwrap_or(&profile.host)
+                        })
+                        .unwrap_or("SSH");
+                    let step = match progress.stage {
+                        HopStage::Connecting => "正在建立连接",
+                        HopStage::ProxyApproval => "等待确认代理命令",
+                        HopStage::Trust => "等待确认主机密钥",
+                        HopStage::Authenticating => "正在认证",
+                        HopStage::Connected => "连接已建立",
+                        HopStage::Failed => "连接失败",
+                    };
+                    let mut message = format!("第 {} 跳 · {node} · {step}", progress.index + 1);
+                    if let Some(rtt) = progress.rtt_ms {
+                        message.push_str(&format!(" · {rtt} ms"));
+                    }
+                    if let Some(error) = progress.error.as_deref() {
+                        message.push_str(&format!(" · {error}"));
+                    }
+                    tab.terminal
+                        .update(cx, |terminal, cx| terminal.system_message(message, cx));
+                    record_hop(&mut tab.route, progress);
+                    cx.notify();
                 }
             }
             Event::Shell(id, ShellEvent::Output(bytes)) => {
@@ -567,10 +1043,10 @@ impl Workbench {
             }
             Event::Shell(id, ShellEvent::Exited(code)) => {
                 let reason = match (self.tab(id).is_some_and(Tab::is_local), code) {
-                    (true, Some(code)) => format!("Shell exited · {code}"),
-                    (true, None) => "Shell closed".into(),
-                    (false, Some(code)) => format!("SSH exited · {code}"),
-                    (false, None) => "SSH channel closed".into(),
+                    (true, Some(code)) => format!("本地 Shell 已退出 · 退出码 {code}"),
+                    (true, None) => "本地 Shell 已关闭".into(),
+                    (false, Some(code)) => format!("SSH 会话已退出 · 退出码 {code}"),
+                    (false, None) => "SSH 通道已关闭".into(),
                 };
                 self.finish_tab(id, Phase::Disconnected, &reason, cx);
             }
@@ -578,8 +1054,13 @@ impl Workbench {
                 self.finish_tab(id, Phase::Failed, &error, cx)
             }
             Event::Sample(id, sample) => {
-                if let Some(tab) = self.tab_mut(id).filter(|tab| tab.phase == Phase::Connected) {
-                    tab.sample = sample.map(|sample| (sample, Instant::now()));
+                if let Some((tab, sample)) = self
+                    .tab_mut(id)
+                    .filter(|tab| tab.phase == Phase::Connected)
+                    .zip(sample)
+                {
+                    tab.monitor_state.push(&sample);
+                    tab.sample = Some((sample, Instant::now()));
                     cx.notify();
                 }
             }
@@ -589,6 +1070,7 @@ impl Workbench {
     }
 
     fn finish_tab(&mut self, id: u64, phase: Phase, reason: &str, cx: &mut Context<Self>) {
+        self.cancel_file_transfers(id, cx);
         let Some(tab) = self.tab_mut(id) else { return };
         if !matches!(tab.phase, Phase::Connecting | Phase::Connected) {
             return;
@@ -599,9 +1081,14 @@ impl Workbench {
             monitor.abort();
         }
         tab.sample = None;
+        tab.monitor_state.clear();
         tab.files = FilePane::default();
         let connection = tab.connection.take();
         let reason = reason.replace(['\r', '\n', '\x1b'], " ");
+        tab.terminal.update(cx, |terminal, cx| {
+            terminal.end_session(cx);
+            terminal.system_message(reason.clone(), cx);
+        });
         let notice = format!("{} · {reason}", tab.name());
         if let Some(connection) = connection {
             self.disconnect(connection);
@@ -610,20 +1097,77 @@ impl Workbench {
     }
 }
 
+fn record_hop(route: &mut Vec<HopProgress>, progress: HopProgress) {
+    if let Some(existing) = route.iter_mut().find(|hop| hop.index == progress.index) {
+        *existing = progress;
+    } else {
+        route.push(progress);
+    }
+}
+
+fn configure_terminal(
+    terminal: &mut TerminalView,
+    settings: &Settings,
+    linux_highlights: &Rc<LinuxHighlights>,
+    session: &Session,
+    cx: &mut Context<TerminalView>,
+) {
+    let family = Theme::global(cx).mono_font_family.clone();
+    terminal.set_font_family(Some(family.as_str()), cx);
+    terminal.set_gutters(settings.show_line_numbers, settings.show_timestamps, cx);
+    terminal.set_font_metrics(
+        settings.terminal_font_size,
+        settings.terminal_line_height,
+        cx,
+    );
+    terminal.set_timeline_options(
+        settings.timestamp_format.into(),
+        Duration::from_secs(settings.idle_threshold.max(1)),
+        settings.dim_repeated_timestamps,
+        cx,
+    );
+    let highlights = (settings.linux_highlighting
+        && matches!(session, Session::Ssh(_) | Session::Local(LocalShell::Wsl)))
+    .then(|| linux_highlights.clone());
+    terminal.set_linux_highlights(highlights, cx);
+}
+
 async fn establish(
     id: u64,
     profile: &ConnectionProfile,
     password: Option<String>,
     known_hosts: std::path::PathBuf,
+    reuse_jumps: bool,
     events: &async_channel::Sender<Event>,
 ) -> anyhow::Result<Connection> {
     let (sender, mut requests) = mpsc::unbounded_channel();
-    let connect = Connection::connect(profile, password, known_hosts, sender);
+    let (route_tx, mut route_rx) = mpsc::unbounded_channel();
+    let connect = Connection::connect_with_progress(
+        profile,
+        password,
+        known_hosts,
+        sender,
+        reuse_jumps,
+        move |progress| {
+            let _ = route_tx.send(progress);
+        },
+    );
     tokio::pin!(connect);
     loop {
         tokio::select! {
-            result = &mut connect => return result,
-            Some(request) = requests.recv() => events.send(Event::Trust(id, request)).await?,
+            result = &mut connect => {
+                while let Ok(progress) = route_rx.try_recv() {
+                    events.send(Event::Route(id, progress)).await?;
+                }
+                return result;
+            },
+            Some(request) = requests.recv() => {
+                while let Ok(progress) = route_rx.try_recv() {
+                    events.send(Event::Route(id, progress)).await?;
+                }
+                events.send(Event::Trust(id, request)).await?;
+            },
+            Some(progress) = route_rx.recv() => events.send(Event::Route(id, progress)).await?,
         }
     }
 }
@@ -681,7 +1225,31 @@ async fn relay_shell_output(
     mut output: mpsc::Receiver<ShellEvent>,
     events: &async_channel::Sender<Event>,
 ) {
-    while let Some(event) = output.recv().await {
+    let mut pending = None;
+    loop {
+        let event = match pending.take() {
+            Some(event) => event,
+            None => match output.recv().await {
+                Some(event) => event,
+                None => break,
+            },
+        };
+        let event = match event {
+            ShellEvent::Output(mut bytes) => {
+                while bytes.len() < 256 * 1024 {
+                    match output.try_recv() {
+                        Ok(ShellEvent::Output(more)) => bytes.extend_from_slice(&more),
+                        Ok(next) => {
+                            pending = Some(next);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                ShellEvent::Output(bytes)
+            }
+            other => other,
+        };
         let finished = matches!(event, ShellEvent::Exited(_) | ShellEvent::Error(_));
         if events.send(Event::Shell(id, event)).await.is_err() || finished {
             return;

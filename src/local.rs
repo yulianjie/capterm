@@ -24,6 +24,8 @@ impl LocalShell {
 
 #[cfg(windows)]
 pub use windows_pty::open;
+#[cfg(windows)]
+mod windows_console;
 
 #[cfg(not(windows))]
 pub async fn open(
@@ -92,6 +94,7 @@ mod windows_pty {
         ready: &mut Option<oneshot::Sender<Result<()>>>,
     ) -> Result<Option<u32>> {
         let command = command(shell)?;
+        windows_console::prepare()?;
         let PtyPair { master, slave } = native_pty_system()
             .openpty(initial_size)
             .context("Opening Windows pseudoconsole")?;
@@ -124,17 +127,23 @@ mod windows_pty {
         let ready = ready.take().expect("shell startup is reported once");
         let result = if ready.send(Ok(())).is_ok() {
             (|| loop {
-                if let Some(code) = exit_code(child.as_mut())? {
+                if let Some(code) = exit_code(child.as_mut(), 0)? {
                     break Ok(Some(code));
                 }
                 if events.is_closed() {
                     break Ok(None);
                 }
-                ensure!(!reading.is_finished(), "Local terminal output closed");
-                ensure!(!writing.is_finished(), "Local terminal input closed");
+                if reading.is_finished() {
+                    break closed_pipe(child.as_mut(), "output");
+                }
+                if writing.is_finished() {
+                    break closed_pipe(child.as_mut(), "input");
+                }
                 match commands.recv_timeout(Duration::from_millis(50)) {
                     Ok(ShellCommand::Input(bytes)) => {
-                        input.send(bytes).context("Local terminal input closed")?;
+                        if input.send(bytes).is_err() {
+                            break closed_pipe(child.as_mut(), "input");
+                        }
                     }
                     Ok(ShellCommand::Resize { columns, rows }) => {
                         master
@@ -200,18 +209,25 @@ mod windows_pty {
         }
     }
 
-    fn exit_code(child: &mut dyn Child) -> Result<Option<u32>> {
+    fn exit_code(child: &mut dyn Child, wait_ms: u32) -> Result<Option<u32>> {
         let process = child
             .as_raw_handle()
             .context("Local shell has no process handle")?;
-        // The child keeps its handle alive throughout this nonblocking wait.
-        match unsafe { WaitForSingleObject(HANDLE(process.cast()), 0) } {
+        // The child keeps its handle alive throughout the wait.
+        match unsafe { WaitForSingleObject(HANDLE(process.cast()), wait_ms) } {
             WAIT_OBJECT_0 => Ok(Some(
                 child.wait().context("Waiting for local shell")?.exit_code(),
             )),
             WAIT_TIMEOUT => Ok(None),
             _ => Err(io::Error::last_os_error()).context("Checking local shell process"),
         }
+    }
+
+    fn closed_pipe(child: &mut dyn Child, pipe: &str) -> Result<Option<u32>> {
+        // ConPTY can close its pipes before Windows signals an ordinary shell exit.
+        let code =
+            exit_code(child, 500)?.with_context(|| format!("Local terminal {pipe} closed"))?;
+        Ok(Some(code))
     }
 
     fn drain_output(

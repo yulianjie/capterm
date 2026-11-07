@@ -9,9 +9,10 @@ mod workbench;
 
 fn main() {
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
             gpui_kit::init(cx);
+            terminal::init(cx);
             workbench::open(cx);
         });
 }
