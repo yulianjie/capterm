@@ -63,7 +63,11 @@ EOF
         codesign --force --sign - "$app"
         ln -s /Applications "$work/image/Applications"
         dmg="$dist/CapTerm-$version-macos-$arch.dmg"
-        hdiutil create -volname CapTerm -srcfolder "$work/image" -format UDZO -ov "$dmg"
+        # Leave room for filesystem metadata beyond hdiutil's source-folder estimate.
+        image_kib=$(du -sk "$work/image" | cut -f1)
+        image_mib=$(( (image_kib + 1023) / 1024 + 64 ))
+        hdiutil create -size "${image_mib}m" -volname CapTerm \
+            -srcfolder "$work/image" -format UDZO -ov "$dmg"
         hdiutil verify "$dmg"
         mkdir "$mount"
         hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
