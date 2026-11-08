@@ -4,7 +4,7 @@
 
 CapTerm 是用 Rust 和 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构建的原生 SSH 工作台。你可以在一个窗口里操作终端、浏览 SFTP 文件、编辑远程文本并查看主机状态。Windows 上也可以在同一标签栏中打开 PowerShell、命令提示符和 WSL。
 
-[下载 Windows x64 版](https://github.com/yulianjie/capterm/releases/latest) · [快速开始](#快速开始) · [构建与发布](#构建与发布)
+[下载安装包](https://github.com/yulianjie/capterm/releases/latest) · [快速开始](#快速开始) · [构建与发布](#构建与发布)
 
 ![CapTerm 深色工作台，左侧显示 SFTP 文件，中间是 SSH 终端，右侧显示会话与主机监控](docs/screenshots/ssh-workbench.jpg)
 
@@ -23,13 +23,17 @@ CapTerm 是用 Rust 和 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构�
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/yulianjie/capterm/releases/latest) 获取 Windows x64 版。
+从 [GitHub Releases](https://github.com/yulianjie/capterm/releases/latest) 选择对应系统和架构的安装包。
 
-| 文件 | 用法 |
+| 系统 | 文件与安装方式 |
 | --- | --- |
-| `*-setup.exe` | 为当前用户安装，并创建开始菜单快捷方式。 |
-| `*-portable.zip` | 解压后直接运行 `capterm.exe`。 |
-| `SHA256SUMS.txt` | 可用 `Get-FileHash -Algorithm SHA256` 计算下载文件的哈希值并核对。 |
+| Windows x64 | 运行 `*-setup.exe`，或解压 `*-portable.zip` 后运行 `capterm.exe`。 |
+| macOS 15 及以上 | Apple Silicon 选择 `*-macos-arm64.dmg`，Intel 选择 `*-macos-x86_64.dmg`。打开磁盘映像，把 CapTerm 拖到「应用程序」。 |
+| Ubuntu 24.04 | x86-64 选择 `*-linux-amd64.deb`，ARM64 选择 `*-linux-arm64.deb`。使用 `sudo apt install ./<文件名>.deb` 安装，需要支持 Vulkan 的图形环境。 |
+
+Windows 包的校验值在 `SHA256SUMS.txt`，macOS 和 Linux 包的校验值在 `SHA256SUMS-unix.txt`。可分别用 `Get-FileHash -Algorithm SHA256`、`shasum -a 256` 或 `sha256sum` 核对。
+
+macOS 包使用临时签名，未经过 Apple 公证。首次打开时，系统可能要求在「系统设置 → 隐私与安全性」中选择「仍要打开」。PowerShell、CMD、WSL 和将 SFTP 文件拖出窗口的功能仅在 Windows 提供。
 
 ## 快速开始
 
@@ -42,6 +46,7 @@ CapTerm 是用 Rust 和 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构�
 ## 构建与发布
 
 在 Windows x64 上构建需要 Rust 1.95 或更高版本的 MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK。
+macOS 构建需要 Rust 1.98 或更高版本和 Xcode 工具链。
 
 ```powershell
 cargo run --locked
@@ -55,7 +60,7 @@ cargo build --release --locked
 ./scripts/package-windows.ps1 -Version 0.1.0 -Executable target/release/capterm.exe
 ```
 
-[Windows build and release](https://github.com/yulianjie/capterm/actions/workflows/windows.yml) 在推送到 `main`、面向 `main` 的 PR 和手动运行时检查格式、运行测试，并验证便携包及安装和卸载流程。发布时更新 `Cargo.toml` 和 `Cargo.lock` 中的版本号，把提交推送到 `main`，再推送对应的 `vX.Y.Z` 标签。工作流核对标签与项目版本后，将安装版、便携版和校验文件发布到 GitHub Releases。
+[Windows build](https://github.com/yulianjie/capterm/actions/workflows/windows.yml) 在推送到 `main`、面向 `main` 的 PR 和手动运行时验证 Windows 构建。发布时更新 `Cargo.toml` 和 `Cargo.lock` 中的版本号，把提交推送到 `main`，再推送对应的 `vX.Y.Z` 标签。[Desktop release](https://github.com/yulianjie/capterm/actions/workflows/release.yml) 核对标签与项目版本，待 Windows、macOS 和 Linux 构建及验证通过后，将安装包和校验文件发布到 GitHub Releases。也可以从 `main` 手动运行该工作流，按已发布的标签补充 macOS 和 Linux 包。
 
 ```powershell
 git tag -a v0.1.0 -m "CapTerm v0.1.0"

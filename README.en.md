@@ -4,7 +4,7 @@
 
 CapTerm is a native SSH workbench built with Rust and [GPUI Kit](https://github.com/longbridge/gpui-kit). Use the terminal, browse SFTP files, edit remote text, and monitor the host in one window. On Windows, PowerShell, Command Prompt, and WSL can run in neighboring tabs.
 
-[Download for Windows x64](https://github.com/yulianjie/capterm/releases/latest) · [Quick start](#quick-start) · [Build and release](#build-and-release)
+[Download CapTerm](https://github.com/yulianjie/capterm/releases/latest) · [Quick start](#quick-start) · [Build and release](#build-and-release)
 
 ![CapTerm in dark mode with SFTP files on the left, an SSH terminal in the center, and sessions and host monitoring on the right](docs/screenshots/ssh-workbench.jpg)
 
@@ -23,13 +23,17 @@ The screenshots show CapTerm's Chinese interface running against an isolated loc
 
 ## Download
 
-Get the Windows x64 build from [GitHub Releases](https://github.com/yulianjie/capterm/releases/latest).
+Choose the package for your operating system and architecture on [GitHub Releases](https://github.com/yulianjie/capterm/releases/latest).
 
-| File | How to use it |
+| System | File and installation |
 | --- | --- |
-| `*-setup.exe` | Install for the current user and create a Start menu shortcut. |
-| `*-portable.zip` | Extract the archive and run `capterm.exe`. |
-| `SHA256SUMS.txt` | Run `Get-FileHash -Algorithm SHA256` on a downloaded file and compare the result. |
+| Windows x64 | Run `*-setup.exe`, or extract `*-portable.zip` and run `capterm.exe`. |
+| macOS 15 or later | Choose `*-macos-arm64.dmg` for Apple Silicon or `*-macos-x86_64.dmg` for Intel. Open the disk image and drag CapTerm into Applications. |
+| Ubuntu 24.04 | Choose `*-linux-amd64.deb` for x86-64 or `*-linux-arm64.deb` for ARM64. Install with `sudo apt install ./<filename>.deb`. CapTerm needs a desktop session with Vulkan support. |
+
+Windows checksums are in `SHA256SUMS.txt`. macOS and Linux checksums are in `SHA256SUMS-unix.txt`. Use `Get-FileHash -Algorithm SHA256`, `shasum -a 256`, or `sha256sum` to verify downloads.
+
+The macOS app uses an ad hoc signature and has no Apple notarization. On first launch, macOS may require Open Anyway under System Settings → Privacy & Security. Local PowerShell, Command Prompt, WSL, and dragging SFTP downloads out of the window are Windows features.
 
 ## Quick start
 
@@ -42,6 +46,7 @@ Password authentication is available for the target host. Jump hosts use a priva
 ## Build and release
 
 Building on Windows x64 requires Rust 1.95 or later with the MSVC toolchain, Visual Studio C++ Build Tools, and the Windows SDK.
+Building on macOS requires Rust 1.98 or later and the Xcode toolchain.
 
 ```powershell
 cargo run --locked
@@ -55,7 +60,7 @@ cargo build --release --locked
 ./scripts/package-windows.ps1 -Version 0.1.0 -Executable target/release/capterm.exe
 ```
 
-The [Windows build and release workflow](https://github.com/yulianjie/capterm/actions/workflows/windows.yml) checks formatting, runs tests, and verifies the portable package and the install and uninstall flows. It runs on pushes to `main`, pull requests targeting `main`, and manual dispatch. To release, update the version in `Cargo.toml` and `Cargo.lock`, push the commit to `main`, and push the matching `vX.Y.Z` tag. The workflow checks that the tag matches the project version and publishes the installer, portable archive, and checksums to GitHub Releases.
+The [Windows build workflow](https://github.com/yulianjie/capterm/actions/workflows/windows.yml) verifies the Windows build on pushes to `main`, pull requests targeting `main`, and manual dispatch. To release, update the version in `Cargo.toml` and `Cargo.lock`, push the commit to `main`, and push the matching `vX.Y.Z` tag. The [Desktop release workflow](https://github.com/yulianjie/capterm/actions/workflows/release.yml) checks the version and publishes packages and checksums after the Windows, macOS, and Linux builds pass. You can also dispatch it from `main` to add macOS and Linux packages to an existing release using its tag.
 
 ```powershell
 git tag -a v0.1.0 -m "CapTerm v0.1.0"

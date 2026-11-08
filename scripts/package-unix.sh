@@ -72,7 +72,7 @@ EOF
         ;;
     linux)
         test "$(dpkg --print-architecture)" = "$arch"
-        stage="$work/package"
+        stage="$work/debian/capterm"
         install -Dm755 "$binary" "$stage/usr/bin/capterm"
         install -Dm644 design/icon/capterm.svg "$stage/usr/share/icons/hicolor/scalable/apps/capterm.svg"
         copy_licenses "$stage/usr/share/doc/capterm"
@@ -97,15 +97,15 @@ Source: capterm
 Package: capterm
 Architecture: any
 EOF
-        depends=$(cd "$work" && dpkg-shlibdeps -O -e"$binary")
+        depends=$(cd "$work" && dpkg-shlibdeps -O -edebian/capterm/usr/bin/capterm)
         cat > "$stage/DEBIAN/control" <<EOF
 Package: capterm
 Version: $version
 Architecture: $arch
 Section: utils
 Priority: optional
-Maintainer: CapTerm maintainers <https://github.com/yulianjie/capterm>
-Depends: ${depends#shlibs:Depends=}, libvulkan1, libwayland-client0
+Maintainer: CapTerm maintainers <34149758+yulianjie@users.noreply.github.com>
+Depends: ${depends#shlibs:Depends=}, libvulkan1, libwayland-client0, xdg-utils
 Recommends: mesa-vulkan-drivers
 Homepage: https://github.com/yulianjie/capterm
 Description: Native SSH workbench with SFTP and host monitoring
