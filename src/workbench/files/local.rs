@@ -7,6 +7,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, ensure};
 
+use crate::local::{LocalShell, windows_home};
 use crate::ssh::RemoteEntry;
 
 #[cfg(windows)]
@@ -34,10 +35,7 @@ pub(super) async fn list(directory: &str) -> Result<(String, Vec<RemoteEntry>)> 
 
 fn read_directory(directory: &str) -> Result<(String, Vec<RemoteEntry>)> {
     let directory = if directory == "." {
-        match dirs::home_dir().filter(|path| path.is_absolute() && path.is_dir()) {
-            Some(home) => home,
-            None => std::env::current_dir().context("无法获取本地工作目录")?,
-        }
+        windows_home()?
     } else {
         PathBuf::from(directory)
     };
@@ -106,9 +104,14 @@ fn is_hidden(_: &fs::Metadata) -> bool {
     false
 }
 
-pub(super) fn prompt_directory(line: &str) -> Option<String> {
-    let path = line.trim_end_matches(' ').strip_prefix("PS ")?;
-    drive_directory(path.strip_suffix('>')?.trim_end_matches('>'))
+pub(super) fn prompt_directory(shell: LocalShell, line: &str) -> Option<String> {
+    let path = line.trim_end_matches(' ').strip_suffix('>')?;
+    let path = match shell {
+        LocalShell::PowerShell => path.strip_prefix("PS ")?.trim_end_matches('>'),
+        LocalShell::CommandPrompt => path,
+        LocalShell::Wsl => return None,
+    };
+    drive_directory(path)
 }
 
 pub(super) fn osc_directory(directory: &str) -> Option<String> {
@@ -157,7 +160,7 @@ mod tests {
     #[test]
     fn follows_only_drive_rooted_powershell_prompts() {
         assert_eq!(
-            prompt_directory(r"PS C:\Users\O'Connor>> ").as_deref(),
+            prompt_directory(LocalShell::PowerShell, r"PS C:\Users\O'Connor>> ").as_deref(),
             Some(r"C:\Users\O'Connor")
         );
         for line in [
@@ -166,7 +169,30 @@ mod tests {
             r"PS \\server\share> ",
             "PS C:\\unsafe\tpath> ",
         ] {
-            assert_eq!(prompt_directory(line), None, "{line:?}");
+            assert_eq!(
+                prompt_directory(LocalShell::PowerShell, line),
+                None,
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn follows_drive_rooted_command_prompt_directories() {
+        assert_eq!(
+            prompt_directory(LocalShell::CommandPrompt, r"D:\Project files\资料>").as_deref(),
+            Some(r"D:\Project files\资料")
+        );
+        assert_eq!(
+            prompt_directory(LocalShell::CommandPrompt, r"C:\>").as_deref(),
+            Some(r"C:\")
+        );
+        for line in ["PS C:\\Users> ", r"C:relative>", "C:\\unsafe\tpath>"] {
+            assert_eq!(
+                prompt_directory(LocalShell::CommandPrompt, line),
+                None,
+                "{line:?}"
+            );
         }
     }
 

@@ -14,6 +14,7 @@ CapTerm is a native SSH workbench built with Rust and [GPUI Kit](https://github.
 - **OpenSSH configuration.** Preview the import, then link the configuration file for future sync or copy its hosts as local sessions. The preview flags skipped entries and unsupported options. Export local sessions as OpenSSH configuration snippets.
 - **Terminal and send bar.** Scrollback includes logical line numbers, timestamps, and command blocks. Search by text or regular expression, with optional case sensitivity. The send bar runs commands line by line or pastes the whole draft, with per-session history and reusable snippets. Full-screen programs such as vim and htop use the alternate-screen layout. The send bar defaults to whole-draft paste when it detects an agent CLI such as Codex or Claude Code.
 - **SFTP and remote editing.** Let the file pane follow the terminal's current directory, drag files in to upload, or drag remote files out to Windows File Explorer. The transfer queue shows progress and conflicts. Click a remote text file to preview or edit it in a tab. CapTerm checks the remote version on save, and you can compare changes or reload when a conflict occurs. Overwriting a file from the editor requires the server's OpenSSH `posix-rename@openssh.com` extension.
+- **Local files.** Browse Windows files from PowerShell and Command Prompt tabs, and Linux files from the WSL distribution, in the left file pane. The pane can follow the terminal directory, and Linux text files in WSL open in a read-only preview.
 - **Host monitoring and layout.** View CPU, memory, disk, network, load, and process data through the current SSH connection without installing a collector on the server. Available metrics vary by remote operating system. The workbench has dark and light themes, collapsible sidebars, and a focus mode.
 
 ![CapTerm's light-theme remote editor with SFTP files on the left and process monitoring on the right](docs/screenshots/remote-editor.jpg)
@@ -34,7 +35,7 @@ Get the Windows x64 build from [GitHub Releases](https://github.com/yulianjie/ca
 
 1. Press `Ctrl+Shift+P` to open the command palette and enter `user@host[:port]`. You can also double-click a saved session on the right or import OpenSSH configuration from the session pane.
 2. On first connection, verify the host key fingerprint and choose whether to trust it for this connection or save it in CapTerm's own `known_hosts` file. To replace a saved key, enter the corresponding hostname.
-3. Run commands in the terminal or open a remote text file from the SFTP pane on the left. Press `Ctrl+Shift+F` to search terminal output and `Ctrl+Shift+Enter` to toggle focus mode.
+3. Run commands in the terminal or open a remote text file from the SFTP pane on the left. After SSH disconnects, press `Enter` in the terminal or click the reconnect prompt to reconnect in the current tab. Press `Ctrl+Shift+F` to search terminal output and `Ctrl+Shift+Enter` to toggle focus mode.
 
 Password authentication is available for the target host. Jump hosts use a private key or SSH agent. Load encrypted private keys into your local SSH agent.
 

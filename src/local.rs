@@ -1,6 +1,6 @@
-use std::sync::mpsc::Sender;
+use std::{path::PathBuf, sync::mpsc::Sender};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::mpsc::Receiver;
 
 use crate::ssh::{ShellCommand, ShellEvent};
@@ -22,16 +22,94 @@ impl LocalShell {
     }
 }
 
+pub struct WslPaths {
+    distribution: String,
+    home: String,
+    drives: Vec<(String, char)>,
+}
+
+impl WslPaths {
+    pub fn home(&self) -> &str {
+        &self.home
+    }
+
+    pub fn windows_directory(&self, directory: &str) -> Option<String> {
+        let path = directory.strip_prefix('/')?.trim_matches('/');
+        if path.contains(['\\', ':'])
+            || path.chars().any(char::is_control)
+            || path.split('/').any(|part| matches!(part, "." | ".."))
+        {
+            return None;
+        }
+        for (mount, drive) in &self.drives {
+            if let Some(rest) = path.strip_prefix(mount)
+                && let Some(relative) = rest
+                    .strip_prefix('/')
+                    .or_else(|| rest.is_empty().then_some(rest))
+            {
+                return Some(format!("{drive}:\\{}", relative.replace('/', "\\")));
+            }
+        }
+        let root = format!(r"\\wsl$\{}", self.distribution);
+        if path.is_empty() {
+            Some(root)
+        } else {
+            Some(format!("{root}\\{}", path.replace('/', "\\")))
+        }
+    }
+}
+
 #[cfg(windows)]
-pub use windows_pty::open;
+fn wsl_drive_mount(line: &str) -> Option<(String, char)> {
+    let mut fields = line.split_whitespace();
+    let [letter, b':', suffix @ ..] = fields.next()?.as_bytes() else {
+        return None;
+    };
+    let mount = fields.next()?.strip_prefix('/')?;
+    let filesystem = fields.next()?;
+    let options = fields.next()?;
+    if !letter.is_ascii_alphabetic()
+        || !(suffix.is_empty() || suffix == br"\134")
+        || mount.is_empty()
+    {
+        return None;
+    }
+    let drvfs = filesystem == "drvfs"
+        || (filesystem == "9p"
+            && options
+                .split(',')
+                .any(|option| option.starts_with("aname=drvfs;")));
+    drvfs.then(|| {
+        (
+            mount.replace(r"\040", " "),
+            char::from(letter.to_ascii_uppercase()),
+        )
+    })
+}
+
+pub fn windows_home() -> Result<PathBuf> {
+    match dirs::home_dir().filter(|path| path.is_absolute() && path.is_dir()) {
+        Some(home) => Ok(home),
+        None => std::env::current_dir().context("无法获取本地工作目录"),
+    }
+}
+
+#[cfg(windows)]
+pub use windows_pty::{open, wsl_paths};
 #[cfg(windows)]
 mod windows_console;
+
+#[cfg(not(windows))]
+pub async fn wsl_paths() -> Result<WslPaths> {
+    anyhow::bail!("WSL 需要 Windows")
+}
 
 #[cfg(not(windows))]
 pub async fn open(
     shell: LocalShell,
     _columns: u16,
     _rows: u16,
+    _wsl: Option<&WslPaths>,
 ) -> Result<(Sender<ShellCommand>, Receiver<ShellEvent>)> {
     anyhow::bail!("Local {} sessions require Windows", shell.label());
 }
@@ -42,18 +120,21 @@ mod windows_pty {
         ffi::OsString,
         io::{self, Read, Write},
         os::windows::ffi::OsStringExt,
-        path::PathBuf,
+        process::Stdio,
         sync::mpsc::{self, RecvTimeoutError},
         thread,
         time::Duration,
     };
 
-    use anyhow::{Context, ensure};
+    use anyhow::ensure;
     use portable_pty::{Child, CommandBuilder, PtyPair, PtySize, native_pty_system};
     use tokio::sync::{mpsc as async_mpsc, oneshot};
     use windows::Win32::{
         Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::{SystemInformation::GetSystemDirectoryW, Threading::WaitForSingleObject},
+        System::{
+            SystemInformation::GetSystemDirectoryW,
+            Threading::{CREATE_NO_WINDOW, WaitForSingleObject},
+        },
     };
 
     use super::*;
@@ -62,15 +143,24 @@ mod windows_pty {
         shell: LocalShell,
         columns: u16,
         rows: u16,
+        wsl: Option<&WslPaths>,
     ) -> Result<(Sender<ShellCommand>, Receiver<ShellEvent>)> {
         let (commands, incoming) = mpsc::channel();
         let (events, output) = async_mpsc::channel(32);
         let (ready, launched) = oneshot::channel();
+        let distribution = wsl.map(|paths| paths.distribution.clone());
         thread::Builder::new()
             .name("capterm-local-shell".into())
             .spawn(move || {
                 let mut ready = Some(ready);
-                let result = serve(shell, size(columns, rows), incoming, &events, &mut ready);
+                let result = serve(
+                    shell,
+                    distribution.as_deref(),
+                    size(columns, rows),
+                    incoming,
+                    &events,
+                    &mut ready,
+                );
                 if let Some(ready) = ready {
                     let _ = ready.send(result.map(|_| ()));
                 } else {
@@ -88,12 +178,13 @@ mod windows_pty {
 
     fn serve(
         shell: LocalShell,
+        distribution: Option<&str>,
         initial_size: PtySize,
         commands: mpsc::Receiver<ShellCommand>,
         events: &async_mpsc::Sender<ShellEvent>,
         ready: &mut Option<oneshot::Sender<Result<()>>>,
     ) -> Result<Option<u32>> {
-        let command = command(shell)?;
+        let command = command(shell, distribution)?;
         windows_console::prepare()?;
         let PtyPair { master, slave } = native_pty_system()
             .openpty(initial_size)
@@ -175,7 +266,58 @@ mod windows_pty {
         Ok(code)
     }
 
-    fn command(shell: LocalShell) -> Result<CommandBuilder> {
+    pub async fn wsl_paths() -> Result<WslPaths> {
+        let mut command = tokio::process::Command::new(system_directory()?.join("wsl.exe"));
+        command
+            .args([
+                "--cd",
+                "~",
+                "--exec",
+                "sh",
+                "-c",
+                r#"printf '%s\0%s\0' "$WSL_DISTRO_NAME" "$PWD"; cat /proc/mounts || true"#,
+            ])
+            .stdin(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+            .await
+            .context("读取 WSL 登录目录超时")?
+            .context("无法查询 WSL 登录目录")?;
+        ensure!(output.status.success(), "无法查询 WSL 登录目录");
+        let mut fields = output.stdout.splitn(3, |&byte| byte == 0);
+        let (Some(distribution), Some(home), Some(mounts)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            anyhow::bail!("无法识别 WSL 登录目录");
+        };
+        let distribution = std::str::from_utf8(distribution)?;
+        let home = std::str::from_utf8(home)?;
+        ensure!(
+            !distribution.is_empty()
+                && !matches!(distribution, "." | "..")
+                && !distribution.contains(['\\', '/', ':'])
+                && !distribution.chars().any(char::is_control),
+            "无法识别 WSL 发行版"
+        );
+        let mut drives = String::from_utf8_lossy(mounts)
+            .lines()
+            .filter_map(wsl_drive_mount)
+            .collect::<Vec<_>>();
+        drives.sort_by_key(|(mount, _)| std::cmp::Reverse(mount.len()));
+        let paths = WslPaths {
+            distribution: distribution.into(),
+            home: home.into(),
+            drives,
+        };
+        ensure!(
+            paths.windows_directory(home).is_some(),
+            "无法识别 WSL 登录目录"
+        );
+        Ok(paths)
+    }
+
+    fn system_directory() -> Result<PathBuf> {
         let mut system = [0; 260];
         // The buffer stays valid for the call and contains UTF-16 on success.
         let length = unsafe { GetSystemDirectoryW(Some(&mut system)) } as usize;
@@ -186,16 +328,28 @@ mod windows_pty {
             length < system.len(),
             "Windows system directory is too long"
         );
-        let system = PathBuf::from(OsString::from_wide(&system[..length]));
-        let mut command = CommandBuilder::new(system.join(match shell {
+        Ok(PathBuf::from(OsString::from_wide(&system[..length])))
+    }
+
+    fn command(shell: LocalShell, distribution: Option<&str>) -> Result<CommandBuilder> {
+        let mut command = CommandBuilder::new(system_directory()?.join(match shell {
             LocalShell::PowerShell => r"WindowsPowerShell\v1.0\powershell.exe",
             LocalShell::CommandPrompt => "cmd.exe",
             LocalShell::Wsl => "wsl.exe",
         }));
         match shell {
             LocalShell::PowerShell => command.arg("-NoLogo"),
-            LocalShell::CommandPrompt => {}
-            LocalShell::Wsl => command.args(["--cd", "~"]),
+            LocalShell::CommandPrompt => {
+                if let Ok(directory) = windows_home() {
+                    command.cwd(directory);
+                }
+            }
+            LocalShell::Wsl => {
+                if let Some(distribution) = distribution {
+                    command.args(["--distribution", distribution]);
+                }
+                command.args(["--cd", "~"]);
+            }
         }
         Ok(command)
     }
@@ -269,7 +423,20 @@ mod tests {
     ) -> Result<()> {
         let mut received = Vec::new();
         timeout(Duration::from_secs(30), async {
-            let (commands, mut output) = open(shell, 80, 25).await?;
+            let wsl = if shell == LocalShell::Wsl {
+                let paths = wsl_paths().await?;
+                let home = paths
+                    .windows_directory(paths.home())
+                    .context("WSL home path")?;
+                ensure!(
+                    PathBuf::from(home).is_dir(),
+                    "Could not browse the WSL home directory"
+                );
+                Some(paths)
+            } else {
+                None
+            };
+            let (commands, mut output) = open(shell, 80, 25, wsl.as_ref()).await?;
             let cursor_query = b"\x1b[6n";
             let mut sent_input = false;
             while let Some(event) = output.recv().await {
@@ -350,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_command_sender_closes_session_during_pending_input() -> Result<()> {
         timeout(Duration::from_secs(10), async {
-            let (commands, mut output) = open(LocalShell::CommandPrompt, 80, 25).await?;
+            let (commands, mut output) = open(LocalShell::CommandPrompt, 80, 25, None).await?;
             commands.send(ShellCommand::Input(vec![b'x'; 2 * 1024 * 1024]))?;
             drop(commands);
             while let Some(event) = output.recv().await {
@@ -378,5 +545,46 @@ mod tests {
             8,
         )
         .await
+    }
+
+    #[test]
+    fn maps_absolute_wsl_directories_to_the_selected_distribution() {
+        let paths = WslPaths {
+            distribution: "Ubuntu Custom".into(),
+            home: "/home/fixture".into(),
+            drives: [
+                r"D:\134 /win/My\040Drive 9p rw,aname=drvfs;path=D:\134 0 0",
+                r"C:\134 /mnt/c drvfs rw 0 0",
+            ]
+            .into_iter()
+            .map(|line| wsl_drive_mount(line).unwrap())
+            .collect(),
+        };
+        assert_eq!(
+            paths.windows_directory("/").as_deref(),
+            Some(r"\\wsl$\Ubuntu Custom")
+        );
+        assert_eq!(
+            paths.windows_directory("/home/fixture/资料").as_deref(),
+            Some(r"\\wsl$\Ubuntu Custom\home\fixture\资料"),
+        );
+        assert_eq!(paths.windows_directory("/mnt/c/").as_deref(), Some(r"C:\"));
+        assert_eq!(
+            paths.windows_directory("/win/My Drive/Users").as_deref(),
+            Some(r"D:\Users")
+        );
+        assert_eq!(
+            paths.windows_directory("/mnt/custom").as_deref(),
+            Some(r"\\wsl$\Ubuntu Custom\mnt\custom")
+        );
+        assert!(wsl_drive_mount(r"C:\134 /other 9p rw 0 0").is_none());
+        for path in [
+            "relative",
+            "/with\\backslash",
+            "/mnt/c/file:stream",
+            "/with\nnewline",
+        ] {
+            assert!(paths.windows_directory(path).is_none(), "{path:?}");
+        }
     }
 }

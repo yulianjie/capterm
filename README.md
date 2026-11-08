@@ -14,6 +14,7 @@ CapTerm 是用 Rust 和 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构�
 - **OpenSSH 配置**。逐项预览导入结果，将配置文件链接为可同步的会话，或复制为本地会话。预览会列出跳过的配置和不适用的选项。本地会话可导出为 OpenSSH 配置片段。
 - **终端与发送栏**。滚动历史带逻辑行号、时间戳和命令块，支持文本和正则表达式搜索，可选择区分大小写。发送栏支持逐行执行、整段粘贴、会话历史和可复用的命令片段。运行 vim、htop 等全屏程序时，终端切换到备用屏幕布局。识别到 Codex、Claude Code 等 Agent CLI 时，发送栏默认使用整段粘贴。
 - **SFTP 与远程编辑**。让文件面板跟随终端当前目录，拖入文件上传，或把远程文件拖到 Windows 资源管理器。传输队列显示进度与冲突。单击远程文本可在标签中预览和编辑，保存时检查远端版本。遇到冲突时可查看差异或重新加载。覆盖保存需要服务端支持 OpenSSH 的 `posix-rename@openssh.com` 扩展。
+- **本地文件**。在左侧面板浏览 PowerShell 和 CMD 的 Windows 文件，以及 WSL 发行版中的 Linux 文件。文件面板可以跟随终端目录，WSL 中的 Linux 文本以只读方式预览。
 - **主机监控与布局**。通过当前 SSH 连接查看 CPU、内存、磁盘、网络、负载和进程，无需在服务器安装采集程序。可用指标随远端系统而异。工作台提供深色和浅色主题、可收起的侧栏和专注模式。
 
 ![CapTerm 浅色远程编辑器，左侧是 SFTP 文件列表，右侧是进程监控](docs/screenshots/remote-editor.jpg)
@@ -34,7 +35,7 @@ CapTerm 是用 Rust 和 [GPUI Kit](https://github.com/longbridge/gpui-kit) 构�
 
 1. 按 `Ctrl+Shift+P` 打开命令面板，输入 `user@host[:port]` 连接。也可以双击右侧已保存的会话，或从面板导入 OpenSSH 配置。
 2. 首次连接时，核对主机密钥指纹，再选择仅本次信任或保存到 CapTerm 的独立 `known_hosts`。替换已保存的密钥需要输入对应主机名。
-3. 连接后在终端运行命令，或从左侧 SFTP 面板打开远程文本。按 `Ctrl+Shift+F` 搜索终端输出，按 `Ctrl+Shift+Enter` 切换专注模式。
+3. 连接后在终端运行命令，或从左侧 SFTP 面板打开远程文本。SSH 断开后，在终端按 `Enter` 即可在当前标签重连，也可以点击重连提示。按 `Ctrl+Shift+F` 搜索终端输出，按 `Ctrl+Shift+Enter` 切换专注模式。
 
 密码用于目标主机认证，跳板使用私钥或 SSH Agent。加密私钥可先加载到本机 SSH Agent。
 

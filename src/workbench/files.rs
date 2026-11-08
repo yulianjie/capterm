@@ -14,9 +14,10 @@ use tokio::task::AbortHandle;
 
 pub(super) use editor::FileEditor;
 
-use super::{Event, Phase, Tab, Workbench};
+use super::{Event, Phase, Session, Tab, Workbench};
 use crate::config::TransferConflictPreference;
 use crate::file_text::{FileText, SaveTextResult, TextEncoding};
+use crate::local::{LocalShell, WslPaths};
 use crate::ssh::{
     Connection, RemoteEntry, RemoteMutation, TransferChoice, TransferConflict, TransferOptions,
     TransferOutcome, TransferSignal,
@@ -34,7 +35,7 @@ impl FileSource {
         if !tab.has_file_browser() {
             return None;
         }
-        if tab.browses_local_files() {
+        if tab.is_local() {
             Some(Self::Local)
         } else {
             tab.connection.clone().map(Self::Ssh)
@@ -86,6 +87,7 @@ impl FileSource {
 pub(super) struct FilePane {
     directory: String,
     home: String,
+    wsl: Option<WslPaths>,
     terminal_directory: Option<String>,
     osc_directory: bool,
     queried_login_directory: bool,
@@ -223,21 +225,33 @@ fn report_error(error: anyhow::Error) -> String {
 }
 
 impl Workbench {
-    pub(super) fn list(&mut self, id: u64, directory: String, cx: &mut Context<Self>) {
+    pub(super) fn list(&mut self, id: u64, mut directory: String, cx: &mut Context<Self>) {
         let Some(tab) = self.tab_mut(id) else { return };
         let Some(source) = FileSource::for_tab(tab) else {
             return;
         };
+        if directory == "." && matches!(tab.session, Session::Local(LocalShell::Wsl)) {
+            let Some(home) = tab
+                .files
+                .wsl
+                .as_ref()
+                .and_then(|wsl| wsl.windows_directory(wsl.home()))
+            else {
+                return;
+            };
+            directory = home;
+        }
         tab.files.listing += 1;
         tab.files.loading = true;
         tab.files.error = None;
         tab.files.navigation = Some(directory.clone());
         let listing = tab.files.listing;
+        let operation_id = tab.operation_id;
         let events = self.events.clone();
         self.runtime.spawn(async move {
             let result = source.list(&directory).await.map_err(report_error);
             let _ = events
-                .send(Event::File(id, FileEvent::List(listing, result)))
+                .send(Event::File(operation_id, FileEvent::List(listing, result)))
                 .await;
         });
         cx.notify();
@@ -251,7 +265,7 @@ impl Workbench {
         tab.files.selected = Some(entry.clone());
         *tab.files.visible_rows.get_mut() = None;
         if tab.files.branches.remove(&entry.path).is_some() {
-            let local = tab.browses_local_files();
+            let local = tab.is_local();
             let remote_prefix = format!("{}/", entry.path);
             tab.files.branches.retain(|path, _| {
                 if local {
@@ -263,6 +277,7 @@ impl Workbench {
         } else {
             tab.files.branches.insert(entry.path.clone(), None);
             let listing = tab.files.listing;
+            let operation_id = tab.operation_id;
             let events = self.events.clone();
             self.runtime.spawn(async move {
                 let result = source
@@ -272,13 +287,34 @@ impl Workbench {
                     .map_err(report_error);
                 let _ = events
                     .send(Event::File(
-                        id,
+                        operation_id,
                         FileEvent::Branch(listing, entry.path, result),
                     ))
                     .await;
             });
         }
         cx.notify();
+    }
+
+    pub(super) fn start_local_files(
+        &mut self,
+        id: u64,
+        paths: Result<Option<WslPaths>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(id) else { return };
+        match paths {
+            Ok(Some(wsl)) => {
+                tab.files.terminal_directory = wsl.windows_directory(wsl.home());
+                tab.files.wsl = Some(wsl);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tab.files.error = Some(error);
+                return;
+            }
+        }
+        self.list(id, ".".into(), cx);
     }
 
     pub(super) fn file_terminal_directory(
@@ -290,16 +326,18 @@ impl Workbench {
         let Some(tab) = self.tab_mut(id).filter(|tab| tab.has_file_browser()) else {
             return;
         };
-        let directory = if tab.browses_local_files() {
-            let Some(path) = local::osc_directory(&directory) else {
-                return;
-            };
-            path
-        } else if directory.starts_with('/') && !directory.contains('\0') {
-            directory
-        } else {
-            return;
+        let path = match tab.session {
+            Session::Local(LocalShell::Wsl) => tab
+                .files
+                .wsl
+                .as_ref()
+                .and_then(|wsl| wsl.windows_directory(&directory)),
+            Session::Local(_) => local::osc_directory(&directory),
+            Session::Ssh(_) => {
+                (directory.starts_with('/') && !directory.contains('\0')).then_some(directory)
+            }
         };
+        let Some(directory) = path else { return };
         tab.files.osc_directory = true;
         self.set_terminal_directory(id, directory, cx);
     }
@@ -326,8 +364,15 @@ impl Workbench {
             return;
         }
         let prompt = tab.terminal.read(cx).prompt_text();
-        if tab.browses_local_files() {
-            if let Some(directory) = prompt.and_then(local::prompt_directory) {
+        if let Session::Local(shell) = tab.session {
+            let directory = prompt.and_then(|line| match shell {
+                LocalShell::Wsl => {
+                    let wsl = tab.files.wsl.as_ref()?;
+                    wsl.windows_directory(&prompt_directory(line, wsl.home())?)
+                }
+                _ => local::prompt_directory(shell, line),
+            });
+            if let Some(directory) = directory {
                 self.set_terminal_directory(id, directory, cx);
             }
             return;
@@ -343,6 +388,7 @@ impl Workbench {
             return;
         };
         tab.files.queried_login_directory = true;
+        let operation_id = tab.operation_id;
         let events = self.events.clone();
         self.runtime.spawn(async move {
             let result = connection
@@ -355,15 +401,17 @@ impl Workbench {
                 })
                 .map_err(report_error);
             let _ = events
-                .send(Event::File(id, FileEvent::Directory(result)))
+                .send(Event::File(operation_id, FileEvent::Directory(result)))
                 .await;
         });
     }
 
     fn mutate_file(&mut self, id: u64, operation: RemoteMutation, cx: &mut Context<Self>) {
-        let Some(connection) = self.tab(id).and_then(|tab| tab.connection.clone()) else {
+        let Some(tab) = self.tab(id) else { return };
+        let Some(connection) = tab.connection.clone() else {
             return;
         };
+        let operation_id = tab.operation_id;
         let events = self.events.clone();
         self.runtime.spawn(async move {
             let result = connection
@@ -371,7 +419,7 @@ impl Workbench {
                 .await
                 .map_err(report_error);
             let _ = events
-                .send(Event::File(id, FileEvent::Mutation(result)))
+                .send(Event::File(operation_id, FileEvent::Mutation(result)))
                 .await;
         });
         cx.notify();
@@ -424,6 +472,7 @@ impl Workbench {
         tab.files.editor_request += 1;
         tab.files.pending_editor = None;
         let request = tab.files.editor_request;
+        let operation_id = tab.operation_id;
         let path = entry.path.clone();
         let edit_limit_mb = self.settings.file_edit_limit_mb;
         let events = self.events.clone();
@@ -435,7 +484,10 @@ impl Workbench {
                     .await
                     .map_err(report_error);
                 let _ = events
-                    .send(Event::File(id, FileEvent::Text(request, entry, result)))
+                    .send(Event::File(
+                        operation_id,
+                        FileEvent::Text(request, entry, result),
+                    ))
                     .await;
             })
             .abort_handle();
@@ -500,6 +552,7 @@ impl Workbench {
             self.announce("连接 SSH 会话后可上传剪贴板图片", cx);
             return;
         };
+        let operation_id = tab.operation_id;
         let extension = match extension {
             "png" => "png",
             "jpg" | "jpeg" => "jpg",
@@ -526,7 +579,7 @@ impl Workbench {
             };
             let result = prepare.await.map_err(report_error);
             let _ = events
-                .send(Event::File(id, FileEvent::ClipboardReady(result)))
+                .send(Event::File(operation_id, FileEvent::ClipboardReady(result)))
                 .await;
         });
         self.announce("正在准备上传剪贴板图片…", cx);
@@ -724,7 +777,7 @@ impl Workbench {
                     continue;
                 }
                 let (signal, watch) = watch::channel(TransferSignal::Running);
-                let (id, item_id) = (tab.id, item.id);
+                let (operation_id, item_id) = (tab.operation_id, item.id);
                 let source = item.source.clone();
                 let options = item.options;
                 let events = self.events.clone();
@@ -739,7 +792,7 @@ impl Workbench {
                             if last.elapsed() >= Duration::from_millis(150) || copied == total {
                                 last = Instant::now();
                                 let _ = events.try_send(Event::File(
-                                    id,
+                                    operation_id,
                                     FileEvent::Progress(item_id, copied, total),
                                 ));
                             }
@@ -771,7 +824,7 @@ impl Workbench {
                         };
                         let _ = events
                             .send(Event::File(
-                                id,
+                                operation_id,
                                 FileEvent::Transfer(
                                     item_id,
                                     bytes_copied,
@@ -1016,6 +1069,7 @@ impl Workbench {
             return;
         };
         let listing = tab.files.listing;
+        let operation_id = tab.operation_id;
         let events = self.events.clone();
         self.runtime.spawn(async move {
             let result = source
@@ -1024,7 +1078,10 @@ impl Workbench {
                 .map(|(_, entries)| entries)
                 .map_err(report_error);
             let _ = events
-                .send(Event::File(id, FileEvent::Branch(listing, updated, result)))
+                .send(Event::File(
+                    operation_id,
+                    FileEvent::Branch(listing, updated, result),
+                ))
                 .await;
         });
     }
@@ -1048,7 +1105,7 @@ impl Workbench {
 
     pub(super) fn apply_file_event(
         &mut self,
-        id: u64,
+        operation_id: u64,
         event: FileEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1057,9 +1114,13 @@ impl Workbench {
             self.finish_editor_save(editor, edited, result, window, cx);
             return;
         }
-        let Some(tab) = self.tab_mut(id).filter(|tab| tab.phase == Phase::Connected) else {
+        let Some(tab) = self
+            .tab_mut_for_operation(operation_id)
+            .filter(|tab| tab.phase == Phase::Connected)
+        else {
             return;
         };
+        let id = tab.id;
         match event {
             FileEvent::List(request, result) if request == tab.files.listing => {
                 tab.files.loading = false;
@@ -1073,7 +1134,7 @@ impl Workbench {
                             tab.files.branches.clear();
                             tab.files.selected = None;
                         } else if let Some(selected) = &tab.files.selected
-                            && file_parent(&selected.path, tab.browses_local_files()).as_deref()
+                            && file_parent(&selected.path, tab.is_local()).as_deref()
                                 == Some(directory.as_str())
                         {
                             tab.files.selected = entries
@@ -1109,7 +1170,7 @@ impl Workbench {
                 self.set_terminal_directory(id, directory, cx);
             }
             FileEvent::Text(request, entry, result) if request == tab.files.editor_request => {
-                let local = tab.browses_local_files();
+                let local = tab.is_local();
                 let pinned = tab
                     .files
                     .pending_editor

@@ -28,23 +28,23 @@ const TREND_SPAN: Duration = Duration::from_secs(5 * 60);
 pub(super) async fn sample_host(
     id: u64,
     connection: Arc<Connection>,
-    mut monitored_tab: watch::Receiver<Option<u64>>,
+    mut monitored_operation: watch::Receiver<Option<u64>>,
     interval: Arc<AtomicU64>,
     events: async_channel::Sender<Event>,
 ) {
     let mut next = time::Instant::now();
-    while monitored_tab
+    while monitored_operation
         .wait_for(|active| *active == Some(id))
         .await
         .is_ok()
     {
         tokio::select! {
             _ = time::sleep_until(next) => {
-                if *monitored_tab.borrow_and_update() != Some(id) {
+                if *monitored_operation.borrow_and_update() != Some(id) {
                     continue;
                 }
             }
-            changed = monitored_tab.changed() => {
+            changed = monitored_operation.changed() => {
                 if changed.is_err() {
                     break;
                 }

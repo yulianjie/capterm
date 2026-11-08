@@ -66,17 +66,26 @@ fn read_path(path: &Path, encoding: TextEncoding, edit_limit: u64) -> Result<Opt
     if let Some(text) = &mut text
         && !text.readonly
     {
-        // Check write and delete access without changing file data or attributes.
-        text.readonly = OpenOptions::new()
-            .access_mode(FILE_WRITE_DATA.0 | DELETE.0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-            .open(path)
-            .is_err_and(|error| {
-                error.kind() == ErrorKind::PermissionDenied
-                    && error.raw_os_error() != Some(ERROR_SHARING_VIOLATION.0 as i32)
-            });
+        // Keep WSL previews read-only to preserve Linux ownership and permissions.
+        // Check write and delete access on other paths without changing the file.
+        text.readonly = wsl_share(path)
+            || OpenOptions::new()
+                .access_mode(FILE_WRITE_DATA.0 | DELETE.0)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+                .open(path)
+                .is_err_and(|error| {
+                    error.kind() == ErrorKind::PermissionDenied
+                        && error.raw_os_error() != Some(ERROR_SHARING_VIOLATION.0 as i32)
+                });
     }
     Ok(text)
+}
+
+fn wsl_share(path: &Path) -> bool {
+    matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(
+        prefix.kind(), Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _)
+            if server.eq_ignore_ascii_case("wsl$") || server.eq_ignore_ascii_case("wsl.localhost")
+    ))
 }
 
 fn validate_path(path: &Path) -> Result<()> {

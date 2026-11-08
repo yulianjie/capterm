@@ -17,6 +17,13 @@ use super::ui::{Palette, button, chrome_icon_tool, col, icon, input, primary, ro
 use crate::config::ConnectionProfile;
 use crate::ssh::{ProxyCommandRequest, TrustDecision, TrustRequest};
 
+#[derive(Clone, Copy)]
+enum CredentialTarget {
+    Connect,
+    Test,
+    Reconnect(u64),
+}
+
 #[derive(Default)]
 pub(super) struct FormStatus {
     busy: Cell<bool>,
@@ -220,7 +227,7 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.credential_dialog(profile, false, window, cx);
+        self.credential_dialog(profile, CredentialTarget::Connect, window, cx);
     }
 
     pub(super) fn test_with_password(
@@ -229,13 +236,23 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.credential_dialog(profile, true, window, cx);
+        self.credential_dialog(profile, CredentialTarget::Test, window, cx);
+    }
+
+    pub(super) fn reconnect_password_dialog(
+        &mut self,
+        id: u64,
+        profile: ConnectionProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.credential_dialog(profile, CredentialTarget::Reconnect(id), window, cx);
     }
 
     fn credential_dialog(
         &mut self,
         profile: ConnectionProfile,
-        test: bool,
+        action: CredentialTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -247,15 +264,24 @@ impl Workbench {
         });
         let view = cx.weak_entity();
         let status = Rc::new(FormStatus::default());
-        window.open_dialog(cx, move |dialog, _, _| {
+        let focus_password = Cell::new(matches!(action, CredentialTarget::Reconnect(_)));
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if focus_password.replace(false) {
+                password.focus_handle(cx).focus(window, cx);
+            }
+            let (description, label) = match action {
+                CredentialTarget::Connect => ("连接到", "连接"),
+                CredentialTarget::Test => ("测试连接到", "测试连接"),
+                CredentialTarget::Reconnect(_) => ("重新连接到", "重新连接"),
+            };
             let body = col()
                 .gap(px(12.))
                 .p(px(15.))
-                .child(div().text_color(palette.muted).child(format!(
-                    "{} {}",
-                    if test { "测试连接到" } else { "连接到" },
-                    target(&profile)
-                )))
+                .child(
+                    div()
+                        .text_color(palette.muted)
+                        .child(format!("{description} {}", target(&profile))),
+                )
                 .child(field(
                     "密码",
                     input(&password, "SSH 密码", palette).content_type(InputContentType::Password),
@@ -266,27 +292,25 @@ impl Workbench {
             let password = password.clone();
             let profile = profile.clone();
             let status = status.clone();
-            let connect = primary(
-                "connect-password",
-                if test { "测试连接" } else { "连接" },
-                palette,
-            )
-            .on_click(move |_, window, cx| {
-                let credential = password.read(cx).value().to_string();
-                if credential.is_empty() {
-                    status.fail("请输入 SSH 密码。", window);
-                    return;
-                }
-                password.update(cx, |password, cx| password.clean(window, cx));
-                window.close_dialog(cx);
-                let _ = view.update(cx, |this, cx| {
-                    if test {
-                        this.test(profile.clone(), Some(credential), cx);
-                    } else {
-                        this.connect(profile.clone(), Some(credential), window, cx);
+            let connect =
+                primary("connect-password", label, palette).on_click(move |_, window, cx| {
+                    let credential = password.read(cx).value().to_string();
+                    if credential.is_empty() {
+                        status.fail("请输入 SSH 密码。", window);
+                        return;
                     }
+                    password.update(cx, |password, cx| password.clean(window, cx));
+                    window.close_dialog(cx);
+                    let _ = view.update(cx, |this, cx| match action {
+                        CredentialTarget::Connect => {
+                            this.connect(profile.clone(), Some(credential), window, cx)
+                        }
+                        CredentialTarget::Test => this.test(profile.clone(), Some(credential), cx),
+                        CredentialTarget::Reconnect(id) => {
+                            this.reconnect_ssh(id, Some(credential), window, cx)
+                        }
+                    });
                 });
-            });
             styled_dialog(dialog, 470., palette).child(
                 col()
                     .child(dialog_head("SSH 密码", palette, false))

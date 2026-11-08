@@ -127,6 +127,7 @@ struct ConnectionTest {
     _task: AbortHandle,
 }
 
+#[derive(Default)]
 struct TerminalLink {
     size: Cell<TerminalSize>,
     commands: RefCell<Option<ShellInput>>,
@@ -168,7 +169,9 @@ enum Session {
 
 struct Tab {
     id: u64,
+    operation_id: u64,
     session: Session,
+    ssh_password_auth: bool,
     phase: Phase,
     terminal: Entity<TerminalView>,
     draft: Entity<TextareaState>,
@@ -184,12 +187,13 @@ struct Tab {
     observed_terminal: TerminalObservation,
     route: Vec<HopProgress>,
     connection: Option<Arc<Connection>>,
-    operation: AbortHandle,
+    operation: Option<tokio::task::JoinHandle<()>>,
     monitor: Option<AbortHandle>,
     monitor_state: monitor::MonitorState,
     sample: Option<Arc<Metrics>>,
     files: FilePane,
-    _subscriptions: Vec<Subscription>,
+    _draft_subscription: Subscription,
+    _terminal_subscriptions: [Subscription; 2],
 }
 
 impl Tab {
@@ -207,16 +211,16 @@ impl Tab {
         }
     }
 
+    fn can_reconnect(&self) -> bool {
+        !self.is_local() && matches!(self.phase, Phase::Disconnected | Phase::Failed)
+    }
+
     fn is_local(&self) -> bool {
         matches!(self.session, Session::Local(_))
     }
 
-    fn browses_local_files(&self) -> bool {
-        matches!(self.session, Session::Local(LocalShell::PowerShell))
-    }
-
     fn has_file_browser(&self) -> bool {
-        self.phase == Phase::Connected && (self.browses_local_files() || self.connection.is_some())
+        self.phase == Phase::Connected && (self.is_local() || self.connection.is_some())
     }
 
     fn bind_shell(&mut self, commands: ShellInput) {
@@ -230,7 +234,11 @@ impl Tab {
 impl Drop for Tab {
     fn drop(&mut self) {
         self.link.commands.borrow_mut().take();
-        self.operation.abort();
+        if let Some(operation) = self.operation.take()
+            && matches!(self.phase, Phase::Connecting | Phase::Connected)
+        {
+            operation.abort();
+        }
         if let Some(monitor) = self.monitor.take() {
             monitor.abort();
         }
@@ -240,7 +248,11 @@ impl Drop for Tab {
 enum Event {
     Trust(u64, ConnectionPrompt),
     Connected(u64, Arc<Connection>, mpsc::UnboundedSender<ShellCommand>),
-    LocalStarted(u64, std::sync::mpsc::Sender<ShellCommand>),
+    LocalStarted(
+        u64,
+        std::sync::mpsc::Sender<ShellCommand>,
+        Result<Option<local::WslPaths>, String>,
+    ),
     StartFailed(u64, String),
     TestFinished(u64, Result<(), String>),
     Route(u64, HopProgress),
@@ -277,7 +289,7 @@ struct Workbench {
     tests: HashMap<u64, ConnectionTest>,
     recent_tests: VecDeque<(String, Vec<HopProgress>)>,
     window_active: bool,
-    monitored_tab: watch::Sender<Option<u64>>,
+    monitored_operation: watch::Sender<Option<u64>>,
     monitor_interval: Arc<AtomicU64>,
     file_editors: Vec<files::FileEditor>,
     active_file_editor: Option<u64>,
@@ -369,7 +381,7 @@ impl Workbench {
             tests: HashMap::new(),
             recent_tests: VecDeque::new(),
             window_active: window.is_window_active(),
-            monitored_tab: watch::Sender::new(None),
+            monitored_operation: watch::Sender::new(None),
             monitor_interval,
             file_editors: Vec::new(),
             active_file_editor: None,
@@ -391,6 +403,14 @@ impl Workbench {
 
     fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|tab| tab.id == id)
+    }
+
+    fn tab_for_operation(&self, id: u64) -> Option<&Tab> {
+        self.tabs.iter().find(|tab| tab.operation_id == id)
+    }
+
+    fn tab_mut_for_operation(&mut self, id: u64) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|tab| tab.operation_id == id)
     }
 
     fn new_id(&mut self) -> u64 {
@@ -543,13 +563,11 @@ impl Workbench {
     }
 
     fn set_monitored_tab(&self, id: Option<u64>) {
-        let monitored = id.filter(|&id| {
-            self.window_active
-                && self
-                    .tab(id)
-                    .is_some_and(|tab| !tab.is_local() && !tab.monitor_state.paused)
-        });
-        self.monitored_tab.send_if_modified(|current| {
+        let monitored = id
+            .and_then(|id| self.tab(id))
+            .filter(|tab| self.window_active && !tab.is_local() && !tab.monitor_state.paused)
+            .map(|tab| tab.operation_id);
+        self.monitored_operation.send_if_modified(|current| {
             if *current == monitored {
                 return false;
             }
@@ -628,58 +646,150 @@ impl Workbench {
         let reuse_jumps = self.settings.reuse_jumps;
         self.start_tab(
             Session::Ssh(profile),
+            password.is_some(),
             window,
             cx,
-            |id, initial, events| async move {
-                let result =
-                    establish(id, &target, password, known_hosts, reuse_jumps, &events).await;
-                match result {
-                    Ok(connection) => run_shell(id, Arc::new(connection), initial, &events).await,
-                    Err(error) => {
-                        let _ = events
-                            .send(Event::StartFailed(id, format!("{error:#}")))
-                            .await;
-                    }
-                }
+            move |id, initial, events| {
+                run_ssh(
+                    id,
+                    target,
+                    password,
+                    known_hosts,
+                    reuse_jumps,
+                    initial,
+                    events,
+                )
             },
         );
+    }
+
+    fn request_reconnect(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab(id).filter(|tab| tab.can_reconnect()) else {
+            return;
+        };
+        if tab.ssh_password_auth {
+            if let Some(profile) = tab.ssh_profile().cloned() {
+                self.reconnect_password_dialog(id, profile, window, cx);
+            }
+        } else {
+            self.reconnect_ssh(id, None, window, cx);
+        }
+    }
+
+    fn reconnect_ssh(
+        &mut self,
+        id: u64,
+        password: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab(id).filter(|tab| tab.can_reconnect()) else {
+            return;
+        };
+        let Some(mut profile) = tab.ssh_profile().cloned() else {
+            return;
+        };
+        let known_hosts = match config::known_hosts() {
+            Ok(path) => path,
+            Err(error) => {
+                self.announce(format!("无法打开已知主机文件：{error:#}"), cx);
+                return;
+            }
+        };
+        self.settings.resolve_jump_references(&mut profile);
+        let mut target = profile.clone();
+        self.settings.apply_ssh_defaults(&mut target);
+        let reuse_jumps = self.settings.reuse_jumps;
+        let session = Session::Ssh(profile);
+        let initial = tab.link.size.get();
+        let link = Rc::new(TerminalLink::default());
+        link.size.set(initial);
+        let (numbers, timestamps) = (tab.line_numbers, tab.timestamps);
+        let (terminal, subscriptions) = self.build_terminal(id, &session, &link, window, cx);
+        terminal.update(cx, |terminal, cx| {
+            terminal.set_gutters(numbers, timestamps, cx);
+            terminal.system_message("正在重新连接…", cx);
+        });
+        let operation_id = self.new_id();
+        let tab = self.tab_mut(id).expect("retrying tab is still open");
+        let previous = tab.operation.take();
+        tab.operation_id = operation_id;
+        tab.phase = Phase::Connecting;
+        tab.session = session;
+        tab.link = link;
+        tab.terminal = terminal;
+        tab.observed_terminal = TerminalObservation::default();
+        tab.route.clear();
+        tab._terminal_subscriptions = subscriptions;
+        let events = self.events.clone();
+        let operation = self.runtime.spawn(async move {
+            // Finish closing the old transport and its forwarding listeners before rebinding.
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            run_ssh(
+                operation_id,
+                target,
+                password,
+                known_hosts,
+                reuse_jumps,
+                initial,
+                events,
+            )
+            .await;
+        });
+        self.tab_mut(id)
+            .expect("retrying tab is still open")
+            .operation = Some(operation);
+        self.notice.clear();
+        self.select_tab(id, window, cx);
     }
 
     fn launch_local(&mut self, shell: LocalShell, window: &mut Window, cx: &mut Context<Self>) {
         self.start_tab(
             Session::Local(shell),
+            false,
             window,
             cx,
             move |id, initial, events| async move {
-                let (commands, output) = match local::open(shell, initial.cols, initial.rows).await
-                {
-                    Ok(shell) => shell,
-                    Err(error) => {
-                        let _ = events
-                            .send(Event::StartFailed(id, format!("{error:#}")))
-                            .await;
-                        return;
-                    }
+                let paths = if shell == LocalShell::Wsl {
+                    local::wsl_paths()
+                        .await
+                        .map(Some)
+                        .map_err(|error| format!("{error:#}"))
+                } else {
+                    Ok(None)
                 };
-                if events.send(Event::LocalStarted(id, commands)).await.is_ok() {
+                let wsl = paths.as_ref().ok().and_then(Option::as_ref);
+                let (commands, output) =
+                    match local::open(shell, initial.cols, initial.rows, wsl).await {
+                        Ok(shell) => shell,
+                        Err(error) => {
+                            let _ = events
+                                .send(Event::StartFailed(id, format!("{error:#}")))
+                                .await;
+                            return;
+                        }
+                    };
+                if events
+                    .send(Event::LocalStarted(id, commands, paths))
+                    .await
+                    .is_ok()
+                {
                     relay_shell_output(id, output, &events).await;
                 }
             },
         );
     }
 
-    fn start_tab<F: Future<Output = ()> + Send + 'static>(
-        &mut self,
-        session: Session,
+    fn build_terminal(
+        &self,
+        id: u64,
+        session: &Session,
+        link: &Rc<TerminalLink>,
         window: &mut Window,
         cx: &mut Context<Self>,
-        run: impl FnOnce(u64, TerminalSize, async_channel::Sender<Event>) -> F,
-    ) {
-        let id = self.new_id();
-        let link = Rc::new(TerminalLink {
-            size: Cell::new(TerminalSize::default()),
-            commands: RefCell::new(None),
-        });
+    ) -> (Entity<TerminalView>, [Subscription; 2]) {
         let terminal = cx.new(|cx| {
             let link = link.clone();
             TerminalView::new(move |command| link.forward(command), cx)
@@ -691,10 +801,32 @@ impl Workbench {
                 terminal,
                 &self.settings,
                 &self.linux_highlights,
-                &session,
+                session,
                 cx,
             );
         });
+        let terminal_subscription = cx.observe_in(&terminal, window, move |view, _, window, cx| {
+            view.observe_terminal(id, window, cx);
+        });
+        let clipboard_subscription =
+            cx.subscribe(&terminal, move |view, _, image: &ClipboardImage, cx| {
+                view.upload_terminal_clipboard(id, image.bytes.clone(), image.extension, cx);
+            });
+        (terminal, [terminal_subscription, clipboard_subscription])
+    }
+
+    fn start_tab<F: Future<Output = ()> + Send + 'static>(
+        &mut self,
+        session: Session,
+        ssh_password_auth: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        run: impl FnOnce(u64, TerminalSize, async_channel::Sender<Event>) -> F,
+    ) {
+        let id = self.new_id();
+        let link = Rc::new(TerminalLink::default());
+        let (terminal, terminal_subscriptions) =
+            self.build_terminal(id, &session, &link, window, cx);
         let draft = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 6)
@@ -713,13 +845,6 @@ impl Workbench {
                     view.send_draft(id, window, cx);
                 }
             });
-        let terminal_subscription = cx.observe_in(&terminal, window, move |view, _, window, cx| {
-            view.observe_terminal(id, window, cx);
-        });
-        let clipboard_subscription =
-            cx.subscribe(&terminal, move |view, _, image: &ClipboardImage, cx| {
-                view.upload_terminal_clipboard(id, image.bytes.clone(), image.extension, cx);
-            });
         let initial = terminal.read(cx).size();
         let operation = self.runtime.spawn(run(id, initial, self.events.clone()));
         let (history_key, saved_history) = match &session {
@@ -736,7 +861,9 @@ impl Workbench {
             .clone();
         self.tabs.push(Tab {
             id,
+            operation_id: id,
             session,
+            ssh_password_auth,
             phase: Phase::Connecting,
             terminal,
             draft,
@@ -752,16 +879,13 @@ impl Workbench {
             observed_terminal: TerminalObservation::default(),
             route: Vec::new(),
             connection: None,
-            operation: operation.abort_handle(),
+            operation: Some(operation),
             monitor: None,
             monitor_state: monitor::MonitorState::default(),
             sample: None,
             files: FilePane::default(),
-            _subscriptions: vec![
-                draft_subscription,
-                terminal_subscription,
-                clipboard_subscription,
-            ],
+            _draft_subscription: draft_subscription,
+            _terminal_subscriptions: terminal_subscriptions,
         });
         self.notice.clear();
         self.select_tab(id, window, cx);
@@ -925,7 +1049,7 @@ impl Workbench {
     fn apply_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Trust(id, request) => {
-                if self.tab(id).is_some() || self.tests.contains_key(&id) {
+                if self.tab_for_operation(id).is_some() || self.tests.contains_key(&id) {
                     match request {
                         ConnectionPrompt::HostKey(request) => {
                             self.prompt_trust(request, window, cx)
@@ -936,11 +1060,12 @@ impl Workbench {
                     }
                 }
             }
-            Event::Connected(id, connection, commands) => {
-                let Some(tab) = self.tab_mut(id) else {
+            Event::Connected(operation_id, connection, commands) => {
+                let Some(tab) = self.tab_mut_for_operation(operation_id) else {
                     self.disconnect(connection);
                     return;
                 };
+                let id = tab.id;
                 tab.connection = Some(connection.clone());
                 tab.bind_shell(ShellInput::Ssh(commands));
                 for rule in connection.forwardings() {
@@ -949,9 +1074,9 @@ impl Workbench {
                     });
                 }
                 let monitor = self.runtime.spawn(monitor::sample_host(
-                    id,
+                    operation_id,
                     connection,
-                    self.monitored_tab.subscribe(),
+                    self.monitored_operation.subscribe(),
                     self.monitor_interval.clone(),
                     self.events.clone(),
                 ));
@@ -961,16 +1086,16 @@ impl Workbench {
                 self.list(id, ".".into(), cx);
                 cx.notify();
             }
-            Event::LocalStarted(id, commands) => {
+            Event::LocalStarted(id, commands, paths) => {
                 if let Some(tab) = self.tab_mut(id) {
                     tab.bind_shell(ShellInput::Local(commands));
-                    if tab.browses_local_files() {
-                        self.list(id, ".".into(), cx);
-                    }
+                    self.start_local_files(id, paths, cx);
                     cx.notify();
                 }
             }
-            Event::StartFailed(id, error) => self.finish_tab(id, Phase::Failed, &error, cx),
+            Event::StartFailed(operation_id, error) => {
+                self.finish_tab(operation_id, Phase::Failed, &error, cx);
+            }
             Event::TestFinished(id, result) => {
                 if let Some(test) = self.tests.remove(&id) {
                     let ok = result.is_ok();
@@ -1004,15 +1129,15 @@ impl Workbench {
                     self.announce(notice, cx);
                 }
             }
-            Event::Route(id, progress) => {
-                if let Some(test) = self.tests.get_mut(&id) {
+            Event::Route(operation_id, progress) => {
+                if let Some(test) = self.tests.get_mut(&operation_id) {
                     record_hop(&mut test.hops, progress);
                     if test.form.is_some() {
                         window.refresh();
                     }
                     return;
                 }
-                if let Some(tab) = self.tab_mut(id) {
+                if let Some(tab) = self.tab_mut_for_operation(operation_id) {
                     let node = tab
                         .ssh_profile()
                         .map(|profile| {
@@ -1044,26 +1169,33 @@ impl Workbench {
                     cx.notify();
                 }
             }
-            Event::Shell(id, ShellEvent::Output(bytes)) => {
-                if let Some(tab) = self.tab(id) {
+            Event::Shell(operation_id, ShellEvent::Output(bytes)) => {
+                if let Some(tab) = self.tab_for_operation(operation_id) {
                     tab.terminal
                         .update(cx, |terminal, cx| terminal.feed(&bytes, cx));
                 }
             }
-            Event::Shell(id, ShellEvent::Exited(code)) => {
-                let reason = match (self.tab(id).is_some_and(Tab::is_local), code) {
+            Event::Shell(operation_id, ShellEvent::Exited(code)) => {
+                let Some(tab) = self.tab_for_operation(operation_id) else {
+                    return;
+                };
+                let reason = match (tab.is_local(), code) {
                     (true, Some(code)) => format!("本地 Shell 已退出 · 退出码 {code}"),
                     (true, None) => "本地 Shell 已关闭".into(),
                     (false, Some(code)) => format!("SSH 会话已退出 · 退出码 {code}"),
                     (false, None) => "SSH 通道已关闭".into(),
                 };
-                self.finish_tab(id, Phase::Disconnected, &reason, cx);
+                self.finish_tab(operation_id, Phase::Disconnected, &reason, cx);
             }
-            Event::Shell(id, ShellEvent::Error(error)) => {
-                self.finish_tab(id, Phase::Failed, &error, cx)
+            Event::Shell(operation_id, ShellEvent::Error(error)) => {
+                self.finish_tab(operation_id, Phase::Failed, &error, cx);
             }
-            Event::Sample(id, sample) => {
-                if let Some(tab) = self.tab_mut(id).filter(|tab| tab.phase == Phase::Connected) {
+            Event::Sample(operation_id, sample) => {
+                if let Some(tab) = self
+                    .tab_mut_for_operation(operation_id)
+                    .filter(|tab| tab.phase == Phase::Connected)
+                {
+                    let id = tab.id;
                     let sample = Arc::new(sample);
                     tab.monitor_state.push(sample.clone());
                     tab.sample = Some(sample);
@@ -1072,17 +1204,29 @@ impl Workbench {
                     }
                 }
             }
-            Event::File(id, event) => self.apply_file_event(id, event, window, cx),
+            Event::File(operation_id, event) => {
+                self.apply_file_event(operation_id, event, window, cx)
+            }
             Event::DragFinished(notice) => self.announce(notice, cx),
         }
     }
 
-    fn finish_tab(&mut self, id: u64, phase: Phase, reason: &str, cx: &mut Context<Self>) {
+    fn finish_tab(
+        &mut self,
+        operation_id: u64,
+        phase: Phase,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self
+            .tab_for_operation(operation_id)
+            .filter(|tab| matches!(tab.phase, Phase::Connecting | Phase::Connected))
+        else {
+            return;
+        };
+        let id = tab.id;
         self.cancel_file_transfers(id, cx);
         let Some(tab) = self.tab_mut(id) else { return };
-        if !matches!(tab.phase, Phase::Connecting | Phase::Connected) {
-            return;
-        }
         tab.phase = phase;
         tab.link.commands.borrow_mut().take();
         if let Some(monitor) = tab.monitor.take() {
@@ -1091,16 +1235,13 @@ impl Workbench {
         tab.sample = None;
         tab.monitor_state.clear();
         tab.files = FilePane::default();
-        let connection = tab.connection.take();
+        tab.connection = None;
         let reason = reason.replace(['\r', '\n', '\x1b'], " ");
         tab.terminal.update(cx, |terminal, cx| {
             terminal.end_session(cx);
             terminal.system_message(reason.clone(), cx);
         });
         let notice = format!("{} · {reason}", tab.name());
-        if let Some(connection) = connection {
-            self.disconnect(connection);
-        }
         self.announce(notice, cx);
     }
 }
@@ -1138,6 +1279,25 @@ fn configure_terminal(
         && matches!(session, Session::Ssh(_) | Session::Local(LocalShell::Wsl)))
     .then(|| linux_highlights.clone());
     terminal.set_linux_highlights(highlights, cx);
+}
+
+async fn run_ssh(
+    id: u64,
+    target: ConnectionProfile,
+    password: Option<String>,
+    known_hosts: std::path::PathBuf,
+    reuse_jumps: bool,
+    initial: TerminalSize,
+    events: async_channel::Sender<Event>,
+) {
+    match establish(id, &target, password, known_hosts, reuse_jumps, &events).await {
+        Ok(connection) => run_shell(id, Arc::new(connection), initial, &events).await,
+        Err(error) => {
+            let _ = events
+                .send(Event::StartFailed(id, format!("{error:#}")))
+                .await;
+        }
+    }
 }
 
 async fn establish(

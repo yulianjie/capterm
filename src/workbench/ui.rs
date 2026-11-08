@@ -825,6 +825,42 @@ impl Workbench {
                 el.child(self.route_bar(p, mono.clone(), cx))
             })
             .child(surface)
+            .when_some(
+                tab.filter(|tab| self.active_file_editor.is_none() && tab.can_reconnect()),
+                |el, tab| {
+                    let id = tab.id;
+                    let hint = if tab.phase == Phase::Failed {
+                        "SSH 连接失败 · 在终端中按 Enter 重连"
+                    } else {
+                        "SSH 已断开 · 在终端中按 Enter 重连"
+                    };
+                    el.child(
+                        row()
+                            .flex_shrink_0()
+                            .px(px(10.))
+                            .py(px(4.))
+                            .gap(px(8.))
+                            .bg(p.panel)
+                            .border_t_1()
+                            .border_color(p.line)
+                            .child(status_dot(tab.phase, p, 7.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(12.))
+                                    .text_color(p.ink)
+                                    .child(hint),
+                            )
+                            .child(
+                                button(("retry-ssh", id), "重新连接", p).on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.request_reconnect(id, window, cx)
+                                    },
+                                )),
+                            ),
+                    )
+                },
+            )
             .child(
                 self.file_input_drop("sender-drop", self.sender(p, mono, width, cx), p, cx)
                     .flex_shrink_0(),
@@ -1259,6 +1295,10 @@ impl Workbench {
                                         "重新连接",
                                         &weak,
                                         move |view, window, cx| {
+                                            if view.tab(id).is_some_and(Tab::can_reconnect) {
+                                                view.request_reconnect(id, window, cx);
+                                                return;
+                                            }
                                             let session =
                                                 view.tab(id).map(|tab| match &tab.session {
                                                     Session::Ssh(profile) => {

@@ -263,6 +263,15 @@ impl Workbench {
             }
             return true;
         }
+        if key.key == "enter"
+            && !m.modified()
+            && self.active_file_editor.is_none()
+            && let Some(tab) = self.active_tab().filter(|tab| tab.can_reconnect())
+            && tab.terminal.read(cx).is_focused(window)
+        {
+            self.request_reconnect(tab.id, window, cx);
+            return true;
+        }
         if !m.modified()
             && self.sender_focused(window, cx)
             && matches!(key.key.as_str(), "up" | "down")

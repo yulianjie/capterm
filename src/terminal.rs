@@ -437,7 +437,7 @@ impl TerminalView {
 
     pub fn prompt_text(&self) -> Option<&str> {
         let (number, row) = self.prompt.as_ref()?;
-        Some(self.timeline.powershell_prompt(*number).unwrap_or(row))
+        Some(self.timeline.captured_prompt(*number).unwrap_or(row))
     }
 
     pub fn notification_serial(&self) -> u64 {
@@ -511,6 +511,10 @@ impl TerminalView {
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         self.focus.focus(window, cx);
+    }
+
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
     }
 
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -671,7 +675,10 @@ impl TerminalView {
             .is_some_and(|stamp| stamp.number == number)
         {
             let text = timeline::row_text(grid, line);
-            let powershell = self.timeline.powershell_prompt(number).is_some()
+            let powershell = self
+                .timeline
+                .captured_prompt(number)
+                .is_some_and(timeline::is_powershell_prompt)
                 || timeline::is_powershell_prompt(&text);
             if powershell
                 || !text.is_empty()

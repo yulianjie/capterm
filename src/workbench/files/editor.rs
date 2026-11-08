@@ -89,7 +89,7 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let local = self.tab(terminal).is_some_and(Tab::browses_local_files);
+        let local = self.tab(terminal).is_some_and(Tab::is_local);
         let hostname = if local {
             "本地".into()
         } else {

@@ -140,7 +140,7 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab = self.active_tab();
-        let local = tab.is_some_and(Tab::browses_local_files);
+        let local = tab.is_some_and(Tab::is_local);
         let active = tab.filter(|tab| tab.has_file_browser()).map(|tab| tab.id);
         let refresh = file_tool("file-refresh", IconName::RefreshCw, "刷新文件", palette)
             .disabled(active.is_none())
@@ -189,10 +189,7 @@ impl Workbench {
                     .font_family(mono.clone())
                     .text_color(palette.muted)
                     .text_size(px(12.))
-                    .child(
-                        tab.filter(|tab| local || !tab.is_local())
-                            .map_or_else(String::new, |tab| tab.name().to_owned()),
-                    ),
+                    .child(tab.map_or_else(String::new, |tab| tab.name().to_owned())),
             )
             .child(refresh)
             .child(more);
@@ -206,8 +203,7 @@ impl Workbench {
             .border_color(palette.line)
             .child(heading);
         let Some(tab) = tab.filter(|tab| tab.has_file_browser()) else {
-            let connecting =
-                tab.filter(|tab| (local || !tab.is_local()) && tab.phase == Phase::Connecting);
+            let connecting = tab.filter(|tab| tab.phase == Phase::Connecting);
             return pane
                 .child(
                     col()
@@ -228,14 +224,14 @@ impl Workbench {
                         .child(div().font_weight(FontWeight::SEMIBOLD).child(
                             connecting.map_or_else(
                                 || "还没有可浏览的文件".into(),
-                                |tab| format!("正在连接 {}", tab.name()),
+                                |tab| format!("{} {}", tab.phase.label(tab.is_local()), tab.name()),
                             ),
                         ))
                         .child(div().text_size(px(12.)).text_color(palette.muted).child(
-                            if connecting.is_some() {
-                                "连接建立后会自动打开登录目录。"
-                            } else {
-                                "连接 SSH 或打开 PowerShell 后，这里显示会话文件。"
+                            match connecting.map(Tab::is_local) {
+                                Some(true) => "终端启动后会自动打开初始目录。",
+                                Some(false) => "连接建立后会自动打开登录目录。",
+                                None => "连接 SSH 或打开本地终端后，这里显示会话文件。",
                             },
                         )),
                 )
@@ -671,7 +667,7 @@ impl Workbench {
     ) -> AnyElement {
         let id = tab.id;
         let files = &tab.files;
-        let local = tab.browses_local_files();
+        let local = tab.is_local();
         let open = files.branches.contains_key(&entry.path);
         let selected = files
             .selected
