@@ -27,7 +27,7 @@ copy_licenses() {
 
 case "$platform" in
     macos)
-        lipo -verify_arch "$arch" "$binary"
+        lipo "$binary" -verify_arch "$arch"
         app="$work/image/CapTerm.app"
         mkdir -p "$app/Contents/"{MacOS,Resources}
         install -m 755 "$binary" "$app/Contents/MacOS/capterm"
@@ -65,6 +65,7 @@ EOF
         dmg="$dist/CapTerm-$version-macos-$arch.dmg"
         hdiutil create -volname CapTerm -srcfolder "$work/image" -format UDZO -ov "$dmg"
         hdiutil verify "$dmg"
+        mkdir "$mount"
         hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
         mounted=true
         codesign --verify --deep --strict --verbose "$mount/CapTerm.app"
