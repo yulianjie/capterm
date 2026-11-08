@@ -1,26 +1,18 @@
-name: Windows build and release
+name: Windows build
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
 
 concurrency:
   group: windows-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  cancel-in-progress: true
 
 jobs:
   check:
-    if: github.ref_type != 'tag'
     permissions:
       contents: read
-    uses: ./.github/workflows/windows-package.yml
-
-  publish:
-    if: github.ref_type == 'tag'
-    permissions:
-      contents: write
     uses: ./.github/workflows/windows-package.yml

@@ -68,11 +68,10 @@ jobs:
             throw "Uninstall failed with exit code $($result.ExitCode)"
           }
 
-      - name: Verify checksums and publish GitHub Release
+      - name: Verify package checksums
         if: github.ref_type == 'tag'
         working-directory: dist
         env:
-          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           $base = "CapTerm-$env:VERSION-windows-x64"
@@ -84,5 +83,14 @@ jobs:
           if (($expected -join "`n") -cne ((Get-Content -LiteralPath SHA256SUMS.txt) -join "`n")) {
             throw 'Package checksums do not match SHA256SUMS.txt'
           }
-          $notes = 'Windows x64 · `setup.exe` 为安装版，`portable.zip` 为便携版，`SHA256SUMS.txt` 用于校验文件。'
-          gh release create $env:GITHUB_REF_NAME @packages SHA256SUMS.txt --repo $env:GITHUB_REPOSITORY --verify-tag --title "CapTerm $env:GITHUB_REF_NAME" --notes $notes
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: github.ref_type == 'tag'
+        with:
+          name: capterm-windows-x64
+          path: |
+            dist/CapTerm-*-windows-x64-setup.exe
+            dist/CapTerm-*-windows-x64-portable.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0

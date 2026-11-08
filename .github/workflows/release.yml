@@ -1,0 +1,163 @@
+name: Desktop release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build and add macOS and Linux packages to
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Validate release tag
+        id: tag
+        env:
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/windows-package.yml
+
+  unix:
+    name: Package ${{ matrix.platform }} ${{ matrix.arch }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, platform: macos, arch: arm64 }
+          - { runner: macos-15-intel, platform: macos, arch: x86_64 }
+          - { runner: ubuntu-24.04, platform: linux, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      CARGO_INCREMENTAL: '0'
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      TAG: ${{ needs.version.outputs.tag }}
+      PLATFORM: ${{ matrix.platform }}
+      ARCH: ${{ matrix.arch }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.version.outputs.tag }}
+          path: source
+          persist-credentials: false
+
+      - name: Install Linux build and test dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev pkg-config dpkg-dev \
+            libfontconfig1-dev libfreetype6-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev \
+            libvulkan1 mesa-vulkan-drivers xvfb xdotool
+
+      - name: Set up Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Check version, test, and build
+        run: |
+          metadata=$(cargo metadata --locked --no-deps --format-version 1)
+          version=$(jq -er '.packages[] | select(.name == "capterm") | .version' <<< "$metadata")
+          if [[ "$TAG" != "v$version" ]]; then
+            echo "Tag $TAG must match Cargo.toml version v$version" >&2
+            exit 1
+          fi
+          cargo test --release --locked
+          cargo build --release --locked
+
+      - name: Package and verify
+        run: bash ../scripts/package-unix.sh "${TAG#v}" "$PLATFORM" "$ARCH"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: capterm-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            source/dist/*.dmg
+            source/dist/*.deb
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [version, windows, unix]
+    if: >-
+      !cancelled() && needs.unix.result == 'success' &&
+      (needs.windows.result == 'success' || needs.windows.result == 'skipped')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: capterm-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify and publish packages
+        working-directory: dist
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base="CapTerm-${TAG#v}"
+          unix=("$base-linux-amd64.deb" "$base-linux-arm64.deb" \
+                "$base-macos-arm64.dmg" "$base-macos-x86_64.dmg")
+          sha256sum "${unix[@]}" > SHA256SUMS-unix.txt
+          assets=("${unix[@]}" SHA256SUMS-unix.txt)
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            sha256sum -c SHA256SUMS.txt
+            assets+=("$base-windows-x64-setup.exe" "$base-windows-x64-portable.zip" SHA256SUMS.txt)
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == push ]] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null; then
+            gh release create "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "CapTerm $TAG" --notes 'Windows x64 · macOS (Apple Silicon and Intel) · Linux (amd64 and arm64). See the SHA256SUMS files to verify downloads.'
+            exit 0
+          fi
+
+          existing=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets)
+          missing=()
+          for asset in "${assets[@]}"; do
+            digest=$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .digest' <<< "$existing")
+            if [[ -z "$digest" ]]; then
+              missing+=("$asset")
+            elif [[ "$digest" != "sha256:$(sha256sum "$asset" | cut -d ' ' -f 1)" ]]; then
+              echo "Release already contains a different $asset" >&2
+              exit 1
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            gh release upload "$TAG" "${missing[@]}" --repo "$GITHUB_REPOSITORY"
+          fi
