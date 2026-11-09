@@ -397,6 +397,18 @@ impl Workbench {
                             })),
                     )
             })
+            .child(
+                file_tool(
+                    "file-send-path",
+                    IconName::Terminal,
+                    "发送路径到终端（优先使用选中项）",
+                    palette,
+                )
+                .disabled(!can_operate)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.send_file_path(id, window, cx);
+                })),
+            )
             .child(div().flex_1())
             .child(
                 file_tool(

@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::mpsc::Sender};
+use std::{
+    path::{Component, Path, PathBuf, Prefix},
+    sync::mpsc::Sender,
+};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc::Receiver;
@@ -56,6 +59,48 @@ impl WslPaths {
         } else {
             Some(format!("{root}\\{}", path.replace('/', "\\")))
         }
+    }
+
+    pub fn linux_path(&self, path: &str) -> Option<String> {
+        let path = Path::new(path);
+        if !path.is_absolute() {
+            return None;
+        }
+        let mut parts = path.components();
+        let Component::Prefix(prefix) = parts.next()? else {
+            return None;
+        };
+        let mut linux = match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                let (mount, _) = self
+                    .drives
+                    .iter()
+                    .find(|(_, drive)| *drive == char::from(letter.to_ascii_uppercase()))?;
+                format!("/{mount}")
+            }
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share)
+                if (server.eq_ignore_ascii_case("wsl$")
+                    || server.eq_ignore_ascii_case("wsl.localhost"))
+                    && share.eq_ignore_ascii_case(&self.distribution) =>
+            {
+                String::new()
+            }
+            _ => return None,
+        };
+        for part in parts {
+            match part {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    linux.push('/');
+                    linux.push_str(name.to_str()?);
+                }
+                _ => return None,
+            }
+        }
+        if linux.is_empty() {
+            linux.push('/');
+        }
+        Some(linux)
     }
 }
 
@@ -548,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_absolute_wsl_directories_to_the_selected_distribution() {
+    fn maps_paths_between_windows_and_the_selected_wsl_distribution() {
         let paths = WslPaths {
             distribution: "Ubuntu Custom".into(),
             home: "/home/fixture".into(),
@@ -577,6 +622,24 @@ mod tests {
             paths.windows_directory("/mnt/custom").as_deref(),
             Some(r"\\wsl$\Ubuntu Custom\mnt\custom")
         );
+        assert_eq!(
+            paths.linux_path(r"\\wsl$\Ubuntu Custom").as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            paths
+                .linux_path(r"\\wsl.localhost\Ubuntu Custom\home\fixture\资料.txt")
+                .as_deref(),
+            Some("/home/fixture/资料.txt")
+        );
+        assert_eq!(paths.linux_path(r"c:\").as_deref(), Some("/mnt/c"));
+        assert_eq!(
+            paths.linux_path(r"D:\Users\Project Files").as_deref(),
+            Some("/win/My Drive/Users/Project Files")
+        );
+        for path in [r"C:relative", r"E:\unmounted", r"\\wsl$\OtherDistro\home"] {
+            assert!(paths.linux_path(path).is_none(), "{path:?}");
+        }
         assert!(wsl_drive_mount(r"C:\134 /other 9p rw 0 0").is_none());
         for path in [
             "relative",

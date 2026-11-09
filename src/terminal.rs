@@ -434,7 +434,7 @@ impl TerminalView {
         if !enabled && self.parser.sync_timeout().deadline().is_some() {
             self.sync_flush = None;
             let now = Local::now();
-            self.finish_sync(now);
+            self.finish_sync(now, cx);
             self.output_changed(now, cx);
         }
     }
@@ -513,10 +513,10 @@ impl TerminalView {
         let now = Local::now();
         self.sync_flush = None;
         if self.parser.sync_timeout().deadline().is_some() {
-            self.finish_sync(now);
+            self.finish_sync(now, cx);
         }
         if self.mode().contains(TermMode::ALT_SCREEN) {
-            self.advance(b"\x1b[?1049l", now);
+            self.advance(b"\x1b[?1049l", now, cx);
         }
         self.output_changed(now, cx);
         self.launched_agent = None;
@@ -555,7 +555,7 @@ impl TerminalView {
         let time = Local::now();
         let mut offset = 0;
         for (end, marker) in self.scanner.scan(bytes) {
-            self.advance(&bytes[offset..end], time);
+            self.advance(&bytes[offset..end], time, cx);
             if self.parser.sync_timeout().deadline().is_some() {
                 if self.sync_markers.len() < 256 {
                     self.sync_markers.push(marker);
@@ -565,12 +565,12 @@ impl TerminalView {
             }
             offset = end;
         }
-        self.advance(&bytes[offset..], time);
+        self.advance(&bytes[offset..], time, cx);
         self.update_sync_timeout(cx);
         self.output_changed(time, cx);
     }
 
-    fn advance(&mut self, bytes: &[u8], now: DateTime<Local>) {
+    fn advance(&mut self, bytes: &[u8], now: DateTime<Local>, cx: &mut Context<Self>) {
         let inline_agent = self.agent_name().is_some();
         let synchronized_output = self.parser.sync_timeout().enabled();
         self.parser.advance(
@@ -595,7 +595,7 @@ impl TerminalView {
             },
             bytes,
         );
-        self.handle_terminal_events();
+        self.handle_terminal_events(cx);
         if self.parser.sync_timeout().deadline().is_none() {
             for marker in std::mem::take(&mut self.sync_markers) {
                 self.apply_marker(marker, now);
@@ -650,7 +650,7 @@ impl TerminalView {
             let _ = view.update(cx, |view, cx| {
                 if view.parser.sync_timeout().deadline() == Some(deadline) {
                     let now = Local::now();
-                    view.finish_sync(now);
+                    view.finish_sync(now, cx);
                     view.output_changed(now, cx);
                 }
             });
@@ -658,7 +658,7 @@ impl TerminalView {
         self.sync_flush = Some((deadline, task));
     }
 
-    fn finish_sync(&mut self, now: DateTime<Local>) {
+    fn finish_sync(&mut self, now: DateTime<Local>, cx: &mut Context<Self>) {
         let inline_agent = self.agent_name().is_some();
         let synchronized_output = self.parser.sync_timeout().enabled();
         self.parser.stop_sync(&mut ParserHandler {
@@ -680,14 +680,14 @@ impl TerminalView {
                 last_input: None,
             }),
         });
-        self.handle_terminal_events();
+        self.handle_terminal_events(cx);
         for marker in std::mem::take(&mut self.sync_markers) {
             self.apply_marker(marker, now);
         }
     }
 
     fn output_changed(&mut self, now: DateTime<Local>, cx: &mut Context<Self>) {
-        self.handle_terminal_events();
+        self.handle_terminal_events(cx);
         if !self.mode().contains(TermMode::ALT_SCREEN) {
             self.timeline.output(self.term.grid(), now);
             self.update_prompt(false);
@@ -766,7 +766,7 @@ impl TerminalView {
     ) {
         self.osc52_write = osc52_write;
         self.confirm_multiline_paste = confirm_multiline_paste;
-        if osc52_write == Osc52WritePreference::Deny && self.clipboard_request.take().is_some() {
+        if osc52_write != Osc52WritePreference::Ask && self.clipboard_request.take().is_some() {
             cx.notify();
         }
     }
@@ -855,7 +855,7 @@ impl TerminalView {
         (self.send)(TerminalCommand::Data(bytes));
     }
 
-    fn handle_terminal_events(&mut self) {
+    fn handle_terminal_events(&mut self, cx: &mut Context<Self>) {
         let events = std::mem::take(&mut *self.events.0.borrow_mut());
         let size = self.size();
         for event in events {
@@ -896,8 +896,14 @@ impl TerminalView {
                     self.push_notification(String::new());
                     continue;
                 }
-                Event::ClipboardStore(_, text) if self.osc52_write == Osc52WritePreference::Ask => {
-                    self.clipboard_request = Some(text);
+                Event::ClipboardStore(_, text) => {
+                    match self.osc52_write {
+                        Osc52WritePreference::Ask => self.clipboard_request = Some(text),
+                        Osc52WritePreference::Allow => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                        Osc52WritePreference::Deny => {}
+                    }
                     continue;
                 }
                 _ => continue,
@@ -1158,7 +1164,7 @@ impl TerminalView {
             .text_size(px(12.))
             .text_color(rgb(palette.text()))
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
-            .child("远端程序请求写入本机剪贴板")
+            .child("终端程序请求写入本机剪贴板")
             .child(
                 div()
                     .id("terminal-clipboard-allow")

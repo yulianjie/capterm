@@ -1011,12 +1011,13 @@ fn terminal_settings(settings: &Settings, view: &View, palette: Palette) -> Div 
         ))
         .child(setting_line(
             "允许程序写入剪贴板（OSC 52）",
-            "控制终端程序向本机剪贴板写入文本的请求。",
+            "控制 Codex 等终端程序向本机剪贴板写入文本的请求。",
             preference_field(
                 "set-osc52-write",
                 settings.osc52_write,
                 &[
                     (Osc52WritePreference::Ask, "每次询问"),
+                    (Osc52WritePreference::Allow, "始终允许"),
                     (Osc52WritePreference::Deny, "拒绝"),
                 ],
                 160.,

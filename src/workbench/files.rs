@@ -535,6 +535,36 @@ impl Workbench {
             .then(|| tab.files.directory.clone())
     }
 
+    fn send_file_path(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self
+            .active
+            .filter(|active| *active == id)
+            .and_then(|active| self.tab_mut(active))
+            .filter(|tab| tab.has_file_browser() && !tab.files.directory.is_empty())
+        else {
+            return;
+        };
+        let path = tab
+            .files
+            .selected
+            .as_ref()
+            .map_or(tab.files.directory.as_str(), |entry| entry.path.as_str());
+        let argument = terminal_path_argument(path, &tab.session, tab.files.wsl.as_ref());
+        match argument {
+            Ok(argument) => {
+                // A pending preview from selecting the row must not retake focus.
+                if tab.files.pending_editor.take().is_some() {
+                    tab.files.editor_request += 1;
+                }
+                tab.terminal.update(cx, |terminal, cx| {
+                    terminal.send_draft(&argument, false, cx);
+                });
+                self.select_tab(id, window, cx);
+            }
+            Err(message) => self.announce(message, cx),
+        }
+    }
+
     fn upload_directory(&self, id: u64) -> Option<String> {
         self.tab(id)?.connection.as_ref()?;
         self.file_directory(id)
@@ -1302,6 +1332,47 @@ fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
 
+fn terminal_path_argument(
+    path: &str,
+    session: &Session,
+    wsl: Option<&WslPaths>,
+) -> Result<String, &'static str> {
+    // Control characters can act as terminal keystrokes in unbracketed input.
+    if path.chars().any(char::is_control) {
+        return Err("路径包含控制字符，无法安全发送到终端");
+    }
+    match session {
+        Session::Ssh(_) => Ok(shell_quote(path)),
+        Session::Local(LocalShell::Wsl) => wsl
+            .and_then(|wsl| wsl.linux_path(path))
+            .filter(|path| !path.chars().any(char::is_control))
+            .map(|path| shell_quote(&path))
+            .ok_or("此路径无法映射到当前 WSL 发行版"),
+        Session::Local(LocalShell::PowerShell) => {
+            let mut quoted = String::with_capacity(path.len() + 2);
+            quoted.push('\'');
+            for character in path.chars() {
+                if matches!(character, '\'' | '‘' | '’' | '‚' | '‛') {
+                    quoted.push(character);
+                }
+                quoted.push(character);
+            }
+            quoted.push('\'');
+            Ok(quoted)
+        }
+        Session::Local(LocalShell::CommandPrompt) => {
+            // CMD can expand variables inside double quotes.
+            if path.contains(['%', '!', '"']) {
+                return Err("此路径包含 CMD 无法安全引用的字符");
+            }
+            // Native programs can interpret a backslash before the closing quote as an escape.
+            let base = path.trim_end_matches('\\');
+            let suffix = &path[base.len()..];
+            Ok(format!("\"{base}\"{suffix}"))
+        }
+    }
+}
+
 fn prompt_directory(line: &str, home: &str) -> Option<String> {
     let line = line.trim().strip_suffix(['$', '#', '%'])?;
     let (host, path) = line.split_once(':')?;
@@ -1318,4 +1389,33 @@ fn prompt_directory(line: &str, home: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LocalShell, Session, shell_quote, terminal_path_argument};
+
+    #[test]
+    fn quotes_file_paths_for_the_receiving_shell() {
+        let powershell = Session::Local(LocalShell::PowerShell);
+        let cmd = Session::Local(LocalShell::CommandPrompt);
+        assert_eq!(
+            terminal_path_argument(r"C:\A & B\O'Neil’s $file.txt", &powershell, None).unwrap(),
+            r"'C:\A & B\O''Neil’’s $file.txt'"
+        );
+        assert_eq!(
+            terminal_path_argument(r"C:\A & B\file.txt", &cmd, None).unwrap(),
+            r#""C:\A & B\file.txt""#
+        );
+        assert_eq!(
+            terminal_path_argument(r"C:\", &cmd, None).unwrap(),
+            r#""C:"\"#
+        );
+        assert_eq!(
+            shell_quote("/tmp/O'Neil's $file"),
+            r"'/tmp/O'\''Neil'\''s $file'"
+        );
+        assert!(terminal_path_argument("C:\\unsafe\nfile", &powershell, None).is_err());
+        assert!(terminal_path_argument(r"C:\%TEMP%\file", &cmd, None).is_err());
+    }
 }

@@ -308,6 +308,7 @@ pub enum TerminalNotificationPreference {
 pub enum Osc52WritePreference {
     #[default]
     Ask,
+    Allow,
     Deny,
 }
 
@@ -1548,6 +1549,19 @@ mod tests {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.osc52_write, Osc52WritePreference::Ask);
         assert!(settings.confirm_multiline_paste);
+    }
+
+    #[test]
+    fn always_allow_clipboard_writes_survives_saving_settings() -> Result<()> {
+        let settings = Settings {
+            osc52_write: Osc52WritePreference::Allow,
+            ..Settings::default()
+        };
+        let saved = serde_json::to_value(settings)?;
+        assert_eq!(saved["osc52_write"], "allow");
+        let loaded: Settings = serde_json::from_value(saved)?;
+        assert_eq!(loaded.osc52_write, Osc52WritePreference::Allow);
+        Ok(())
     }
 
     #[test]
