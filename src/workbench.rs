@@ -826,7 +826,11 @@ impl Workbench {
     ) -> (Entity<TerminalView>, [Subscription; 2]) {
         let terminal = cx.new(|cx| {
             let link = link.clone();
-            TerminalView::new(move |command| link.forward(command), cx)
+            TerminalView::new(
+                self.settings.scrollback_lines() as usize,
+                move |command| link.forward(command),
+                cx,
+            )
         });
         terminal.update(cx, |terminal, cx| {
             terminal.set_light(self.settings.light, cx);

@@ -656,6 +656,25 @@ fn terminal_settings(settings: &Settings, view: &View, palette: Palette) -> Div 
     ))
     .border_b_1()
     .child(
+        settings_section("滚屏历史", "", palette).child(setting_line(
+            "每个标签保留的历史行数",
+            "行数越少，终端占用的内存越低。修改后对新打开的终端标签生效。",
+            choices(
+                "set-scrollback-lines",
+                format!("{} 行", settings.scrollback_lines()),
+                [1_000, 5_000, 10_000, 20_000, 50_000, 100_000]
+                    .into_iter()
+                    .map(|lines| (lines, format!("{lines} 行")))
+                    .collect(),
+                120.,
+                palette,
+                view,
+                |settings, lines| settings.terminal_scrollback_lines = lines,
+            ),
+            palette,
+        )),
+    )
+    .child(
         settings_section(
             "终端兼容",
             "适用于 vim、htop、tmux、Claude Code、Codex、Gemini CLI 等程序。",

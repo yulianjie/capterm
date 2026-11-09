@@ -308,6 +308,7 @@ pub struct Settings {
     pub idle_threshold: u64,
     pub terminal_font_size: f32,
     pub terminal_line_height: f32,
+    pub terminal_scrollback_lines: u64,
     pub ui_font_family: Option<String>,
     pub mono_font_family: Option<String>,
     pub watch_ssh_configs: bool,
@@ -342,6 +343,7 @@ impl Default for Settings {
             idle_threshold: 60,
             terminal_font_size: 13.,
             terminal_line_height: 20.,
+            terminal_scrollback_lines: 10_000,
             ui_font_family: None,
             mono_font_family: None,
             watch_ssh_configs: true,
@@ -364,6 +366,10 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn scrollback_lines(&self) -> u64 {
+        self.terminal_scrollback_lines.clamp(1_000, 100_000)
+    }
+
     pub fn resolve_jump_references(&self, profile: &mut ConnectionProfile) {
         for hop in &mut profile.jumps {
             if let Some(saved) = hop.reference.as_ref().and_then(|reference| {
@@ -1443,6 +1449,12 @@ fn resolve_jumps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_settings_default_to_ten_thousand_scrollback_rows() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.scrollback_lines(), 10_000);
+    }
 
     #[test]
     fn displays_windows_drive_and_unc_paths_without_the_extended_prefix() {

@@ -278,10 +278,14 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(send: impl Fn(TerminalCommand) + 'static, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        scrollback_lines: usize,
+        send: impl Fn(TerminalCommand) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let config = Config {
             osc52: Osc52::OnlyCopy,
-            scrolling_history: 100_000,
+            scrolling_history: scrollback_lines,
             ..Config::default()
         };
         let size = TerminalSize::default();

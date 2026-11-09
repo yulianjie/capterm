@@ -102,10 +102,29 @@ pub(super) fn install_theme(cx: &mut App) {
     let theme = Theme::global_mut(cx);
     theme.dark_theme = dark;
     theme.light_theme = light;
-    for font in [
-        include_bytes!("../../assets/fonts/NotoSansSC.ttf").as_slice(),
-        include_bytes!("../../assets/fonts/MapleMono-NF-CN-Regular.ttf").as_slice(),
+    // DirectWrite copies fonts registered from memory. Reuse matching Windows
+    // system fonts and register the bundled copies only as fallbacks.
+    let installed_fonts = if cfg!(windows) {
+        cx.text_system().all_font_names()
+    } else {
+        Vec::new()
+    };
+    for (family, font) in [
+        (
+            "Noto Sans SC",
+            include_bytes!("../../assets/fonts/NotoSansSC.ttf").as_slice(),
+        ),
+        (
+            "Maple Mono NF CN",
+            include_bytes!("../../assets/fonts/MapleMono-NF-CN-Regular.ttf").as_slice(),
+        ),
     ] {
+        if installed_fonts
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(family))
+        {
+            continue;
+        }
         if let Err(error) = cx
             .text_system()
             .add_fonts(vec![std::borrow::Cow::Borrowed(font)])
