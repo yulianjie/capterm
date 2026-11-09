@@ -285,6 +285,42 @@ impl From<TimestampPreference> for crate::terminal::TimestampFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShiftEnterPreference {
+    #[default]
+    EscapeEnter,
+    Enter,
+    LineFeed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalNotificationPreference {
+    Off,
+    InApp,
+    #[default]
+    InAppAndSystem,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Osc52WritePreference {
+    #[default]
+    Ask,
+    Deny,
+}
+
+pub const DEFAULT_TERMINAL_TYPE: &str = "xterm-256color";
+
+pub fn validate_terminal_type(term: &str) -> Result<()> {
+    ensure!(
+        !term.chars().any(|ch| ch.is_whitespace() || ch.is_control()),
+        "终端类型不能包含空格或控制字符。"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LinkedConfig {
@@ -309,17 +345,28 @@ pub struct Settings {
     pub terminal_font_size: f32,
     pub terminal_line_height: f32,
     pub terminal_scrollback_lines: u64,
+    pub ssh_terminal_type: Option<String>,
+    pub kitty_keyboard: bool,
+    pub synchronized_output: bool,
+    pub shift_enter: ShiftEnterPreference,
+    pub terminal_notifications: TerminalNotificationPreference,
+    pub osc52_write: Osc52WritePreference,
+    pub confirm_multiline_paste: bool,
     pub ui_font_family: Option<String>,
     pub mono_font_family: Option<String>,
     pub watch_ssh_configs: bool,
     pub linked_configs: Vec<LinkedConfig>,
     pub monitor_interval: u64,
+    pub monitor_pause_in_background: bool,
     pub monitor_warn_pct: u8,
     pub monitor_danger_pct: u8,
     pub snippets: Vec<String>,
     pub sender_history: BTreeMap<String, VecDeque<String>>,
+    pub shortcuts: crate::shortcuts::ShortcutBindings,
     pub ssh_keepalive: u32,
     pub ssh_timeout: u32,
+    pub ssh_identity_agent: Option<String>,
+    pub ssh_require_known_host: bool,
     pub reuse_jumps: bool,
     pub download_directory: String,
     pub transfer_concurrency: usize,
@@ -344,17 +391,28 @@ impl Default for Settings {
             terminal_font_size: 13.,
             terminal_line_height: 20.,
             terminal_scrollback_lines: 10_000,
+            ssh_terminal_type: None,
+            kitty_keyboard: true,
+            synchronized_output: true,
+            shift_enter: ShiftEnterPreference::default(),
+            terminal_notifications: TerminalNotificationPreference::default(),
+            osc52_write: Osc52WritePreference::default(),
+            confirm_multiline_paste: true,
             ui_font_family: None,
             mono_font_family: None,
             watch_ssh_configs: true,
             linked_configs: Vec::new(),
             monitor_interval: 5,
+            monitor_pause_in_background: true,
             monitor_warn_pct: 80,
             monitor_danger_pct: 95,
             snippets: Vec::new(),
             sender_history: BTreeMap::new(),
+            shortcuts: crate::shortcuts::ShortcutBindings::default(),
             ssh_keepalive: 30,
             ssh_timeout: 15,
+            ssh_identity_agent: None,
+            ssh_require_known_host: false,
             reuse_jumps: true,
             download_directory: String::new(),
             transfer_concurrency: 3,
@@ -365,9 +423,22 @@ impl Default for Settings {
     }
 }
 
+pub const MAX_SCROLLBACK_LINES: u64 = 100_000;
+
 impl Settings {
     pub fn scrollback_lines(&self) -> u64 {
-        self.terminal_scrollback_lines.clamp(1_000, 100_000)
+        self.terminal_scrollback_lines.min(MAX_SCROLLBACK_LINES)
+    }
+
+    pub fn download_dir(&self) -> PathBuf {
+        if self.download_directory.is_empty() {
+            dirs::download_dir()
+                .filter(|path| path.is_dir())
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(std::env::temp_dir)
+        } else {
+            PathBuf::from(&self.download_directory)
+        }
     }
 
     pub fn resolve_jump_references(&self, profile: &mut ConnectionProfile) {
@@ -387,12 +458,27 @@ impl Settings {
     }
 
     pub fn apply_ssh_defaults(&self, profile: &mut ConnectionProfile) {
+        if profile.ssh.term.is_none() {
+            profile.ssh.term.clone_from(&self.ssh_terminal_type);
+        }
         for ssh in std::iter::once(&mut profile.ssh)
             .chain(profile.jumps.iter_mut().map(|hop| &mut hop.ssh))
         {
             ssh.connect_timeout.get_or_insert(self.ssh_timeout.max(1));
             ssh.keepalive_interval.get_or_insert(self.ssh_keepalive);
+            if ssh.identity_agent.is_none() {
+                ssh.identity_agent.clone_from(&self.ssh_identity_agent);
+            }
         }
+    }
+
+    pub fn terminal_type<'a>(&'a self, profile: &'a ConnectionProfile) -> &'a str {
+        profile
+            .ssh
+            .term
+            .as_deref()
+            .or(self.ssh_terminal_type.as_deref())
+            .unwrap_or(DEFAULT_TERMINAL_TYPE)
     }
 
     pub fn load() -> Result<Self> {
@@ -401,6 +487,7 @@ impl Settings {
             Ok(file) => {
                 let mut settings: Self = serde_json::from_reader(file)
                     .with_context(|| format!("Read settings from {}", path.display()))?;
+                settings.shortcuts.normalize();
                 if settings.linked_configs.is_empty() {
                     for source in settings
                         .profiles
@@ -1454,6 +1541,48 @@ mod tests {
     fn legacy_settings_default_to_ten_thousand_scrollback_rows() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.scrollback_lines(), 10_000);
+    }
+
+    #[test]
+    fn legacy_settings_use_clipboard_confirmations() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.osc52_write, Osc52WritePreference::Ask);
+        assert!(settings.confirm_multiline_paste);
+    }
+
+    #[test]
+    fn ssh_defaults_apply_without_overwriting_session_and_jump_overrides() -> Result<()> {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "ssh_terminal_type": "vt100",
+            "ssh_identity_agent": "none",
+            "ssh_keepalive": 0
+        }))?;
+        let mut profile: ConnectionProfile = serde_json::from_value(serde_json::json!({
+            "id": "fixture",
+            "name": "target",
+            "host": "target",
+            "user": "user",
+            "port": 22,
+            "jumps": [{
+                "host": "jump",
+                "user": "user",
+                "port": 22,
+                "ssh": {"identity_agent": "SSH_AUTH_SOCK"}
+            }]
+        }))?;
+        assert_eq!(settings.terminal_type(&profile), "vt100");
+        settings.apply_ssh_defaults(&mut profile);
+        assert_eq!(profile.ssh.term.as_deref(), Some("vt100"));
+        assert_eq!(profile.ssh.identity_agent.as_deref(), Some("none"));
+        assert_eq!(profile.ssh.keepalive_interval, Some(0));
+        assert_eq!(
+            profile.jumps[0].ssh.identity_agent.as_deref(),
+            Some("SSH_AUTH_SOCK")
+        );
+        profile.ssh.term = Some("xterm".into());
+        settings.apply_ssh_defaults(&mut profile);
+        assert_eq!(settings.terminal_type(&profile), "xterm");
+        Ok(())
     }
 
     #[test]

@@ -10,6 +10,8 @@ mod prompt;
 mod search;
 mod timeline;
 
+use crate::config::{Osc52WritePreference, ShiftEnterPreference};
+
 use std::{
     cell::RefCell,
     ops::Range,
@@ -35,6 +37,7 @@ use gpui_kit::{
     ScrollEvent, StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection, Window,
     canvas,
     component::{
+        WindowExt,
         input::{Input, InputEvent, InputState},
         menu::{ContextMenuExt, PopupMenuItem},
     },
@@ -44,7 +47,7 @@ use gpui_kit::{
 use highlight::LinuxHighlights;
 use osc::{Marker, Scanner};
 use paint::{Frame, FrameOptions, Palette, color_components, terminal_font};
-use parser::{KeyboardProtocol, ParserHandler, Tracking};
+use parser::{KeyboardProtocol, ParserHandler, SyncTimeout, Tracking};
 use search::Search;
 use timeline::{Stamp, Timeline};
 
@@ -224,7 +227,7 @@ impl Geometry {
 
 pub struct TerminalView {
     term: Term<TerminalEvents>,
-    parser: Processor,
+    parser: Processor<SyncTimeout>,
     keyboard: KeyboardProtocol,
     sync_flush: Option<(Instant, Task<()>)>,
     events: TerminalEvents,
@@ -256,6 +259,8 @@ pub struct TerminalView {
     fullscreen: Option<(Instant, Option<String>)>,
     last_program: Option<String>,
     clipboard_request: Option<String>,
+    osc52_write: Osc52WritePreference,
+    confirm_multiline_paste: bool,
     font_family: Option<String>,
     font_metrics: Option<(Font, Pixels)>,
     focus: FocusHandle,
@@ -271,6 +276,7 @@ pub struct TerminalView {
     timestamp_format: TimestampFormat,
     idle_threshold: Duration,
     dim_repeated: bool,
+    shift_enter: ShiftEnterPreference,
     font_size: Pixels,
     line_height: Pixels,
     compact: bool,
@@ -324,6 +330,8 @@ impl TerminalView {
             fullscreen: None,
             last_program: None,
             clipboard_request: None,
+            osc52_write: Osc52WritePreference::default(),
+            confirm_multiline_paste: true,
             font_family: None,
             font_metrics: None,
             focus: cx.focus_handle(),
@@ -339,6 +347,7 @@ impl TerminalView {
             timestamp_format: TimestampFormat::default(),
             idle_threshold: Duration::from_secs(60),
             dim_repeated: true,
+            shift_enter: ShiftEnterPreference::default(),
             font_size: px(13.),
             line_height: px(20.),
             compact: false,
@@ -409,6 +418,24 @@ impl TerminalView {
             self.font_size = font_size;
             self.line_height = line_height;
             cx.notify();
+        }
+    }
+
+    pub fn set_shift_enter(&mut self, preference: ShiftEnterPreference) {
+        self.shift_enter = preference;
+    }
+
+    pub fn set_kitty_keyboard(&mut self, enabled: bool) {
+        self.keyboard.set_enabled(enabled);
+    }
+
+    pub fn set_synchronized_output(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.parser.sync_timeout().set_enabled(enabled);
+        if !enabled && self.parser.sync_timeout().deadline().is_some() {
+            self.sync_flush = None;
+            let now = Local::now();
+            self.finish_sync(now);
+            self.output_changed(now, cx);
         }
     }
 
@@ -485,7 +512,7 @@ impl TerminalView {
     pub fn end_session(&mut self, cx: &mut Context<Self>) {
         let now = Local::now();
         self.sync_flush = None;
-        if self.parser.sync_timeout().sync_timeout().is_some() {
+        if self.parser.sync_timeout().deadline().is_some() {
             self.finish_sync(now);
         }
         if self.mode().contains(TermMode::ALT_SCREEN) {
@@ -529,7 +556,7 @@ impl TerminalView {
         let mut offset = 0;
         for (end, marker) in self.scanner.scan(bytes) {
             self.advance(&bytes[offset..end], time);
-            if self.parser.sync_timeout().sync_timeout().is_some() {
+            if self.parser.sync_timeout().deadline().is_some() {
                 if self.sync_markers.len() < 256 {
                     self.sync_markers.push(marker);
                 }
@@ -545,11 +572,13 @@ impl TerminalView {
 
     fn advance(&mut self, bytes: &[u8], now: DateTime<Local>) {
         let inline_agent = self.agent_name().is_some();
+        let synchronized_output = self.parser.sync_timeout().enabled();
         self.parser.advance(
             &mut ParserHandler {
                 term: &mut self.term,
                 keyboard: &mut self.keyboard,
                 events: &self.events,
+                synchronized_output,
                 tracking: Some(Tracking {
                     timeline: &mut self.timeline,
                     reflow: &mut self.primary_snapshot,
@@ -567,7 +596,7 @@ impl TerminalView {
             bytes,
         );
         self.handle_terminal_events();
-        if self.parser.sync_timeout().sync_timeout().is_none() {
+        if self.parser.sync_timeout().deadline().is_none() {
             for marker in std::mem::take(&mut self.sync_markers) {
                 self.apply_marker(marker, now);
             }
@@ -602,7 +631,7 @@ impl TerminalView {
     }
 
     fn update_sync_timeout(&mut self, cx: &mut Context<Self>) {
-        let Some(deadline) = self.parser.sync_timeout().sync_timeout() else {
+        let Some(deadline) = self.parser.sync_timeout().deadline() else {
             self.sync_flush = None;
             return;
         };
@@ -619,7 +648,7 @@ impl TerminalView {
         let task = cx.spawn(async move |view, cx| {
             timer.await;
             let _ = view.update(cx, |view, cx| {
-                if view.parser.sync_timeout().sync_timeout() == Some(deadline) {
+                if view.parser.sync_timeout().deadline() == Some(deadline) {
                     let now = Local::now();
                     view.finish_sync(now);
                     view.output_changed(now, cx);
@@ -631,10 +660,12 @@ impl TerminalView {
 
     fn finish_sync(&mut self, now: DateTime<Local>) {
         let inline_agent = self.agent_name().is_some();
+        let synchronized_output = self.parser.sync_timeout().enabled();
         self.parser.stop_sync(&mut ParserHandler {
             term: &mut self.term,
             keyboard: &mut self.keyboard,
             events: &self.events,
+            synchronized_output,
             tracking: Some(Tracking {
                 timeline: &mut self.timeline,
                 reflow: &mut self.primary_snapshot,
@@ -649,6 +680,7 @@ impl TerminalView {
                 last_input: None,
             }),
         });
+        self.handle_terminal_events();
         for marker in std::mem::take(&mut self.sync_markers) {
             self.apply_marker(marker, now);
         }
@@ -726,7 +758,25 @@ impl TerminalView {
         self.send_input(bytes, cx);
     }
 
-    fn paste_clipboard(&mut self, item: ClipboardItem, cx: &mut Context<Self>) {
+    pub fn set_clipboard_preferences(
+        &mut self,
+        osc52_write: Osc52WritePreference,
+        confirm_multiline_paste: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.osc52_write = osc52_write;
+        self.confirm_multiline_paste = confirm_multiline_paste;
+        if osc52_write == Osc52WritePreference::Deny && self.clipboard_request.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn paste_clipboard(
+        &mut self,
+        item: ClipboardItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let text = item.text();
         if (text.is_none() || self.agent_name().is_some())
             && let Some(image) = item.into_entries().find_map(|entry| match entry {
@@ -739,7 +789,30 @@ impl TerminalView {
                 extension: image.format.extension(),
             });
         } else if let Some(text) = text {
-            self.send_draft(&text, false, cx);
+            if input::requires_paste_confirmation(
+                &text,
+                self.bracketed_paste_enabled(),
+                self.confirm_multiline_paste,
+            ) {
+                let view = cx.weak_entity();
+                let text = Rc::new(text);
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let view = view.clone();
+                    let text = text.clone();
+                    alert
+                        .confirm()
+                        .title("粘贴多行内容？")
+                        .description("当前终端程序未启用括号粘贴，内容中的换行可能会执行命令。")
+                        .ok_text("继续粘贴")
+                        .cancel_text("取消")
+                        .on_ok(move |_, _, cx| {
+                            let _ = view.update(cx, |view, cx| view.send_draft(&text, false, cx));
+                            true
+                        })
+                });
+            } else {
+                self.send_draft(&text, false, cx);
+            }
         }
     }
 
@@ -823,7 +896,7 @@ impl TerminalView {
                     self.push_notification(String::new());
                     continue;
                 }
-                Event::ClipboardStore(_, text) => {
+                Event::ClipboardStore(_, text) if self.osc52_write == Osc52WritePreference::Ask => {
                     self.clipboard_request = Some(text);
                     continue;
                 }
@@ -1135,10 +1208,6 @@ impl TerminalView {
             .then(|| self.term.selection_to_string())
             .flatten();
         let handled = match key.key.as_str() {
-            "f" if clipboard_shortcut => {
-                self.open_search(window, cx);
-                true
-            }
             "c" if clipboard_shortcut || copied.is_some() => {
                 if let Some(text) = copied {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1147,7 +1216,7 @@ impl TerminalView {
             }
             "v" if clipboard_shortcut => {
                 if let Some(item) = cx.read_from_clipboard() {
-                    self.paste_clipboard(item, cx);
+                    self.paste_clipboard(item, window, cx);
                 }
                 true
             }
@@ -1158,12 +1227,9 @@ impl TerminalView {
                 true
             }
             _ => {
-                if key.key == "enter"
-                    && !m.alt
-                    && !m.shift
-                    && !m.control
-                    && !m.platform
-                    && !self.raw()
+                let mode = self.mode();
+                if !self.raw()
+                    && input::is_line_enter(key, mode | self.keyboard.mode(mode), self.shift_enter)
                 {
                     self.timeline.start_fallback(Local::now());
                     if let Some((_, prompt)) = &self.prompt {
@@ -1189,7 +1255,9 @@ impl TerminalView {
 
     fn send_key(&mut self, key: &Keystroke, cx: &mut Context<Self>) -> bool {
         let mode = self.mode();
-        if let Some(bytes) = input::key_bytes(key, mode | self.keyboard.mode(mode)) {
+        if let Some(bytes) =
+            input::key_bytes(key, mode | self.keyboard.mode(mode), self.shift_enter)
+        {
             self.send_input(bytes, cx);
             true
         } else {
@@ -1697,10 +1765,10 @@ impl Render for TerminalView {
                             let _ = formatted.update(cx, |view, cx| view.copy_formatted(cx));
                         }),
                 )
-                .item(PopupMenuItem::new("粘贴").on_click(move |_, _, cx| {
+                .item(PopupMenuItem::new("粘贴").on_click(move |_, window, cx| {
                     let _ = paste.update(cx, |view, cx| {
                         if let Some(item) = cx.read_from_clipboard() {
-                            view.paste_clipboard(item, cx);
+                            view.paste_clipboard(item, window, cx);
                         }
                     });
                 }))
@@ -1749,8 +1817,8 @@ impl EntityInputHandler for TerminalView {
         cx.notify();
     }
 
-    fn paste(&mut self, item: ClipboardItem, _: &mut Window, cx: &mut Context<Self>) {
-        self.paste_clipboard(item, cx);
+    fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
+        self.paste_clipboard(item, window, cx);
     }
 
     fn replace_text_in_range(

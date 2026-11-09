@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 
 use super::ui::{Palette, button, col, input, row};
 use super::*;
+use crate::shortcuts::ShortcutAction;
 
 type Invoke = Rc<dyn Fn(&mut Workbench, &mut Window, &mut Context<Workbench>)>;
 
@@ -214,7 +215,10 @@ impl Workbench {
         let weak = cx.weak_entity();
         let window_id = window.window_handle().window_id();
         cx.intercept_keystrokes(move |event, window, cx| {
-            if window.window_handle().window_id() != window_id || window.has_active_dialog(cx) {
+            if window.window_handle().window_id() != window_id
+                || window.has_active_dialog(cx)
+                || event.input_preference == InputPreference::CharacterInput
+            {
                 return;
             }
             let handled = weak
@@ -228,50 +232,34 @@ impl Workbench {
     }
 
     fn shortcut(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(action) = self.settings.shortcuts.action(key) {
+            use ShortcutAction::*;
+            match action {
+                Palette => self.command_palette(window, cx),
+                NewSession => self.profile_dialog(None, window, cx),
+                DuplicateTab => self.duplicate_active(window, cx),
+                CloseTab => self.close_active(window, cx),
+                NextTab => self.cycle_tabs(false, window, cx),
+                PreviousTab => self.cycle_tabs(true, window, cx),
+                SearchTerminal if self.active_file_editor.is_none() => {
+                    self.search_terminal(window, cx);
+                }
+                FocusSender => self.focus_sender(window, cx),
+                ToggleGutters => self.toggle_gutters(None, cx),
+                ToggleFiles => self.toggle_left(cx),
+                ToggleSessions => self.toggle_right(cx),
+                ToggleTheme => self.toggle_theme(window, cx),
+                FocusMode => self.toggle_focus_mode(cx),
+                SaveFile if self.active_file_editor.is_some() => {
+                    self.save_active_file_editor(window, cx);
+                }
+                OpenSettings => self.settings_dialog(window, cx),
+                SenderHistory if self.sender_focused(window, cx) => self.history_picker(window, cx),
+                _ => return false,
+            }
+            return true;
+        }
         let m = key.modifiers;
-        let action = if cfg!(target_os = "macos") {
-            m.platform && !m.control && !m.shift
-        } else {
-            m.control && m.shift && !m.platform
-        };
-        let control = if cfg!(target_os = "macos") {
-            m.platform
-        } else {
-            m.control
-        };
-        if !m.alt && action {
-            match key.key.as_str() {
-                "p" => self.command_palette(window, cx),
-                "n" => self.profile_dialog(None, window, cx),
-                "t" => self.duplicate_active(window, cx),
-                "w" => self.close_active(window, cx),
-                "tab" if !cfg!(target_os = "macos") => self.cycle_tabs(true, window, cx),
-                "f" if self.active_file_editor.is_none() => self.search_terminal(window, cx),
-                "i" => self.focus_sender(window, cx),
-                "g" => self.toggle_gutters(None, cx),
-                "e" => self.toggle_left(cx),
-                "b" => self.toggle_right(cx),
-                "l" => self.toggle_theme(window, cx),
-                "enter" => self.toggle_focus_mode(cx),
-                "c" | "v" if cfg!(target_os = "macos") => return false,
-                _ => return false,
-            }
-            return true;
-        }
-        if !m.alt && control {
-            match key.key.as_str() {
-                "tab" => self.cycle_tabs(m.shift, window, cx),
-                "," if !m.shift => self.settings_dialog(window, cx),
-                "s" if !m.shift && self.active_file_editor.is_some() => {
-                    self.save_active_file_editor(window, cx)
-                }
-                "r" if !m.shift && self.sender_focused(window, cx) => {
-                    self.history_picker(window, cx)
-                }
-                _ => return false,
-            }
-            return true;
-        }
         if key.key == "enter"
             && !m.modified()
             && self.active_file_editor.is_none()
@@ -351,9 +339,12 @@ impl Workbench {
             })
             .collect::<Vec<_>>();
         items.extend([
-            Choice::new("新建会话", "Ctrl+Shift+N", IconName::Plus, |v, w, c| {
-                v.profile_dialog(None, w, c)
-            }),
+            Choice::new(
+                "新建会话",
+                self.settings.shortcuts.label(ShortcutAction::NewSession),
+                IconName::Plus,
+                |v, w, c| v.profile_dialog(None, w, c),
+            ),
             Choice::new(
                 "导入 SSH 配置",
                 "",
@@ -362,31 +353,36 @@ impl Workbench {
             ),
             Choice::new(
                 "设置",
-                "Ctrl+,",
+                self.settings.shortcuts.label(ShortcutAction::OpenSettings),
                 IconName::Settings,
                 Workbench::settings_dialog,
             ),
             Choice::new(
                 "搜索终端",
-                "Ctrl+Shift+F",
+                self.settings
+                    .shortcuts
+                    .label(ShortcutAction::SearchTerminal),
                 IconName::Search,
                 Workbench::search_terminal,
             ),
             Choice::new(
                 "切换主题",
-                "Ctrl+Shift+L",
+                self.settings.shortcuts.label(ShortcutAction::ToggleTheme),
                 IconName::Sun,
                 Workbench::toggle_theme,
             ),
             Choice::new(
                 "专注模式",
-                "Ctrl+Shift+Enter",
+                self.settings.shortcuts.label(ShortcutAction::FocusMode),
                 IconName::Maximize,
                 |v, _, c| v.toggle_focus_mode(c),
             ),
             Choice::new(
                 "命令历史",
-                "Ctrl+R（输入栏）",
+                format!(
+                    "{}（输入栏）",
+                    self.settings.shortcuts.label(ShortcutAction::SenderHistory)
+                ),
                 IconName::Clock,
                 |v, w, c| v.history_picker(w, c),
             ),
@@ -795,6 +791,7 @@ impl Workbench {
             self.file_prompt_ready(id, cx);
         }
         if let Some(note) = note
+            && self.settings.terminal_notifications != config::TerminalNotificationPreference::Off
             && (self.active != Some(id)
                 || !window.is_window_active()
                 || self.active_file_editor.is_some())
@@ -837,10 +834,13 @@ impl Workbench {
             .on_click(move |_, window, cx| {
                 let _ = weak.update(cx, |view, cx| view.select_tab(id, window, cx));
             });
-        let notification = if window.is_window_active() {
-            notification
-        } else {
+        let notification = if !window.is_window_active()
+            && self.settings.terminal_notifications
+                == config::TerminalNotificationPreference::InAppAndSystem
+        {
             notification.in_app_and_system()
+        } else {
+            notification
         };
         window.push_notification(notification, cx);
         cx.notify();

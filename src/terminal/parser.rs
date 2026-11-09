@@ -1,7 +1,11 @@
 //! Delegate VT actions to Alacritty while negotiating only the keyboard
 //! enhancement the frontend encodes.
 
-use std::{collections::VecDeque, time::Instant};
+use std::{
+    cell::Cell,
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use alacritty_terminal::{
     Term,
@@ -11,8 +15,9 @@ use alacritty_terminal::{
     term::TermMode,
     vte::ansi::{
         Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
-        KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode, Rgb,
-        StandardCharset, TabulationClearMode, cursor_icon::CursorIcon,
+        KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedPrivateMode,
+        PrivateMode, Rgb, StandardCharset, StdSyncHandler, TabulationClearMode, Timeout,
+        cursor_icon::CursorIcon,
     },
 };
 use chrono::{DateTime, Local};
@@ -26,17 +31,68 @@ const KEYBOARD_STACK_LIMIT: usize = 128;
 const SUPPORTED: KeyboardModes = KeyboardModes::DISAMBIGUATE_ESC_CODES;
 
 #[derive(Default)]
+// Gate VTE's buffering without filtering the PTY bytes or replacing its parser.
+pub(super) struct SyncTimeout {
+    disabled: Cell<bool>,
+    inner: StdSyncHandler,
+}
+
+impl SyncTimeout {
+    pub(super) fn enabled(&self) -> bool {
+        !self.disabled.get()
+    }
+
+    pub(super) fn set_enabled(&self, enabled: bool) {
+        self.disabled.set(!enabled);
+    }
+
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.inner.sync_timeout()
+    }
+}
+
+impl Timeout for SyncTimeout {
+    fn set_timeout(&mut self, duration: Duration) {
+        if self.enabled() {
+            self.inner.set_timeout(duration);
+        }
+    }
+
+    fn clear_timeout(&mut self) {
+        self.inner.clear_timeout();
+    }
+
+    fn pending_timeout(&self) -> bool {
+        self.inner.pending_timeout()
+    }
+}
+
+#[derive(Default)]
 struct KeyboardScreen {
     current: KeyboardModes,
     saved: VecDeque<KeyboardModes>,
 }
 
 #[derive(Default)]
-pub(super) struct KeyboardProtocol([KeyboardScreen; 2]);
+pub(super) struct KeyboardProtocol {
+    disabled: bool,
+    screens: [KeyboardScreen; 2],
+}
 
 impl KeyboardProtocol {
+    pub(super) fn set_enabled(&mut self, enabled: bool) {
+        if !enabled && !self.disabled {
+            self.reset();
+        }
+        self.disabled = !enabled;
+    }
+
+    fn reset(&mut self) {
+        self.screens = Default::default();
+    }
+
     pub(super) fn mode(&self, term_mode: TermMode) -> TermMode {
-        self.0[screen_index(term_mode)].current.into()
+        self.screens[screen_index(term_mode)].current.into()
     }
 }
 
@@ -48,6 +104,7 @@ pub(super) struct ParserHandler<'a> {
     pub(super) term: &'a mut Term<TerminalEvents>,
     pub(super) keyboard: &'a mut KeyboardProtocol,
     pub(super) events: &'a TerminalEvents,
+    pub(super) synchronized_output: bool,
     pub(super) tracking: Option<Tracking<'a>>,
 }
 
@@ -66,8 +123,11 @@ pub(super) struct Tracking<'a> {
 }
 
 impl ParserHandler<'_> {
-    fn keyboard_screen(&mut self) -> &mut KeyboardScreen {
-        &mut self.keyboard.0[screen_index(*self.term.mode())]
+    fn keyboard_screen(&mut self) -> Option<&mut KeyboardScreen> {
+        if self.keyboard.disabled {
+            return None;
+        }
+        Some(&mut self.keyboard.screens[screen_index(*self.term.mode())])
     }
 
     fn reset_input_run(&mut self) {
@@ -136,7 +196,6 @@ impl Handler for ParserHandler<'_> {
         fn set_mode(mode: Mode);
         fn unset_mode(mode: Mode);
         fn report_mode(mode: Mode);
-        fn report_private_mode(mode: PrivateMode);
         fn set_scrolling_region(top: usize, bottom: Option<usize>);
         fn set_keypad_application_mode();
         fn unset_keypad_application_mode();
@@ -333,9 +392,19 @@ impl Handler for ParserHandler<'_> {
         }
     }
 
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        self.reset_input_run();
+        if mode == NamedPrivateMode::SyncUpdate.into() && !self.synchronized_output {
+            self.events
+                .send_event(Event::PtyWrite("\x1b[?2026;0$y".into()));
+        } else {
+            self.term.report_private_mode(mode);
+        }
+    }
+
     fn reset_state(&mut self) {
         self.reset_input_run();
-        *self.keyboard = KeyboardProtocol::default();
+        self.keyboard.reset();
         self.term.reset_state();
         if let Some(track) = &mut self.tracking {
             track.timeline.reset();
@@ -349,13 +418,18 @@ impl Handler for ParserHandler<'_> {
     }
 
     fn report_keyboard_mode(&mut self) {
-        let flags = self.keyboard_screen().current.bits();
+        let Some(screen) = self.keyboard_screen() else {
+            return;
+        };
+        let flags = screen.current.bits();
         self.events
             .send_event(Event::PtyWrite(format!("\x1b[?{flags}u")));
     }
 
     fn push_keyboard_mode(&mut self, mode: KeyboardModes) {
-        let screen = self.keyboard_screen();
+        let Some(screen) = self.keyboard_screen() else {
+            return;
+        };
         if screen.saved.len() == KEYBOARD_STACK_LIMIT {
             screen.saved.pop_front();
         }
@@ -364,7 +438,9 @@ impl Handler for ParserHandler<'_> {
     }
 
     fn pop_keyboard_modes(&mut self, count: u16) {
-        let screen = self.keyboard_screen();
+        let Some(screen) = self.keyboard_screen() else {
+            return;
+        };
         let count = usize::from(count);
         if count == 0 {
             return;
@@ -377,7 +453,9 @@ impl Handler for ParserHandler<'_> {
     }
 
     fn set_keyboard_mode(&mut self, mode: KeyboardModes, apply: KeyboardModesApplyBehavior) {
-        let screen = self.keyboard_screen();
+        let Some(screen) = self.keyboard_screen() else {
+            return;
+        };
         let mode = mode & SUPPORTED;
         screen.current = match apply {
             KeyboardModesApplyBehavior::Replace => mode,
@@ -401,7 +479,7 @@ mod tests {
     struct TerminalFixture {
         events: TerminalEvents,
         term: Term<TerminalEvents>,
-        parser: Processor,
+        parser: Processor<SyncTimeout>,
         keyboard: KeyboardProtocol,
         timeline: Timeline,
         reflow: Option<Vec<Option<Stamp>>>,
@@ -441,31 +519,50 @@ mod tests {
         }
 
         fn feed(&mut self, bytes: &[u8], second: u32) {
+            self.process(Some(bytes), second);
+        }
+
+        fn process(&mut self, bytes: Option<&[u8]>, second: u32) {
             let now = Local.with_ymd_and_hms(2026, 11, 7, 10, 0, second).unwrap();
-            self.parser.advance(
-                &mut ParserHandler {
-                    term: &mut self.term,
-                    keyboard: &mut self.keyboard,
-                    events: &self.events,
-                    tracking: Some(Tracking {
-                        timeline: &mut self.timeline,
-                        reflow: &mut self.reflow,
-                        primary_log: &mut self.primary_log,
-                        timestamp_format: TimestampFormat::Seconds,
-                        reflowed: &mut self.reflowed,
-                        redraw: &mut self.redraw,
-                        fullscreen: &mut self.fullscreen,
-                        program: None,
-                        inline_agent: false,
-                        now,
-                        last_input: None,
-                    }),
-                },
-                bytes,
-            );
+            let mut handler = ParserHandler {
+                term: &mut self.term,
+                keyboard: &mut self.keyboard,
+                events: &self.events,
+                synchronized_output: self.parser.sync_timeout().enabled(),
+                tracking: Some(Tracking {
+                    timeline: &mut self.timeline,
+                    reflow: &mut self.reflow,
+                    primary_log: &mut self.primary_log,
+                    timestamp_format: TimestampFormat::Seconds,
+                    reflowed: &mut self.reflowed,
+                    redraw: &mut self.redraw,
+                    fullscreen: &mut self.fullscreen,
+                    program: None,
+                    inline_agent: false,
+                    now,
+                    last_input: None,
+                }),
+            };
+            if let Some(bytes) = bytes {
+                self.parser.advance(&mut handler, bytes);
+            } else {
+                self.parser.stop_sync(&mut handler);
+            }
             if !self.term.mode().contains(TermMode::ALT_SCREEN) {
                 self.timeline.output(self.term.grid(), now);
             }
+        }
+
+        fn replies(&self) -> Vec<String> {
+            self.events
+                .0
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    Event::PtyWrite(reply) => Some(reply.clone()),
+                    _ => None,
+                })
+                .collect()
         }
 
         fn stamp(&self, line: i32) -> (u64, String, bool) {
@@ -606,6 +703,7 @@ mod tests {
             term: &mut term,
             keyboard: &mut keyboard,
             events: &events,
+            synchronized_output: true,
             tracking: None,
         };
         parser.advance(&mut handler, b"\x1b[>3");
@@ -630,6 +728,65 @@ mod tests {
     }
 
     #[test]
+    fn disabling_kitty_clears_both_stacks_and_ignores_requests_until_renegotiated() {
+        let mut terminal = TerminalFixture::new(80, 6);
+        terminal.feed(b"\x1b[>1u\x1b[>0u\x1b[?1049h\x1b[>1u\x1b[>0u", 1);
+        terminal.keyboard.set_enabled(false);
+        terminal.feed(b"\x1b[>1u\x1b[=1u\x1b[?u", 2);
+        assert!(terminal.keyboard.mode(*terminal.term.mode()).is_empty());
+        assert!(terminal.replies().is_empty());
+
+        terminal.keyboard.set_enabled(true);
+        terminal.feed(b"\x1b[<u\x1b[?u\x1b[?1049l\x1b[<u\x1b[?u\x1b[>1u\x1b[?u", 3);
+        assert_eq!(terminal.replies(), ["\x1b[?0u", "\x1b[?0u", "\x1b[?1u"]);
+
+        terminal.keyboard.set_enabled(false);
+        terminal.feed(b"\x1bc\x1b[?u\x1b[>1u", 4);
+        assert_eq!(terminal.replies().len(), 3);
+        assert!(terminal.keyboard.mode(*terminal.term.mode()).is_empty());
+    }
+
+    #[test]
+    fn disabling_sync_flushes_pending_output_and_does_not_buffer_further_frames() {
+        let mut terminal = TerminalFixture::new(80, 6);
+        terminal.feed(b"\x1b[?2026$pfirst\x1b[?20", 1);
+        terminal.feed(b"26;25h-held\x1b[", 2);
+        assert_eq!(timeline::row_text(terminal.term.grid(), Line(0)), "first");
+        assert!(terminal.parser.sync_timeout().deadline().is_some());
+
+        terminal.parser.sync_timeout().set_enabled(false);
+        terminal.process(None, 3);
+        assert!(terminal.parser.sync_timeout().deadline().is_none());
+        assert_eq!(
+            timeline::row_text(terminal.term.grid(), Line(0)),
+            "first-held"
+        );
+
+        // Finish the CSI that straddled the setting change, then try a new frame.
+        terminal.feed(b"0m\x1b[?2026;1h-now\x1b[?2026$p", 4);
+        assert_eq!(
+            timeline::row_text(terminal.term.grid(), Line(0)),
+            "first-held-now"
+        );
+        assert!(terminal.parser.sync_timeout().deadline().is_none());
+        assert!(terminal.term.mode().contains(TermMode::APP_CURSOR));
+        assert_eq!(terminal.replies(), ["\x1b[?2026;2$y", "\x1b[?2026;0$y"]);
+
+        terminal.parser.sync_timeout().set_enabled(true);
+        terminal.feed(b"\x1b[?2026h-later", 5);
+        assert_eq!(
+            timeline::row_text(terminal.term.grid(), Line(0)),
+            "first-held-now"
+        );
+        terminal.feed(b"\x1b[?2026l", 6);
+        assert_eq!(
+            timeline::row_text(terminal.term.grid(), Line(0)),
+            "first-held-now-later"
+        );
+        assert!(terminal.parser.sync_timeout().deadline().is_none());
+    }
+
+    #[test]
     fn remote_keyboard_stack_is_bounded() {
         let events = TerminalEvents::default();
         let mut term = Term::new(Config::default(), &TerminalSize::default(), events.clone());
@@ -639,10 +796,14 @@ mod tests {
             term: &mut term,
             keyboard: &mut keyboard,
             events: &events,
+            synchronized_output: true,
             tracking: None,
         };
         parser.advance(&mut handler, &b"\x1b[>1u".repeat(4097));
-        assert_eq!(handler.keyboard_screen().saved.len(), KEYBOARD_STACK_LIMIT);
+        assert_eq!(
+            handler.keyboard_screen().unwrap().saved.len(),
+            KEYBOARD_STACK_LIMIT
+        );
         parser.advance(&mut handler, b"\x1b[<4097u");
         assert!(handler.keyboard.mode(*handler.term.mode()).is_empty());
     }
@@ -657,6 +818,7 @@ mod tests {
             term: &mut term,
             keyboard: &mut keyboard,
             events: &events,
+            synchronized_output: true,
             tracking: None,
         };
         parser.advance(&mut handler, b"\x1b[3");

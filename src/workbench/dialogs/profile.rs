@@ -147,12 +147,12 @@ impl ProfileForm {
                 profile.map_or_else(String::new, |p| p.identity_files.join("; ")),
             ),
             agent: control(
-                "使用系统 SSH Agent",
+                "使用全局 SSH Agent",
                 ssh.and_then(|ssh| ssh.identity_agent.clone())
                     .unwrap_or_default(),
             ),
             term: control(
-                "xterm-256color",
+                "使用全局终端类型",
                 ssh.and_then(|ssh| ssh.term.clone()).unwrap_or_default(),
             ),
             connect_timeout: control(
@@ -391,10 +391,7 @@ impl ProfileForm {
             ssh.identity_agent = Some(agent);
         }
         if !term.is_empty() {
-            ensure!(
-                !term.chars().any(|ch| ch.is_whitespace() || ch.is_control()),
-                "终端类型不能包含空格或控制字符。"
-            );
+            config::validate_terminal_type(&term)?;
             ssh.term = Some(term);
         }
         if !timeout.is_empty() {
@@ -1310,7 +1307,7 @@ impl Workbench {
                             palette,
                         ))
                         .child(description_text(
-                            "留空使用系统 Agent，输入 none 禁用，也可填写本机套接字路径。",
+                            "留空使用全局 SSH Agent，输入 none 禁用，也可填写本机套接字或命名管道。",
                             palette,
                         ))
                         .child(
@@ -1356,7 +1353,7 @@ impl Workbench {
                         palette,
                     ))
                     .child(description_text(
-                        "留空使用 xterm-256color。会同时尝试发送 COLORTERM=truecolor。",
+                        "留空使用全局 SSH 终端类型。会同时尝试发送 COLORTERM=truecolor。",
                         palette,
                     ))
                     .child(field(

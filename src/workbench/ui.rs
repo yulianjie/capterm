@@ -14,6 +14,7 @@ use std::{
 use super::{Drawer, Phase, SendTarget, Session, Tab, Workbench};
 use crate::config::{ConnectionProfile, Settings};
 use crate::local::LocalShell;
+use crate::shortcuts::ShortcutAction;
 use crate::ssh::HopStage;
 
 #[derive(Clone, Copy)]
@@ -119,10 +120,7 @@ pub(super) fn install_theme(cx: &mut App) {
             include_bytes!("../../assets/fonts/MapleMono-NF-CN-Regular.ttf").as_slice(),
         ),
     ] {
-        if installed_fonts
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(family))
-        {
+        if font_family_index(&installed_fonts, family).is_some() {
             continue;
         }
         if let Err(error) = cx
@@ -132,6 +130,12 @@ pub(super) fn install_theme(cx: &mut App) {
             eprintln!("Unable to register CapTerm font: {error}");
         }
     }
+}
+
+pub(super) fn font_family_index(fonts: &[impl AsRef<str>], requested: &str) -> Option<usize> {
+    fonts
+        .iter()
+        .position(|family| family.as_ref().eq_ignore_ascii_case(requested))
 }
 
 pub(super) fn apply_theme(settings: &Settings, cx: &mut App) {
@@ -147,7 +151,8 @@ pub(super) fn apply_theme(settings: &Settings, cx: &mut App) {
     if settings.ui_font_family.is_some() || settings.mono_font_family.is_some() {
         let fonts = cx.text_system().all_font_names();
         let available = |requested: Option<&str>| {
-            requested.and_then(|name| fonts.iter().find(|font| font.eq_ignore_ascii_case(name)))
+            let index = font_family_index(&fonts, requested?)?;
+            Some(&fonts[index])
         };
         Theme::update(cx, |theme| {
             if let Some(family) = available(settings.ui_font_family.as_deref()) {
@@ -208,13 +213,14 @@ pub(super) fn primary(
 pub(super) fn tool(
     id: impl Into<ElementId>,
     glyph: impl Into<SharedString>,
-    title: &'static str,
+    title: impl Into<SharedString>,
     p: Palette,
 ) -> Button {
+    let title = title.into();
     Button::new(id)
         .ghost()
         .label(glyph)
-        .accessibility_label(title)
+        .accessibility_label(title.clone())
         .tooltip(title)
         .h(px(26.))
         .min_w(px(26.))
@@ -242,7 +248,7 @@ fn app_icon() -> Arc<Image> {
 pub(super) fn icon_tool(
     id: impl Into<ElementId>,
     name: IconName,
-    title: &'static str,
+    title: impl Into<SharedString>,
     p: Palette,
 ) -> Button {
     sized_icon_tool(id, name, title, 14., 24., p)
@@ -251,7 +257,7 @@ pub(super) fn icon_tool(
 pub(super) fn chrome_icon_tool(
     id: impl Into<ElementId>,
     name: IconName,
-    title: &'static str,
+    title: impl Into<SharedString>,
     p: Palette,
 ) -> Button {
     sized_icon_tool(id, name, title, 16., 28., p)
@@ -269,17 +275,18 @@ pub(super) fn tab_close_tool(
 fn sized_icon_tool(
     id: impl Into<ElementId>,
     name: IconName,
-    title: &'static str,
+    title: impl Into<SharedString>,
     glyph_size: f32,
     hit_size: f32,
     p: Palette,
 ) -> Button {
     // Button::icon applies the button's sizing preset to the glyph. Keep the
     // Lucide glyph at the design size independently of its hit target.
+    let title = title.into();
     Button::new(id)
         .ghost()
         .child(Icon::new(name).size(px(glyph_size)))
-        .accessibility_label(title)
+        .accessibility_label(title.clone())
         .tooltip(title)
         .size(px(hit_size))
         .min_w(px(hit_size))
@@ -534,11 +541,6 @@ impl Workbench {
     }
 
     fn top(&self, p: Palette, mono: SharedString, width: Pixels, cx: &Context<Self>) -> TitleBar {
-        let shortcuts = if cfg!(target_os = "macos") {
-            &["⌘", "P"][..]
-        } else {
-            &["Ctrl", "Shift", "P"][..]
-        };
         let logo = img(app_icon()).size(px(22.)).flex_shrink_0();
         TitleBar::new()
             .h(px(40.))
@@ -593,19 +595,18 @@ impl Workbench {
                             .child("搜索会话、命令，或输入 user@host 快速连接"),
                     )
                     .when(width >= px(800.), |el| {
-                        el.child(row().gap(px(3.)).font_family(mono).children(
-                            shortcuts.iter().map(|key| {
-                                div()
-                                    .text_size(px(10.))
-                                    .px(px(4.))
-                                    .rounded(px(4.))
-                                    .border_1()
-                                    .border_color(p.line)
-                                    .bg(p.raised)
-                                    .text_color(p.muted)
-                                    .child(*key)
-                            }),
-                        ))
+                        el.child(
+                            div()
+                                .font_family(mono)
+                                .text_size(px(10.))
+                                .px(px(4.))
+                                .rounded(px(4.))
+                                .border_1()
+                                .border_color(p.line)
+                                .bg(p.raised)
+                                .text_color(p.muted)
+                                .child(self.settings.shortcuts.label(ShortcutAction::Palette)),
+                        )
                     })
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, window, cx| this.command_palette(window, cx))),
@@ -626,7 +627,9 @@ impl Workbench {
                                 chrome_icon_tool(
                                     "toggle-files",
                                     IconName::PanelLeft,
-                                    "文件面板 · Ctrl+Shift+E",
+                                    self.settings
+                                        .shortcuts
+                                        .with_label(ShortcutAction::ToggleFiles, "文件面板"),
                                     p,
                                 )
                                 .when(
@@ -640,7 +643,9 @@ impl Workbench {
                                 chrome_icon_tool(
                                     "toggle-sessions",
                                     IconName::PanelRight,
-                                    "会话与监控 · Ctrl+Shift+B",
+                                    self.settings
+                                        .shortcuts
+                                        .with_label(ShortcutAction::ToggleSessions, "会话与监控"),
                                     p,
                                 )
                                 .when(self.right_visible, |el| el.text_color(p.accent))
@@ -655,7 +660,9 @@ impl Workbench {
                                     } else {
                                         IconName::Sun
                                     },
-                                    "切换主题 · Ctrl+Shift+L",
+                                    self.settings
+                                        .shortcuts
+                                        .with_label(ShortcutAction::ToggleTheme, "切换主题"),
                                     p,
                                 )
                                 .on_click(
@@ -697,7 +704,9 @@ impl Workbench {
                                 chrome_icon_tool(
                                     "open-settings",
                                     IconName::Settings,
-                                    "设置 · Ctrl+,",
+                                    self.settings
+                                        .shortcuts
+                                        .with_label(ShortcutAction::OpenSettings, "设置"),
                                     p,
                                 )
                                 .on_click(cx.listener(
@@ -816,7 +825,9 @@ impl Workbench {
                                 } else {
                                     IconName::Maximize
                                 },
-                                "专注模式 · Ctrl+Shift+Enter",
+                                self.settings
+                                    .shortcuts
+                                    .with_label(ShortcutAction::FocusMode, "专注模式"),
                                 p,
                             )
                             .when(self.focus_mode, |el| el.bg(p.tint))
@@ -1242,7 +1253,9 @@ impl Workbench {
                             icon_tool(
                                 "route-search",
                                 IconName::ListFilter,
-                                "搜索终端 · Ctrl+Shift+F",
+                                self.settings
+                                    .shortcuts
+                                    .with_label(ShortcutAction::SearchTerminal, "搜索终端"),
                                 p,
                             )
                             .disabled(tab.is_none())
@@ -1397,7 +1410,9 @@ impl Workbench {
                     tool(
                         "expand-sender",
                         "展开输入栏",
-                        "聚焦输入栏 · Ctrl+Shift+I",
+                        self.settings
+                            .shortcuts
+                            .with_label(ShortcutAction::FocusSender, "聚焦输入栏"),
                         p,
                     )
                     .on_click(cx.listener(|view, _, window, cx| view.focus_sender(window, cx))),
@@ -1518,11 +1533,16 @@ impl Workbench {
                         ),
                 )
                 .child(
-                    icon_tool("sender-history", IconName::Clock, "命令历史 · Ctrl+R", p)
-                        .mb(px(2.))
-                        .on_click(
-                            cx.listener(|view, _, window, cx| view.history_picker(window, cx)),
-                        ),
+                    icon_tool(
+                        "sender-history",
+                        IconName::Clock,
+                        self.settings
+                            .shortcuts
+                            .with_label(ShortcutAction::SenderHistory, "命令历史"),
+                        p,
+                    )
+                    .mb(px(2.))
+                    .on_click(cx.listener(|view, _, window, cx| view.history_picker(window, cx))),
                 )
             });
         col()
@@ -1677,7 +1697,9 @@ impl Workbench {
                                 icon_tool(
                                     "new-session",
                                     IconName::Plus,
-                                    "新建会话 · Ctrl+Shift+N",
+                                    self.settings
+                                        .shortcuts
+                                        .with_label(ShortcutAction::NewSession, "新建会话"),
                                     p,
                                 )
                                 .on_click(cx.listener(
@@ -2114,11 +2136,7 @@ impl Workbench {
         } else if let Some(tab) = tab {
             let size = tab.terminal.read(cx).size();
             if width >= px(710.) {
-                let kind = tab
-                    .ssh_profile()
-                    .and_then(|profile| profile.ssh.term.as_deref())
-                    .unwrap_or("xterm-256color");
-                status = status.child(status_field(kind.to_owned(), None, false, p));
+                status = status.child(status_field(tab.terminal_type.clone(), None, false, p));
             }
             status = status
                 .child(status_field(

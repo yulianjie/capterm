@@ -174,10 +174,16 @@ pub enum ShellEvent {
     Error(String),
 }
 
+pub struct HostKeySettings {
+    pub path: PathBuf,
+    pub require_known: bool,
+}
+
 struct HostVerifier {
     host: String,
     port: u16,
     known_hosts: PathBuf,
+    require_known_host: bool,
     trust: mpsc::UnboundedSender<ConnectionPrompt>,
     route: Vec<String>,
     temporary_pin: Option<PublicKey>,
@@ -270,6 +276,12 @@ impl client::Handler for HostVerifier {
             let _ = self.persistent_key.set(key.clone());
             return Ok(true);
         }
+        ensure!(
+            !self.require_known_host,
+            "主机 {0}:{1} 的密钥未在 known_hosts 中验证",
+            self.host,
+            self.port
+        );
         let previous_fingerprints = known
             .iter()
             .map(|(_, key)| key.fingerprint(HashAlg::Sha256).to_string())
@@ -448,13 +460,17 @@ impl Connection {
         known_hosts: PathBuf,
         trust: mpsc::UnboundedSender<ConnectionPrompt>,
     ) -> Result<Self> {
-        Self::connect_with_progress(profile, password, known_hosts, trust, true, |_| {}).await
+        let host_keys = HostKeySettings {
+            path: known_hosts,
+            require_known: false,
+        };
+        Self::connect_with_progress(profile, password, host_keys, trust, true, |_| {}).await
     }
 
     pub async fn connect_with_progress(
         profile: &ConnectionProfile,
         password: Option<String>,
-        known_hosts: PathBuf,
+        host_keys: HostKeySettings,
         trust: mpsc::UnboundedSender<ConnectionPrompt>,
         reuse_jumps: bool,
         progress: impl Fn(HopProgress) + Send + Sync + 'static,
@@ -512,7 +528,7 @@ impl Connection {
                 && proxy_command.is_none()
                 && network_proxy.is_none()
             {
-                JumpKey::new(&known_hosts, &profile.jumps[..=index])
+                JumpKey::new(&host_keys.path, &profile.jumps[..=index])
             } else {
                 None
             };
@@ -580,7 +596,8 @@ impl Connection {
                 let verifier = HostVerifier {
                     host: host.clone(),
                     port: hop.port,
-                    known_hosts: known_hosts.clone(),
+                    known_hosts: host_keys.path.clone(),
+                    require_known_host: host_keys.require_known,
                     trust: trust.clone(),
                     route: route.clone(),
                     temporary_pin: None,
@@ -774,7 +791,10 @@ impl Connection {
             channel
                 .request_pty(
                     true,
-                    self.ssh.term.as_deref().unwrap_or("xterm-256color"),
+                    self.ssh
+                        .term
+                        .as_deref()
+                        .unwrap_or(crate::config::DEFAULT_TERMINAL_TYPE),
                     u32::from(columns.max(1)),
                     u32::from(rows.max(1)),
                     0,
@@ -1856,6 +1876,7 @@ mod tests {
             host: "fixture".into(),
             port: 22,
             known_hosts: known_hosts.clone(),
+            require_known_host: true,
             trust,
             route: vec!["fixture@fixture:22".into()],
             temporary_pin: None,
@@ -1869,6 +1890,14 @@ mod tests {
             network_timeout: NETWORK_TIMEOUT,
         };
         let first = PublicKeyOrCertificate::from(fixture_key(20)?.public_key().clone());
+        let refused = timeout(
+            Duration::from_secs(1),
+            client::Handler::check_server_key(&mut verifier, &first),
+        )
+        .await?;
+        assert!(refused.unwrap_err().to_string().contains("known_hosts"));
+        assert!(requests.try_recv().is_err());
+        verifier.require_known_host = false;
         let approve = tokio::spawn(async move {
             let ConnectionPrompt::HostKey(request) =
                 requests.recv().await.expect("first host key prompt")
@@ -1948,7 +1977,10 @@ mod tests {
         let connect = Connection::connect_with_progress(
             &profile,
             Some("fixture-password".into()),
-            known_hosts.clone(),
+            HostKeySettings {
+                path: known_hosts.clone(),
+                require_known: false,
+            },
             trust.clone(),
             true,
             move |hop| progress.lock().unwrap().push(hop),
@@ -2152,7 +2184,10 @@ mod tests {
             Connection::connect_with_progress(
                 &second_profile,
                 Some("fixture-password".into()),
-                known_hosts.clone(),
+                HostKeySettings {
+                    path: known_hosts.clone(),
+                    require_known: false,
+                },
                 trust.clone(),
                 false,
                 |_| {},
@@ -2191,7 +2226,10 @@ mod tests {
         let reconnect = Connection::connect_with_progress(
             &profile,
             Some("fixture-password".into()),
-            known_hosts.clone(),
+            HostKeySettings {
+                path: known_hosts.clone(),
+                require_known: false,
+            },
             trust.clone(),
             true,
             move |hop| progress.lock().unwrap().push(hop),

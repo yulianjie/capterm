@@ -24,8 +24,8 @@ use tokio::task::AbortHandle;
 use crate::config::{self, AuthMethod, ConnectionProfile, Settings, ThemePreference};
 use crate::local::{self, LocalShell};
 use crate::ssh::{
-    Connection, ConnectionPrompt, HopProgress, HopStage, Metrics, PasswordRejected, ShellCommand,
-    ShellEvent,
+    Connection, ConnectionPrompt, HopProgress, HopStage, HostKeySettings, Metrics,
+    PasswordRejected, ShellCommand, ShellEvent,
 };
 use crate::terminal::highlight::{BUNDLED, LinuxHighlights};
 use crate::terminal::{ClipboardImage, TerminalCommand, TerminalSize, TerminalView};
@@ -172,6 +172,7 @@ struct Tab {
     id: u64,
     operation_id: u64,
     session: Session,
+    terminal_type: String,
     ssh_password_auth: bool,
     ssh_password_rejected: bool,
     phase: Phase,
@@ -436,11 +437,36 @@ impl Workbench {
         };
         match result {
             Ok(()) => {
+                let numbers_changed = self.settings.show_line_numbers != settings.show_line_numbers;
+                let timestamps_changed = self.settings.show_timestamps != settings.show_timestamps;
+                let concurrency_changed =
+                    self.settings.transfer_concurrency != settings.transfer_concurrency;
+                let monitor_pause_changed = self.settings.monitor_pause_in_background
+                    != settings.monitor_pause_in_background;
                 self.settings = settings;
                 self.monitor_interval.store(
                     self.settings.monitor_interval.clamp(1, 60),
                     Ordering::Relaxed,
                 );
+                if numbers_changed || timestamps_changed {
+                    for tab in &mut self.tabs {
+                        if numbers_changed {
+                            tab.line_numbers = self.settings.show_line_numbers;
+                        }
+                        if timestamps_changed {
+                            tab.timestamps = self.settings.show_timestamps;
+                        }
+                        tab.terminal.update(cx, |term, cx| {
+                            term.set_gutters(tab.line_numbers, tab.timestamps, cx);
+                        });
+                    }
+                }
+                if concurrency_changed {
+                    self.schedule_transfers(cx);
+                }
+                if monitor_pause_changed {
+                    self.set_monitored_tab(self.active);
+                }
                 cx.notify();
                 true
             }
@@ -493,9 +519,7 @@ impl Workbench {
     }
 
     fn apply_terminal_preferences(&mut self, cx: &mut Context<Self>) {
-        for tab in &mut self.tabs {
-            tab.line_numbers = self.settings.show_line_numbers;
-            tab.timestamps = self.settings.show_timestamps;
+        for tab in &self.tabs {
             tab.terminal.update(cx, |term, cx| {
                 configure_terminal(
                     term,
@@ -568,7 +592,11 @@ impl Workbench {
     fn set_monitored_tab(&self, id: Option<u64>) {
         let monitored = id
             .and_then(|id| self.tab(id))
-            .filter(|tab| self.window_active && !tab.is_local() && !tab.monitor_state.paused)
+            .filter(|tab| {
+                (self.window_active || !self.settings.monitor_pause_in_background)
+                    && !tab.is_local()
+                    && !tab.monitor_state.paused
+            })
             .map(|tab| tab.operation_id);
         self.monitored_operation.send_if_modified(|current| {
             if *current == monitored {
@@ -649,7 +677,7 @@ impl Workbench {
         } else {
             password
         };
-        let known_hosts = match config::known_hosts() {
+        let host_keys = match self.ssh_host_keys() {
             Ok(path) => path,
             Err(error) => {
                 self.announce(format!("无法打开已知主机文件：{error:#}"), cx);
@@ -670,7 +698,7 @@ impl Workbench {
                     id,
                     target,
                     password,
-                    known_hosts,
+                    host_keys,
                     reuse_jumps,
                     initial,
                     events,
@@ -722,7 +750,7 @@ impl Workbench {
         let Some(mut profile) = tab.ssh_profile().cloned() else {
             return;
         };
-        let known_hosts = match config::known_hosts() {
+        let host_keys = match self.ssh_host_keys() {
             Ok(path) => path,
             Err(error) => {
                 self.announce(format!("无法打开已知主机文件：{error:#}"), cx);
@@ -733,6 +761,7 @@ impl Workbench {
         let mut target = profile.clone();
         self.settings.apply_ssh_defaults(&mut target);
         let reuse_jumps = self.settings.reuse_jumps;
+        let terminal_type = self.settings.terminal_type(&profile).to_owned();
         let session = Session::Ssh(profile);
         let initial = tab.link.size.get();
         let link = Rc::new(TerminalLink::default());
@@ -750,6 +779,7 @@ impl Workbench {
         tab.phase = Phase::Connecting;
         tab.ssh_password_rejected = false;
         tab.session = session;
+        tab.terminal_type = terminal_type;
         tab.link = link;
         tab.terminal = terminal;
         tab.observed_terminal = TerminalObservation::default();
@@ -765,7 +795,7 @@ impl Workbench {
                 operation_id,
                 target,
                 password,
-                known_hosts,
+                host_keys,
                 reuse_jumps,
                 initial,
                 events,
@@ -835,6 +865,11 @@ impl Workbench {
         terminal.update(cx, |terminal, cx| {
             terminal.set_light(self.settings.light, cx);
             terminal.set_compact(self.compact, cx);
+            terminal.set_gutters(
+                self.settings.show_line_numbers,
+                self.settings.show_timestamps,
+                cx,
+            );
             configure_terminal(
                 terminal,
                 &self.settings,
@@ -885,12 +920,17 @@ impl Workbench {
             });
         let initial = terminal.read(cx).size();
         let operation = self.runtime.spawn(run(id, initial, self.events.clone()));
-        let (history_key, saved_history) = match &session {
+        let (history_key, saved_history, terminal_type) = match &session {
             Session::Ssh(profile) => (
                 format!("ssh:{}", profile.id),
                 self.settings.sender_history.get(&profile.id),
+                self.settings.terminal_type(profile).to_owned(),
             ),
-            Session::Local(shell) => (format!("local:{}", shell.label()), None),
+            Session::Local(shell) => (
+                format!("local:{}", shell.label()),
+                None,
+                config::DEFAULT_TERMINAL_TYPE.to_owned(),
+            ),
         };
         let command_history = self
             .sender_histories
@@ -901,6 +941,7 @@ impl Workbench {
             id,
             operation_id: id,
             session,
+            terminal_type,
             ssh_password_auth,
             ssh_password_rejected: false,
             phase: Phase::Connecting,
@@ -990,7 +1031,7 @@ impl Workbench {
             self.announce("此会话正在测试连接", cx);
             return false;
         }
-        let known_hosts = match config::known_hosts() {
+        let host_keys = match self.ssh_host_keys() {
             Ok(path) => path,
             Err(error) => {
                 self.announce(format!("无法打开已知主机文件：{error:#}"), cx);
@@ -1005,7 +1046,7 @@ impl Workbench {
         let reuse_jumps = self.settings.reuse_jumps;
         let events = self.events.clone();
         let task = self.runtime.spawn(async move {
-            let result = establish(id, &target, password, known_hosts, reuse_jumps, &events).await;
+            let result = establish(id, &target, password, host_keys, reuse_jumps, &events).await;
             let result = match result {
                 Ok(connection) => {
                     let _ = connection.disconnect().await;
@@ -1027,6 +1068,13 @@ impl Workbench {
             },
         );
         true
+    }
+
+    fn ssh_host_keys(&self) -> anyhow::Result<HostKeySettings> {
+        Ok(HostKeySettings {
+            path: config::known_hosts()?,
+            require_known: self.settings.ssh_require_known_host,
+        })
     }
 
     fn test_progress(&self, profile: &str, hop: usize) -> Option<&HopProgress> {
@@ -1332,7 +1380,9 @@ fn configure_terminal(
 ) {
     let family = Theme::global(cx).mono_font_family.clone();
     terminal.set_font_family(Some(family.as_str()), cx);
-    terminal.set_gutters(settings.show_line_numbers, settings.show_timestamps, cx);
+    terminal.set_shift_enter(settings.shift_enter);
+    terminal.set_kitty_keyboard(settings.kitty_keyboard);
+    terminal.set_synchronized_output(settings.synchronized_output, cx);
     terminal.set_font_metrics(
         settings.terminal_font_size,
         settings.terminal_line_height,
@@ -1348,18 +1398,19 @@ fn configure_terminal(
         && matches!(session, Session::Ssh(_) | Session::Local(LocalShell::Wsl)))
     .then(|| linux_highlights.clone());
     terminal.set_linux_highlights(highlights, cx);
+    terminal.set_clipboard_preferences(settings.osc52_write, settings.confirm_multiline_paste, cx);
 }
 
 async fn run_ssh(
     id: u64,
     target: ConnectionProfile,
     password: Option<String>,
-    known_hosts: std::path::PathBuf,
+    host_keys: HostKeySettings,
     reuse_jumps: bool,
     initial: TerminalSize,
     events: async_channel::Sender<Event>,
 ) {
-    match establish(id, &target, password, known_hosts, reuse_jumps, &events).await {
+    match establish(id, &target, password, host_keys, reuse_jumps, &events).await {
         Ok(connection) => run_shell(id, Arc::new(connection), initial, &events).await,
         Err(error) => {
             let event = if error.is::<PasswordRejected>() {
@@ -1376,7 +1427,7 @@ async fn establish(
     id: u64,
     profile: &ConnectionProfile,
     password: Option<String>,
-    known_hosts: std::path::PathBuf,
+    host_keys: HostKeySettings,
     reuse_jumps: bool,
     events: &async_channel::Sender<Event>,
 ) -> anyhow::Result<Connection> {
@@ -1385,7 +1436,7 @@ async fn establish(
     let connect = Connection::connect_with_progress(
         profile,
         password,
-        known_hosts,
+        host_keys,
         sender,
         reuse_jumps,
         move |progress| {

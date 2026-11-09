@@ -5,6 +5,7 @@ mod credentials;
 mod file_text;
 mod local;
 mod platform;
+mod shortcuts;
 mod ssh;
 mod terminal;
 mod workbench;

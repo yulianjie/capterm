@@ -1,5 +1,14 @@
+use crate::config::ShiftEnterPreference;
 use alacritty_terminal::term::TermMode;
 use gpui_kit::{Keystroke, Modifiers, MouseButton};
+
+pub(super) fn requires_paste_confirmation(
+    text: &str,
+    bracketed: bool,
+    confirm_multiline: bool,
+) -> bool {
+    confirm_multiline && !bracketed && text.contains(['\r', '\n'])
+}
 
 pub(super) fn paste(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
@@ -15,7 +24,26 @@ fn modifier_parameter(m: Modifiers) -> u8 {
     1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(m.control)
 }
 
-pub(super) fn key_bytes(key: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+pub(super) fn is_line_enter(
+    key: &Keystroke,
+    mode: TermMode,
+    shift_enter: ShiftEnterPreference,
+) -> bool {
+    let m = key.modifiers;
+    key.key == "enter"
+        && !m.control
+        && !m.alt
+        && !m.platform
+        && (!m.shift
+            || (shift_enter == ShiftEnterPreference::Enter
+                && !mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)))
+}
+
+pub(super) fn key_bytes(
+    key: &Keystroke,
+    mode: TermMode,
+    shift_enter: ShiftEnterPreference,
+) -> Option<Vec<u8>> {
     let m = key.modifiers;
     if m.platform {
         return None;
@@ -78,7 +106,15 @@ pub(super) fn key_bytes(key: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
         });
     } else {
         match key_name {
-            "enter" if m.shift || m.control || m.alt => return Some(b"\x1b\r".to_vec()),
+            "enter"
+                if m.shift
+                    && !m.control
+                    && !m.alt
+                    && shift_enter == ShiftEnterPreference::LineFeed =>
+            {
+                return Some(vec![b'\n']);
+            }
+            "enter" if !is_line_enter(key, mode, shift_enter) => return Some(b"\x1b\r".to_vec()),
             "enter" if mode.contains(TermMode::LINE_FEED_NEW_LINE) => b"\r\n".to_vec(),
             "enter" => vec![b'\r'],
             "tab" if m.shift => return Some(b"\x1b[Z".to_vec()),
@@ -197,36 +233,60 @@ pub(super) fn mouse_bytes(
 mod tests {
     use super::*;
 
+    fn default_key_bytes(key: &Keystroke, mode: TermMode) -> Vec<u8> {
+        key_bytes(key, mode, ShiftEnterPreference::default()).unwrap()
+    }
+
     #[test]
     fn encodes_application_cursor_and_modifiers() {
         let key = Keystroke::parse("up").unwrap();
-        assert_eq!(key_bytes(&key, TermMode::APP_CURSOR).unwrap(), b"\x1bOA");
+        assert_eq!(default_key_bytes(&key, TermMode::APP_CURSOR), b"\x1bOA");
         let key = Keystroke::parse("ctrl-left").unwrap();
-        assert_eq!(key_bytes(&key, TermMode::APP_CURSOR).unwrap(), b"\x1b[1;5D");
+        assert_eq!(default_key_bytes(&key, TermMode::APP_CURSOR), b"\x1b[1;5D");
         let key = Keystroke::parse("ctrl-c").unwrap();
-        assert_eq!(key_bytes(&key, TermMode::empty()).unwrap(), b"\x03");
+        assert_eq!(default_key_bytes(&key, TermMode::empty()), b"\x03");
     }
 
     #[test]
     fn disambiguates_modified_enter_and_escape_only_when_negotiated() {
         let mode = TermMode::DISAMBIGUATE_ESC_CODES;
         let key = Keystroke::parse("shift-enter").unwrap();
-        assert_eq!(key_bytes(&key, mode).unwrap(), b"\x1b[13;2u");
-        assert_eq!(key_bytes(&key, TermMode::empty()).unwrap(), b"\x1b\r");
+        assert_eq!(default_key_bytes(&key, mode), b"\x1b[13;2u");
+        assert_eq!(default_key_bytes(&key, TermMode::empty()), b"\x1b\r");
+        for (preference, expected) in [
+            (ShiftEnterPreference::Enter, b"\r"),
+            (ShiftEnterPreference::LineFeed, b"\n"),
+        ] {
+            assert_eq!(
+                key_bytes(&key, TermMode::empty(), preference).unwrap(),
+                expected
+            );
+            assert_eq!(key_bytes(&key, mode, preference).unwrap(), b"\x1b[13;2u");
+        }
         let key = Keystroke::parse("enter").unwrap();
-        assert_eq!(key_bytes(&key, mode).unwrap(), b"\r");
+        assert_eq!(default_key_bytes(&key, mode), b"\r");
         let key = Keystroke::parse("escape").unwrap();
-        assert_eq!(key_bytes(&key, mode).unwrap(), b"\x1b[27u");
+        assert_eq!(default_key_bytes(&key, mode), b"\x1b[27u");
         let key = Keystroke::parse("ctrl-c").unwrap();
-        assert_eq!(key_bytes(&key, mode).unwrap(), b"\x1b[99;5u");
+        assert_eq!(default_key_bytes(&key, mode), b"\x1b[99;5u");
         let key = Keystroke::parse("f3").unwrap();
-        assert_eq!(key_bytes(&key, mode).unwrap(), b"\x1b[13~");
+        assert_eq!(default_key_bytes(&key, mode), b"\x1b[13~");
     }
 
     #[test]
     fn brackets_paste_and_strips_escape_bytes() {
         assert_eq!(paste("a\n\x1bb", true), b"\x1b[200~a\nb\x1b[201~",);
         assert_eq!(paste("a\r\nb\nc", false), b"a\rb\rc");
+    }
+
+    #[test]
+    fn confirms_only_direct_unbracketed_pastes_with_line_breaks() {
+        for text in ["one\ntwo", "one\r\ntwo", "one\rtwo", "one\n"] {
+            assert!(requires_paste_confirmation(text, false, true));
+            assert!(!requires_paste_confirmation(text, true, true));
+            assert!(!requires_paste_confirmation(text, false, false));
+        }
+        assert!(!requires_paste_confirmation("one line", false, true));
     }
 
     #[test]

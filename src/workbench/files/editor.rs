@@ -10,6 +10,7 @@ use similar::TextDiff;
 
 use super::browser::{byte_size, file_icon, file_time, short_time, small_icon};
 use super::*;
+use crate::shortcuts::ShortcutAction;
 use crate::workbench::ui::{Palette, button, col, primary, row, tab_close_tool};
 
 const FULL_EDITOR_BYTES: usize = 256 * 1024;
@@ -542,7 +543,9 @@ impl Workbench {
         .flex_shrink_0()
         .text_size(px(12.))
         .icon(small_icon(IconName::Save, palette.primary_text))
-        .child(Kbd::new(Keystroke::parse("ctrl-s").unwrap()))
+        .child(Kbd::new(
+            self.settings.shortcuts.keystroke(ShortcutAction::SaveFile),
+        ))
         .disabled(
             !(local || connected)
                 || readonly

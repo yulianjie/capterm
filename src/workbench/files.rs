@@ -640,15 +640,7 @@ impl Workbench {
     }
 
     fn download_to_default(&mut self, id: u64, entry: RemoteEntry, cx: &mut Context<Self>) {
-        let directory = if self.settings.download_directory.is_empty() {
-            dirs::download_dir()
-                .filter(|path| path.is_dir())
-                .or_else(dirs::home_dir)
-                .unwrap_or_else(std::env::temp_dir)
-        } else {
-            PathBuf::from(&self.settings.download_directory)
-        };
-        self.download_entry(id, entry, directory, false, cx);
+        self.download_entry(id, entry, self.settings.download_dir(), false, cx);
     }
 
     fn download_entry(
@@ -745,7 +737,7 @@ impl Workbench {
         self.schedule_transfers(cx);
     }
 
-    fn schedule_transfers(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn schedule_transfers(&mut self, cx: &mut Context<Self>) {
         let limit = self.settings.transfer_concurrency.clamp(1, 16);
         let mut running = self
             .tabs

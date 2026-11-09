@@ -1,12 +1,20 @@
+mod idle_input;
+mod shortcut_editor;
+
 use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{IndexPath, Sizable};
 
+use self::idle_input::IdleInput;
 use super::*;
 use crate::config::{
-    self, Settings, ThemePreference, TimestampPreference, TransferConflictPreference,
+    self, Osc52WritePreference, Settings, ShiftEnterPreference, TerminalNotificationPreference,
+    ThemePreference, TimestampPreference, TransferConflictPreference,
 };
+use crate::workbench::ui::font_family_index;
 
 const NAV: [(IconName, &str); 6] = [
     (IconName::SunMoon, "外观"),
@@ -129,6 +137,36 @@ fn choices(
     })
 }
 
+fn number_options(
+    values: impl IntoIterator<Item = u64>,
+    label: impl Fn(u64) -> String,
+) -> Vec<(u64, String)> {
+    values
+        .into_iter()
+        .map(|value| (value, label(value)))
+        .collect()
+}
+
+fn scrollback_label(lines: u64) -> String {
+    if lines < 1_000 {
+        format!("{lines} 行")
+    } else {
+        format!("{} {:03} 行", lines / 1_000, lines % 1_000)
+    }
+}
+
+fn seconds_label(seconds: u64) -> String {
+    format!("{seconds} 秒")
+}
+
+fn keepalive_label(seconds: u64) -> String {
+    if seconds == 0 {
+        "关闭".into()
+    } else {
+        seconds_label(seconds)
+    }
+}
+
 fn dropdown_field<T: Clone + 'static>(
     id: &'static str,
     value: String,
@@ -185,61 +223,200 @@ fn dropdown_field<T: Clone + 'static>(
     )
 }
 
-fn font_picker(
+fn preference_field<T: Copy + PartialEq + 'static>(
     id: &'static str,
-    current: &str,
-    candidates: &[&'static str],
-    installed: &[String],
+    current: T,
+    options: &[(T, &str)],
+    width: f32,
     palette: Palette,
-    view: &View,
-    set: fn(&mut Settings, Option<String>),
+    select: impl Fn(T, &mut App) + 'static,
 ) -> Div {
-    let options = candidates
+    let label = options
         .iter()
-        .enumerate()
-        .filter(|(index, family)| {
-            *index == 0
-                || installed
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(family))
-        })
-        .map(|(index, family)| ((index > 0).then_some(*family), (*family).to_owned()))
-        .collect();
-    let view = view.clone();
+        .find(|(value, _)| *value == current)
+        .map_or("", |(_, label)| *label);
     dropdown_field(
         id,
-        current.to_owned(),
-        options,
-        200.,
+        label.to_owned(),
+        options
+            .iter()
+            .map(|&(value, label)| (value, label.to_owned()))
+            .collect(),
+        width,
         palette,
-        move |font, cx| {
-            let _ = view.update(cx, |this, cx| {
-                let mut settings = this.settings.clone();
-                set(&mut settings, font.map(str::to_owned));
-                if this.persist(settings, cx) {
-                    this.apply_font_preferences(cx);
-                }
-            });
-        },
+        select,
     )
 }
 
-fn fixed_value(value: impl Into<SharedString>, width: f32, palette: Palette) -> Div {
-    row()
-        .w(px(width))
-        .h(px(28.))
-        .px(px(8.))
-        .rounded(px(6.))
-        .border_1()
-        .border_color(palette.line)
-        .bg(palette.input)
-        .child(
-            div()
-                .truncate()
-                .text_size(px(12.5))
-                .text_color(palette.ink)
-                .child(value.into()),
-        )
+fn ssh_value_field(
+    id: &'static str,
+    current: Option<&str>,
+    presets: &[(Option<&str>, &str)],
+    view: &View,
+    palette: Palette,
+    set: fn(&mut Settings, Option<String>),
+) -> Div {
+    let mut options: Vec<_> = presets
+        .iter()
+        .map(|&(value, label)| (value.map(str::to_owned), label.to_owned()))
+        .collect();
+    let label = if let Some((_, label)) = options
+        .iter()
+        .find(|(value, _)| value.as_deref() == current)
+    {
+        label.clone()
+    } else {
+        let value = current.unwrap_or_default().to_owned();
+        options.insert(0, (Some(value.clone()), value.clone()));
+        value
+    };
+    let view = view.clone();
+    dropdown_field(id, label, options, 200., palette, move |value, cx| {
+        let _ = view.update(cx, |this, cx| {
+            let mut settings = this.settings.clone();
+            set(&mut settings, value);
+            this.persist(settings, cx);
+        });
+    })
+}
+
+#[derive(Clone, Copy)]
+enum FontRole {
+    Ui,
+    Mono,
+}
+
+impl FontRole {
+    fn effective(self, theme: &Theme) -> &SharedString {
+        match self {
+            Self::Ui => &theme.font_family,
+            Self::Mono => &theme.mono_font_family,
+        }
+    }
+
+    fn theme_family(self, theme: &Theme) -> Option<&SharedString> {
+        let config = if theme.is_dark() {
+            &theme.dark_theme
+        } else {
+            &theme.light_theme
+        };
+        match self {
+            Self::Ui => config.font_family.as_ref(),
+            Self::Mono => config.mono_font_family.as_ref(),
+        }
+    }
+
+    fn setting(self, settings: &mut Settings) -> &mut Option<String> {
+        match self {
+            Self::Ui => &mut settings.ui_font_family,
+            Self::Mono => &mut settings.mono_font_family,
+        }
+    }
+}
+
+struct FontPicker {
+    state: Entity<SelectState<SearchableVec<SharedString>>>,
+    _subscription: Subscription,
+}
+
+impl FontPicker {
+    fn new(
+        role: FontRole,
+        installed: &[String],
+        window: &mut Window,
+        cx: &mut Context<Workbench>,
+    ) -> Self {
+        let current = role.effective(Theme::global(cx));
+        let mut options: Vec<_> = installed.iter().cloned().map(SharedString::from).collect();
+        let selected = font_family_index(&options, current).unwrap_or_else(|| {
+            options.push(current.clone());
+            options.len() - 1
+        });
+        let families = options.clone();
+        let state = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(options),
+                Some(IndexPath::new(selected)),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        let subscription =
+            cx.subscribe_in(&state, window, move |this, state, event, window, cx| {
+                let SelectEvent::Confirm(Some(choice)) = event else {
+                    return;
+                };
+                let theme = Theme::global(cx);
+                let family = role
+                    .theme_family(theme)
+                    .is_none_or(|default| !default.eq_ignore_ascii_case(choice))
+                    .then(|| choice.to_string());
+                let mut settings = this.settings.clone();
+                let setting = role.setting(&mut settings);
+                if *setting == family {
+                    return;
+                }
+                *setting = family;
+                if this.persist(settings, cx) {
+                    this.apply_font_preferences(cx);
+                } else {
+                    let current = role.effective(Theme::global(cx));
+                    let selected = font_family_index(&families, current).map(IndexPath::new);
+                    state.update(cx, |state, cx| {
+                        state.set_selected_index(selected, window, cx);
+                        cx.notify();
+                    });
+                }
+            });
+        Self {
+            state,
+            _subscription: subscription,
+        }
+    }
+
+    fn render(&self, id: &'static str, label: &'static str, palette: Palette) -> Div {
+        div()
+            .w(px(200.))
+            .h(px(28.))
+            .min_w_0()
+            .flex_shrink_1()
+            .child(
+                Select::new(&self.state)
+                    .id(id)
+                    .small()
+                    .h(px(28.))
+                    .px(px(8.))
+                    .rounded(px(6.))
+                    .bg(palette.input)
+                    .border_color(palette.line)
+                    .text_size(px(12.5))
+                    .icon(icon(IconName::ChevronsUpDown, 12., palette.muted))
+                    .accessibility_label(label)
+                    .search_placeholder("搜索字体")
+                    .menu_max_h(px(260.))
+                    .empty(move |_, _| {
+                        div()
+                            .py(px(10.))
+                            .text_center()
+                            .text_color(palette.dim)
+                            .child("未找到匹配字体")
+                    }),
+            )
+    }
+}
+
+struct FontPickers {
+    ui: FontPicker,
+    mono: FontPicker,
+}
+
+fn setting_note(value: impl Into<SharedString>, palette: Palette) -> Div {
+    div()
+        .truncate()
+        .text_size(px(12.))
+        .text_color(palette.dim)
+        .child(value.into())
 }
 
 fn settings_head(path: &str, palette: Palette) -> Div {
@@ -524,15 +701,19 @@ fn theme_cards(settings: &Settings, view: &View, palette: Palette, show_caption:
         }),
     )
 }
+fn terminal_line_spacing(settings: &Settings) -> f32 {
+    let size = settings.terminal_font_size.clamp(8., 32.);
+    settings.terminal_line_height.clamp(size, 56.) / size
+}
+
 fn appearance(
     settings: &Settings,
     view: &View,
+    idle_input: &IdleInput,
     palette: Palette,
-    installed: &[String],
+    fonts: &FontPickers,
     show_caption: bool,
-    cx: &App,
 ) -> Div {
-    let theme = Theme::global(cx);
     let time_options = [
         "时:分:秒（10:42:07）",
         "时:分:秒.毫秒（10:42:07.125）",
@@ -543,57 +724,145 @@ fn appearance(
         TimestampPreference::Milliseconds => 1,
         TimestampPreference::Relative => 2,
     };
-    let font_sizes = [10, 11, 12, 13, 14, 15, 16, 18, 20]
+    let font_size = settings.terminal_font_size.clamp(8., 32.);
+    let font_size_label = format!("{font_size:.2}");
+    let font_size_label = font_size_label.trim_end_matches('0').trim_end_matches('.');
+    let line_spacing = terminal_line_spacing(settings);
+    let spacing_choices = [10, 12, 14, 15, 17, 20]
         .into_iter()
-        .map(|size| (size, size.to_string()))
-        .collect();
-    let spacing = [12, 14, 15, 17, 20]
-        .into_iter()
-        .map(|multiple| (multiple, format!("{:.1} 倍", multiple as f32 / 10.)))
-        .collect();
+        .filter(|&spacing| font_size * (spacing as f32 / 10.) <= 56.);
     col()
         .flex_shrink_0()
-        .child(settings_section("主题", "深色、浅色两套主题等价设计；终端配色、图表和代码高亮随主题一起切换。快捷键 Ctrl+Shift+L。", palette)
-            .child(theme_cards(settings, view, palette, show_caption)))
-        .child(settings_section("字体", "", palette).border_t_1()
-            .child(setting_line("界面字体", "标签、菜单与表单。",
-                font_picker("set-ui-font", &theme.font_family,
-                    &["Noto Sans SC", "Microsoft YaHei UI", "Segoe UI", "PingFang SC"],
-                    installed, palette, view, |s, v| s.ui_font_family = v), palette))
-            .child(setting_line("终端与编辑器字体", "建议使用中英文 2:1 等宽的字体，TUI 边框与表格才不会错位。",
-                font_picker("set-mono-font", &theme.mono_font_family,
-                    &["Maple Mono NF CN", "Sarasa Mono SC", "Cascadia Mono", "Consolas"],
-                    installed, palette, view, |s, v| s.mono_font_family = v), palette))
-            .child(setting_line("终端字号与行高", "", row().gap(px(8.))
-                .child(choices("set-terminal-size", format!("{:.0}", settings.terminal_font_size), font_sizes, 80., palette, view, |s, v| {
-                    let ratio = s.terminal_line_height / s.terminal_font_size.max(1.);
-                    s.terminal_font_size = v as f32;
-                    s.terminal_line_height = (s.terminal_font_size * ratio).round();
-                }))
-                .child(choices("set-terminal-spacing", format!("{:.1} 倍", settings.terminal_line_height / settings.terminal_font_size.max(1.)), spacing, 100., palette, view, |s, v| {
-                    s.terminal_line_height = (s.terminal_font_size * v as f32 / 10.).round();
-                })), palette)))
-        .child(settings_section("行号与时间", "", palette).border_t_1().pb(px(16.))
-            .child(setting_line("显示行号", "按会话累计编号，全屏程序期间显示屏幕行号。",
-                toggle_setting("set-line-numbers", settings.show_line_numbers, view, |s, v| s.show_line_numbers = v), palette))
-            .child(setting_line("显示时间戳", "每一行记录写入终端的时间；重绘行在滚入历史后定格。",
-                toggle_setting("set-timestamps", settings.show_timestamps, view, |s, v| s.show_timestamps = v), palette))
-            .child(setting_line("时间格式", "", choices("set-timestamp-format", time_options[time_index].into(),
-                time_options.into_iter().enumerate().map(|(index, text)| (index as u64, text.into())).collect(),
-                200., palette, view, |s, v| s.timestamp_format = match v {
-                    1 => TimestampPreference::Milliseconds,
-                    2 => TimestampPreference::Relative,
-                    _ => TimestampPreference::Seconds,
-                }), palette))
-            .child(setting_line("弱化同一秒内重复的时间", "让命令的开始时间更容易被扫到。",
-                toggle_setting("set-dim-timestamps", settings.dim_repeated_timestamps, view, |s, v| s.dim_repeated_timestamps = v), palette))
-            .child(setting_line("空闲间隔线", "两行之间超出时长时插入分隔线。",
-                choices("set-idle-threshold", format!("{} 秒", settings.idle_threshold),
-                    [15, 30, 60, 120, 300].into_iter().map(|value| (value, format!("{value} 秒"))).collect(),
-                    120., palette, view, |s, v| s.idle_threshold = v), palette)))
+        .child(
+            settings_section(
+                "主题",
+                "深色、浅色两套主题等价设计，终端配色、图表和代码高亮随主题一起切换。",
+                palette,
+            )
+            .child(theme_cards(settings, view, palette, show_caption)),
+        )
+        .child(
+            settings_section("字体", "", palette)
+                .border_t_1()
+                .child(setting_line(
+                    "界面字体",
+                    "标签、菜单与表单。",
+                    fonts.ui.render("set-ui-font", "界面字体", palette),
+                    palette,
+                ))
+                .child(setting_line(
+                    "终端与编辑器字体",
+                    "建议使用中英文 2:1 等宽的字体，TUI 边框与表格才不会错位。",
+                    fonts
+                        .mono
+                        .render("set-mono-font", "终端与编辑器字体", palette),
+                    palette,
+                ))
+                .child(setting_line(
+                    "终端字号与行高",
+                    "",
+                    row()
+                        .gap(px(8.))
+                        .child(choices(
+                            "set-terminal-size",
+                            font_size_label.to_owned(),
+                            number_options([10, 11, 12, 13, 14, 15, 16, 18, 20], |size| {
+                                size.to_string()
+                            }),
+                            80.,
+                            palette,
+                            view,
+                            |settings, size| {
+                                let spacing = terminal_line_spacing(settings);
+                                settings.terminal_font_size = size as f32;
+                                settings.terminal_line_height = (size as f32 * spacing).min(56.);
+                            },
+                        ))
+                        .child(choices(
+                            "set-terminal-spacing",
+                            format!("{line_spacing:.1} 倍"),
+                            number_options(spacing_choices, |spacing| {
+                                format!("{:.1} 倍", spacing as f32 / 10.)
+                            }),
+                            100.,
+                            palette,
+                            view,
+                            |settings, spacing| {
+                                let size = settings.terminal_font_size.clamp(8., 32.);
+                                settings.terminal_line_height = size * (spacing as f32 / 10.);
+                            },
+                        )),
+                    palette,
+                )),
+        )
+        .child(
+            settings_section("行号与时间", "", palette)
+                .border_t_1()
+                .pb(px(16.))
+                .child(setting_line(
+                    "显示行号",
+                    "按会话累计编号，全屏程序期间显示屏幕行号。",
+                    toggle_setting(
+                        "set-line-numbers",
+                        settings.show_line_numbers,
+                        view,
+                        |s, v| s.show_line_numbers = v,
+                    ),
+                    palette,
+                ))
+                .child(setting_line(
+                    "显示时间戳",
+                    "每一行记录写入终端的时间；重绘行在滚入历史后定格。",
+                    toggle_setting("set-timestamps", settings.show_timestamps, view, |s, v| {
+                        s.show_timestamps = v
+                    }),
+                    palette,
+                ))
+                .child(setting_line(
+                    "时间格式",
+                    "",
+                    choices(
+                        "set-timestamp-format",
+                        time_options[time_index].into(),
+                        time_options
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, text)| (index as u64, text.into()))
+                            .collect(),
+                        200.,
+                        palette,
+                        view,
+                        |s, v| {
+                            s.timestamp_format = match v {
+                                1 => TimestampPreference::Milliseconds,
+                                2 => TimestampPreference::Relative,
+                                _ => TimestampPreference::Seconds,
+                            }
+                        },
+                    ),
+                    palette,
+                ))
+                .child(setting_line(
+                    "弱化同一秒内重复的时间",
+                    "让命令的开始时间更容易被扫到。",
+                    toggle_setting(
+                        "set-dim-timestamps",
+                        settings.dim_repeated_timestamps,
+                        view,
+                        |s, v| s.dim_repeated_timestamps = v,
+                    ),
+                    palette,
+                ))
+                .child(setting_line(
+                    "空闲间隔线",
+                    "两行之间超出时长时插入分隔线。输入后按 Enter 或离开输入框保存。",
+                    idle_input.render(palette),
+                    palette,
+                )),
+        )
 }
 
-fn terminal_settings(settings: &Settings, view: &View, palette: Palette) -> Div {
+fn linux_highlight_settings(settings: &Settings, view: &View, palette: Palette) -> Div {
     let actions_view = view.clone();
     let rule_path = config::linux_highlights_path()
         .map(|path| config::display_path(&path.to_string_lossy()))
@@ -603,6 +872,8 @@ fn terminal_settings(settings: &Settings, view: &View, palette: Palette) -> Div 
         "在 SSH 与 WSL 终端中强调 Linux 命令输出中的关键文本，可编辑规则后重载。",
         palette,
     )
+    .border_t_1()
+    .pb(px(16.))
     .child(setting_line(
         "启用 Linux 文本高亮",
         "应用于 SSH 与 WSL 会话。",
@@ -651,22 +922,158 @@ fn terminal_settings(settings: &Settings, view: &View, palette: Palette) -> Div 
     .child(setting_line(
         "规则文件位置",
         "编辑规则使用此文件。",
-        fixed_value(rule_path, 220., palette),
+        setting_note(rule_path, palette),
         palette,
     ))
-    .border_b_1()
+}
+
+fn terminal_settings(settings: &Settings, view: &View, palette: Palette) -> Div {
+    let shift_enter = view.clone();
+    let notifications = view.clone();
+    let osc52 = view.clone();
+    let shift_options = [
+        (ShiftEnterPreference::EscapeEnter, "发送 ESC + Enter"),
+        (ShiftEnterPreference::Enter, "作为普通 Enter"),
+        (ShiftEnterPreference::LineFeed, "发送换行符（LF）"),
+    ];
+    let notification_options = [
+        (TerminalNotificationPreference::Off, "关闭"),
+        (TerminalNotificationPreference::InApp, "仅应用内"),
+        (
+            TerminalNotificationPreference::InAppAndSystem,
+            "应用内与系统",
+        ),
+    ];
+    col()
+    .flex_shrink_0()
     .child(
-        settings_section("滚屏历史", "", palette).child(setting_line(
-            "每个标签保留的历史行数",
-            "行数越少，终端占用的内存越低。修改后对新打开的终端标签生效。",
+        settings_section(
+            "终端兼容",
+            "适用于 vim、htop、tmux、Claude Code、Codex、Gemini CLI 等程序。",
+            palette,
+        )
+        .child(setting_line(
+            "终端类型 TERM",
+            "用于新的 SSH 连接和重连，可在单个会话中覆盖。发送 COLORTERM=truecolor 需服务器放行。",
+            ssh_value_field(
+                "set-ssh-term",
+                settings.ssh_terminal_type.as_deref().filter(|value| *value != config::DEFAULT_TERMINAL_TYPE),
+                &[
+                    (None, config::DEFAULT_TERMINAL_TYPE),
+                    (Some("xterm"), "xterm"),
+                    (Some("vt100"), "vt100"),
+                ],
+                view,
+                palette,
+                |settings, value| settings.ssh_terminal_type = value,
+            ),
+            palette,
+        ))
+        .child(setting_line(
+            "Shift+Enter",
+            "终端程序协商 Kitty 键盘协议后，使用协议定义的编码。",
+            preference_field(
+                "set-shift-enter",
+                settings.shift_enter,
+                &shift_options,
+                170.,
+                palette,
+                move |value, cx| {
+                    let _ = shift_enter.update(cx, |this, cx| {
+                        let mut settings = this.settings.clone();
+                        settings.shift_enter = value;
+                        if this.persist(settings, cx) {
+                            this.apply_terminal_preferences(cx);
+                        }
+                    });
+                },
+            ),
+            palette,
+        ))
+        .child(setting_line(
+            "Kitty 键盘协议",
+            "允许终端程序请求 CSI u 键盘编码。",
+            toggle_setting("set-kitty-keyboard", settings.kitty_keyboard, view, |s, v| {
+                s.kitty_keyboard = v;
+            }),
+            palette,
+        ))
+        .child(setting_line(
+            "同步输出（DEC 2026）",
+            "允许终端程序整帧刷新，减少闪烁。",
+            toggle_setting(
+                "set-synchronized-output",
+                settings.synchronized_output,
+                view,
+                |s, v| s.synchronized_output = v,
+            ),
+            palette,
+        ))
+        .child(setting_line(
+            "允许程序写入剪贴板（OSC 52）",
+            "控制终端程序向本机剪贴板写入文本的请求。",
+            preference_field(
+                "set-osc52-write",
+                settings.osc52_write,
+                &[
+                    (Osc52WritePreference::Ask, "每次询问"),
+                    (Osc52WritePreference::Deny, "拒绝"),
+                ],
+                160.,
+                palette,
+                move |value, cx| {
+                    let _ = osc52.update(cx, |this, cx| {
+                        let mut settings = this.settings.clone();
+                        settings.osc52_write = value;
+                        if this.persist(settings, cx) {
+                            this.apply_terminal_preferences(cx);
+                        }
+                    });
+                },
+            ),
+            palette,
+        ))
+        .child(setting_line(
+            "桌面通知（OSC 9 / 777、响铃）",
+            "后台标签需要确认时提醒。窗口失焦时可发送系统通知。",
+            preference_field(
+                "set-terminal-notifications",
+                settings.terminal_notifications,
+                &notification_options,
+                170.,
+                palette,
+                move |value, cx| {
+                    let _ = notifications.update(cx, |this, cx| {
+                        let mut settings = this.settings.clone();
+                        settings.terminal_notifications = value;
+                        this.persist(settings, cx);
+                    });
+                },
+            ),
+            palette,
+        ))
+        .child(setting_line(
+            "粘贴多行内容时确认",
+            "直接粘贴到未启用括号粘贴的终端时生效。",
+            toggle_setting(
+                "set-confirm-multiline-paste",
+                settings.confirm_multiline_paste,
+                view,
+                |s, value| s.confirm_multiline_paste = value,
+            ),
+            palette,
+        ))
+        .child(setting_line(
+            "回滚行数",
+            "0 表示关闭历史，修改后对新打开的终端标签生效。",
             choices(
                 "set-scrollback-lines",
-                format!("{} 行", settings.scrollback_lines()),
-                [1_000, 5_000, 10_000, 20_000, 50_000, 100_000]
-                    .into_iter()
-                    .map(|lines| (lines, format!("{lines} 行")))
-                    .collect(),
-                120.,
+                scrollback_label(settings.scrollback_lines()),
+                number_options(
+                    [0, 1_000, 5_000, 10_000, 20_000, 50_000, config::MAX_SCROLLBACK_LINES],
+                    scrollback_label,
+                ),
+                160.,
                 palette,
                 view,
                 |settings, lines| settings.terminal_scrollback_lines = lines,
@@ -674,51 +1081,29 @@ fn terminal_settings(settings: &Settings, view: &View, palette: Palette) -> Div 
             palette,
         )),
     )
-    .child(
-        settings_section(
-            "终端兼容",
-            "适用于 vim、htop、tmux、Claude Code、Codex、Gemini CLI 等程序。",
-            palette,
-        )
-        .children(
-            [
-                ("终端类型 TERM", "支持 24 位真彩色。", "xterm-256color"),
-                (
-                    "Shift+Enter",
-                    "启用 Kitty 键盘协议的程序会收到对应编码。",
-                    "发送 ESC + Enter",
-                ),
-                ("Kitty 键盘协议", "程序可请求 CSI u 键盘编码。", "自动协商"),
-                ("同步输出（DEC 2026）", "程序可请求整帧绘制。", "由程序控制"),
-                (
-                    "桌面通知（OSC 9 / 777、响铃）",
-                    "程序请求提醒时在工作区标记。",
-                    "通知中心",
-                ),
-            ]
-            .into_iter()
-            .map(|(label, detail, value)| {
-                setting_line(label, detail, fixed_value(value, 200., palette), palette)
-            }),
-        ),
-    )
+    .child(linux_highlight_settings(settings, view, palette))
 }
 
 fn ssh_settings(settings: &Settings, view: &View, palette: Palette, mono: SharedString) -> Div {
-    let seconds = |values: &[u64]| {
-        values
-            .iter()
-            .map(|&value| {
-                (
-                    value,
-                    if value == 0 {
-                        "关闭".into()
-                    } else {
-                        format!("{value} 秒")
-                    },
-                )
-            })
-            .collect()
+    let trust_view = view.clone();
+    let mut agents = vec![
+        (
+            None,
+            if cfg!(windows) {
+                "Windows OpenSSH Agent"
+            } else {
+                "SSH_AUTH_SOCK"
+            },
+        ),
+        (Some("none"), "不使用"),
+    ];
+    if cfg!(windows) {
+        agents.insert(1, (Some("SSH_AUTH_SOCK"), "SSH_AUTH_SOCK"));
+    }
+    let agent = match settings.ssh_identity_agent.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("none") => Some("none"),
+        Some("SSH_AUTH_SOCK") if !cfg!(windows) => None,
+        value => value,
     };
     let paths = settings
         .linked_configs
@@ -867,21 +1252,33 @@ fn ssh_settings(settings: &Settings, view: &View, palette: Palette, mono: Shared
                 ))
                 .child(setting_line(
                     "首次连接新主机",
-                    "",
-                    fixed_value("显示指纹并询问", 180., palette),
+                    "适用于目标主机和跳板。",
+                    preference_field(
+                        "set-require-known-host",
+                        settings.ssh_require_known_host,
+                        &[(false, "显示指纹并询问"), (true, "仅允许已知主机")],
+                        180.,
+                        palette,
+                        move |value, cx| {
+                            let _ = trust_view.update(cx, |this, cx| {
+                                let mut settings = this.settings.clone();
+                                settings.ssh_require_known_host = value;
+                                this.persist(settings, cx);
+                            });
+                        },
+                    ),
                     palette,
                 ))
                 .child(setting_line(
                     "SSH Agent",
-                    "",
-                    fixed_value(
-                        if cfg!(windows) {
-                            "Windows OpenSSH Agent"
-                        } else {
-                            "SSH_AUTH_SOCK"
-                        },
-                        200.,
+                    "用于新的 SSH 连接和重连，可在会话的认证设置中覆盖。",
+                    ssh_value_field(
+                        "set-ssh-agent",
+                        agent,
+                        &agents,
+                        view,
                         palette,
+                        |settings, value| settings.ssh_identity_agent = value,
                     ),
                     palette,
                 ))
@@ -890,12 +1287,12 @@ fn ssh_settings(settings: &Settings, view: &View, palette: Palette, mono: Shared
                     "每一跳单独计时。",
                     choices(
                         "set-ssh-timeout",
-                        format!("{} 秒", settings.ssh_timeout),
-                        seconds(&[5, 10, 15, 30, 60]),
+                        seconds_label(u64::from(settings.ssh_timeout.max(1))),
+                        number_options([5, 10, 15, 30, 60], seconds_label),
                         120.,
                         palette,
                         view,
-                        |s, value| s.ssh_timeout = value as u32,
+                        |settings, value| settings.ssh_timeout = value as u32,
                     ),
                     palette,
                 ))
@@ -904,16 +1301,12 @@ fn ssh_settings(settings: &Settings, view: &View, palette: Palette, mono: Shared
                     "使用 SSH 协议保活消息。",
                     choices(
                         "set-ssh-keepalive",
-                        if settings.ssh_keepalive == 0 {
-                            "关闭".into()
-                        } else {
-                            format!("{} 秒", settings.ssh_keepalive)
-                        },
-                        seconds(&[0, 15, 30, 60, 120]),
+                        keepalive_label(u64::from(settings.ssh_keepalive)),
+                        number_options([0, 15, 30, 60, 120], keepalive_label),
                         120.,
                         palette,
                         view,
-                        |s, value| s.ssh_keepalive = value as u32,
+                        |settings, value| settings.ssh_keepalive = value as u32,
                     ),
                     palette,
                 ))
@@ -934,14 +1327,9 @@ fn transfer_settings(
     palette: Palette,
     mono: SharedString,
 ) -> Div {
-    let downloads = if settings.download_directory.is_empty() {
-        dirs::download_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "下载".into())
-    } else {
-        settings.download_directory.clone()
-    };
+    let downloads = settings.download_dir();
     let choice = view.clone();
+    let reset = view.clone();
     let conflicts = [
         (TransferConflictPreference::Ask, "在队列中询问"),
         (TransferConflictPreference::Overwrite, "覆盖"),
@@ -967,7 +1355,7 @@ fn transfer_settings(
                         .font_family(mono)
                         .text_size(px(12.))
                         .text_color(palette.dim)
-                        .child(config::display_path(&downloads)),
+                        .child(config::display_path(&downloads.to_string_lossy())),
                 )
                 .child(
                     button("change-download-location", "更改…", palette)
@@ -998,7 +1386,21 @@ fn transfer_settings(
                                 })
                                 .detach();
                         }),
-                ),
+                )
+                .when(!settings.download_directory.is_empty(), |row| {
+                    row.child(
+                        button("reset-download-location", "恢复默认", palette)
+                            .h(px(22.))
+                            .text_size(px(11.5))
+                            .on_click(move |_, _, cx| {
+                                let _ = reset.update(cx, |this, cx| {
+                                    let mut settings = this.settings.clone();
+                                    settings.download_directory.clear();
+                                    this.persist(settings, cx);
+                                });
+                            }),
+                    )
+                }),
             palette,
         ))
         .child(setting_line(
@@ -1006,15 +1408,12 @@ fn transfer_settings(
             "",
             choices(
                 "set-transfer-concurrency",
-                format!("{} 个文件", settings.transfer_concurrency),
-                [1, 2, 3, 4, 5, 8]
-                    .into_iter()
-                    .map(|value| (value, format!("{value} 个文件")))
-                    .collect(),
+                format!("{} 个文件", settings.transfer_concurrency.clamp(1, 16)),
+                number_options([1, 2, 3, 4, 5, 8], |value| format!("{value} 个文件")),
                 120.,
                 palette,
                 view,
-                |s, value| s.transfer_concurrency = value as usize,
+                |settings, value| settings.transfer_concurrency = value as usize,
             ),
             palette,
         ))
@@ -1059,42 +1458,27 @@ fn transfer_settings(
             "更大的文本文件以只读方式预览，或下载后在本机打开。",
             choices(
                 "set-edit-limit",
-                format!("{} MB", settings.file_edit_limit_mb),
-                [1, 2, 5, 10, 20, 50]
-                    .into_iter()
-                    .map(|value| (value, format!("{value} MB")))
-                    .collect(),
+                format!("{} MB", settings.file_edit_limit_mb.clamp(1, 50)),
+                number_options([1, 2, 5, 10, 20, 50], |value| format!("{value} MB")),
                 120.,
                 palette,
                 view,
-                |s, value| s.file_edit_limit_mb = value,
+                |settings, value| settings.file_edit_limit_mb = value,
             ),
             palette,
         ))
         .child(setting_line(
             "保存方式",
             "远程文件先写入同目录的临时文件。",
-            fixed_value("原子替换", 140., palette),
+            setting_note("原子替换", palette),
             palette,
         ))
 }
 
 fn monitor_settings(settings: &Settings, view: &View, palette: Palette) -> Div {
-    let intervals = [2, 5, 10, 15, 30]
-        .into_iter()
-        .map(|v| (v, format!("{v} 秒")))
-        .collect();
+    let warn = u64::from(settings.monitor_warn_pct);
+    let danger = u64::from(settings.monitor_danger_pct);
     let thresholds = [50, 60, 70, 75, 80, 85, 90, 95, 98, 100];
-    let warning = thresholds
-        .into_iter()
-        .filter(|&v| v < u64::from(settings.monitor_danger_pct))
-        .map(|v| (v, format!("{v}%")))
-        .collect();
-    let danger = thresholds
-        .into_iter()
-        .filter(|&v| v > u64::from(settings.monitor_warn_pct))
-        .map(|v| (v, format!("{v}%")))
-        .collect();
     settings_section(
         "主机监控",
         "复用当前 SSH 连接执行只读命令，采集 CPU、内存、磁盘和网络数据。",
@@ -1105,12 +1489,12 @@ fn monitor_settings(settings: &Settings, view: &View, palette: Palette) -> Div {
         "",
         choices(
             "set-monitor-interval",
-            format!("{} 秒", settings.monitor_interval),
-            intervals,
+            seconds_label(settings.monitor_interval.clamp(1, 60)),
+            number_options([2, 5, 10, 15, 30], seconds_label),
             120.,
             palette,
             view,
-            |s, v| s.monitor_interval = v,
+            |settings, value| settings.monitor_interval = value,
         ),
         palette,
     ))
@@ -1121,77 +1505,41 @@ fn monitor_settings(settings: &Settings, view: &View, palette: Palette) -> Div {
             .gap(px(8.))
             .child(choices(
                 "set-monitor-warn",
-                format!("{}%", settings.monitor_warn_pct),
-                warning,
+                format!("{warn}%"),
+                number_options(
+                    thresholds.into_iter().filter(|&value| value < danger),
+                    |value| format!("{value}%"),
+                ),
                 90.,
                 palette,
                 view,
-                |s, v| s.monitor_warn_pct = v as u8,
+                |settings, value| settings.monitor_warn_pct = value as u8,
             ))
             .child(choices(
                 "set-monitor-danger",
-                format!("{}%", settings.monitor_danger_pct),
-                danger,
+                format!("{danger}%"),
+                number_options(
+                    thresholds.into_iter().filter(|&value| value > warn),
+                    |value| format!("{value}%"),
+                ),
                 90.,
                 palette,
                 view,
-                |s, v| s.monitor_danger_pct = v as u8,
+                |settings, value| settings.monitor_danger_pct = value as u8,
             )),
         palette,
     ))
-}
-
-fn shortcuts(palette: Palette) -> Div {
-    const KEYS: [(&str, &str); 16] = [
-        ("命令面板 / 快速连接", "Ctrl+Shift+P"),
-        ("新建会话", "Ctrl+Shift+N"),
-        ("复制当前会话到新标签", "Ctrl+Shift+T"),
-        ("关闭标签", "Ctrl+Shift+W"),
-        ("切换标签", "Ctrl+Tab / Ctrl+Shift+Tab"),
-        ("终端内搜索", "Ctrl+Shift+F"),
-        ("复制 / 粘贴", "Ctrl+Shift+C / Ctrl+Shift+V"),
-        ("聚焦输入栏", "Ctrl+Shift+I"),
-        ("行号与时间", "Ctrl+Shift+G"),
-        ("文件面板", "Ctrl+Shift+E"),
-        ("会话与监控面板", "Ctrl+Shift+B"),
-        ("切换主题", "Ctrl+Shift+L"),
-        ("专注模式", "Ctrl+Shift+Enter"),
-        ("保存文件", "Ctrl+S"),
-        ("设置", "Ctrl+,"),
-        ("关闭对话框", "Esc"),
-    ];
-    settings_section(
-        "快捷键",
-        "全局快捷键使用 Ctrl+Shift，避免占用终端程序的 Ctrl 组合键。",
+    .child(setting_line(
+        "窗口在后台时暂停采样",
+        "",
+        toggle_setting(
+            "set-monitor-pause-in-background",
+            settings.monitor_pause_in_background,
+            view,
+            |settings, value| settings.monitor_pause_in_background = value,
+        ),
         palette,
-    )
-    .children(KEYS.into_iter().map(|(label, keys)| {
-        setting_line(
-            label,
-            "",
-            row().justify_end().gap(px(5.)).flex_wrap().children(
-                keys.split(" / ").enumerate().map(|(index, chord)| {
-                    row()
-                        .gap(px(3.))
-                        .when(index > 0, |chord| {
-                            chord.child(div().text_color(palette.dim).child("或"))
-                        })
-                        .children(chord.split('+').map(|key| {
-                            div()
-                                .border_1()
-                                .border_color(palette.line)
-                                .rounded(px(4.))
-                                .px(px(5.))
-                                .text_size(px(11.))
-                                .text_color(palette.muted)
-                                .child(key)
-                        }))
-                }),
-            ),
-            palette,
-        )
-        .py(px(8.))
-    }))
+    ))
 }
 
 impl Workbench {
@@ -1202,7 +1550,13 @@ impl Workbench {
     ) {
         let selected = Rc::new(Cell::new(0));
         let view = cx.weak_entity();
+        let (shortcut_recorder, shortcut_keys) = shortcut_editor::ShortcutRecorder::new(cx);
+        let idle_input = IdleInput::new(&self.settings, &view, window, cx);
         let installed = cx.text_system().all_font_names();
+        let fonts = FontPickers {
+            ui: FontPicker::new(FontRole::Ui, &installed, window, cx),
+            mono: FontPicker::new(FontRole::Mono, &installed, window, cx),
+        };
         let path = if cfg!(windows) {
             r"%APPDATA%\CapTerm\settings.json".to_owned()
         } else {
@@ -1211,6 +1565,7 @@ impl Workbench {
                 .unwrap_or_else(|_| "settings.json".into())
         };
         window.open_dialog(cx, move |dialog, window, cx| {
+            let _ = &shortcut_keys;
             let Some(entity) = view.upgrade() else {
                 return dialog;
             };
@@ -1225,6 +1580,7 @@ impl Workbench {
                 .bg(palette.panel.opacity(0.4))
                 .children(NAV.into_iter().enumerate().map(|(index, (symbol, title))| {
                     let selected = selected.clone();
+                    let shortcut_recorder = shortcut_recorder.clone();
                     let active = index == selected.get();
                     Button::new(("settings-nav", index))
                         .ghost()
@@ -1257,18 +1613,26 @@ impl Workbench {
                                 ),
                         )
                         .on_click(move |_, window, _| {
+                            shortcut_recorder.cancel();
                             selected.set(index);
                             window.refresh();
                         })
                 }));
             let theme = Theme::global(cx);
             let body = match selected.get() {
-                0 => appearance(settings, &view, palette, &installed, width >= px(720.), cx),
+                0 => appearance(
+                    settings,
+                    &view,
+                    &idle_input,
+                    palette,
+                    &fonts,
+                    width >= px(720.),
+                ),
                 1 => terminal_settings(settings, &view, palette),
                 2 => ssh_settings(settings, &view, palette, theme.mono_font_family.clone()),
                 3 => transfer_settings(settings, &view, palette, theme.mono_font_family.clone()),
                 4 => monitor_settings(settings, &view, palette),
-                _ => shortcuts(palette),
+                _ => shortcut_recorder.render(settings, &view, palette, window),
             };
             styled_dialog(dialog, f32::from(width), palette).child(
                 col()
