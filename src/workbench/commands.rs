@@ -56,11 +56,19 @@ impl Picker {
         if self.ssh
             && let Some(profile) = quick_profile(&text)
         {
+            let mut key_profile = profile.clone();
+            key_profile.auth = config::AuthMethod::Key;
             items.push(Choice::new(
                 format!("连接到 {}", ui::target(&profile)),
                 "快速连接 · 不保存会话",
                 IconName::Terminal,
                 move |view, window, cx| view.connect(profile.clone(), None, window, cx),
+            ));
+            items.push(Choice::new(
+                format!("用密钥连接到 {}", ui::target(&key_profile)),
+                "快速连接 · 私钥或 SSH Agent",
+                IconName::KeyRound,
+                move |view, window, cx| view.connect(key_profile.clone(), None, window, cx),
             ));
         }
         let words = text.to_lowercase();
@@ -192,6 +200,7 @@ fn quick_profile(value: &str) -> Option<ConnectionProfile> {
         host: host.to_owned(),
         user: user.to_owned(),
         port,
+        auth: config::AuthMethod::Password,
         identity_files: Vec::new(),
         jumps: Vec::new(),
         source: None,

@@ -30,6 +30,8 @@ pub struct ConnectionProfile {
     pub user: String,
     pub port: u16,
     #[serde(default)]
+    pub auth: AuthMethod,
+    #[serde(default)]
     pub identity_files: Vec<String>,
     #[serde(default)]
     pub jumps: Vec<Hop>,
@@ -39,6 +41,15 @@ pub struct ConnectionProfile {
     pub group: String,
     #[serde(default)]
     pub ssh: SshOptions,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    Password,
+    // Preserve key and agent authentication for profiles saved before this setting existed.
+    #[default]
+    Key,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,6 +675,7 @@ pub fn import_many(paths: &[String]) -> (Vec<ImportResult>, Vec<(String, anyhow:
                         host: host.endpoint.host,
                         user: host.endpoint.user,
                         port: host.endpoint.port,
+                        auth: AuthMethod::Key,
                         identity_files: host.endpoint.identity_files,
                         jumps,
                         source: Some(source.clone()),

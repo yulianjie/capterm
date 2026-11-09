@@ -1945,8 +1945,8 @@ impl Workbench {
                     duplicate.name.push_str(" 副本");
                     v.profile_dialog(Some(duplicate), w, c);
                 }))
-                .item(menu_action("测试连接", &view, move |v, _, c| {
-                    v.test(test.clone(), None, c)
+                .item(menu_action("测试连接", &view, move |v, w, c| {
+                    v.test(test.clone(), w, c)
                 }))
                 .item(menu_action(
                     "用密码测试连接…",

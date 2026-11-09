@@ -27,7 +27,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::config::{ConnectionProfile, Hop, SshOptions};
+use crate::config::{AuthMethod, ConnectionProfile, Hop, SshOptions};
 
 mod agent_forward;
 mod files;
@@ -654,11 +654,18 @@ impl Connection {
                 .with_context(|| format!("{endpoint} SSH 握手失败"))?;
                 report(HopStage::Authenticating, None, None, None);
                 let password = if is_target { password.as_deref() } else { None };
-                let authentication =
-                    timeout(network_timeout, authenticate(&mut session, hop, password))
-                        .await
-                        .with_context(|| format!("{endpoint} 认证超时"))?
-                        .with_context(|| format!("{endpoint} 认证失败，请检查凭据或 SSH Agent"))?;
+                let auth = if is_target {
+                    profile.auth
+                } else {
+                    AuthMethod::Key
+                };
+                let authentication = timeout(
+                    network_timeout,
+                    authenticate(&mut session, hop, auth, password),
+                )
+                .await
+                .with_context(|| format!("{endpoint} 认证超时"))?
+                .with_context(|| format!("{endpoint} 认证失败"))?;
                 Ok((session, authentication, host))
             }
             .await;
@@ -1031,12 +1038,38 @@ fn shell_environment(options: &SshOptions) -> std::collections::BTreeMap<String,
     environment
 }
 
+#[derive(Debug)]
+pub struct PasswordRejected;
+
+impl std::fmt::Display for PasswordRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("服务器拒绝了密码认证，请检查密码或选择密钥认证")
+    }
+}
+
+impl std::error::Error for PasswordRejected {}
+
 async fn authenticate(
     session: &mut client::Handle<HostVerifier>,
     hop: &Hop,
+    auth: AuthMethod,
     password: Option<&str>,
 ) -> Result<&'static str> {
     let user = &hop.user;
+    if auth == AuthMethod::Password {
+        let password = password.context("未提供 SSH 密码")?;
+        if session
+            .authenticate_password(user, password)
+            .await?
+            .success()
+        {
+            return Ok("密码");
+        }
+        if authenticate_interactive_password(session, user, password).await? {
+            return Ok("键盘交互");
+        }
+        return Err(PasswordRejected.into());
+    }
     let mut last_key_error = None;
     // A password provided without a key selection is an explicit choice of authentication method.
     let mut password_tried = false;
@@ -1136,21 +1169,7 @@ async fn authenticate(
                 "密码"
             });
         }
-        let result = session
-            .authenticate_keyboard_interactive_start(user, None::<String>)
-            .await?;
-        if matches!(result, client::KeyboardInteractiveAuthResponse::Success) {
-            return Ok("键盘交互");
-        }
-        if let client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } = result
-            && matches!(prompts.as_slice(), [prompt] if !prompt.echo && prompt.prompt.to_ascii_lowercase().contains("password"))
-            && matches!(
-                session
-                    .authenticate_keyboard_interactive_respond(vec![password.to_owned()])
-                    .await?,
-                client::KeyboardInteractiveAuthResponse::Success
-            )
-        {
+        if authenticate_interactive_password(session, user, password).await? {
             return Ok("键盘交互");
         }
     }
@@ -1160,6 +1179,30 @@ async fn authenticate(
             "Server rejected available credentials; key could not be loaded ({error}). Encrypted keys can be loaded into an SSH agent."
         ),
         None => bail!("Server rejected available credentials"),
+    }
+}
+
+async fn authenticate_interactive_password(
+    session: &mut client::Handle<HostVerifier>,
+    user: &str,
+    password: &str,
+) -> Result<bool> {
+    use client::KeyboardInteractiveAuthResponse::{InfoRequest, Success};
+
+    let result = session
+        .authenticate_keyboard_interactive_start(user, None::<String>)
+        .await?;
+    match result {
+        Success => Ok(true),
+        InfoRequest { prompts, .. } if matches!(prompts.as_slice(), [prompt] if !prompt.echo && prompt.prompt.to_ascii_lowercase().contains("password")) => {
+            Ok(matches!(
+                session
+                    .authenticate_keyboard_interactive_respond(vec![password.to_owned()])
+                    .await?,
+                Success
+            ))
+        }
+        _ => Ok(false),
     }
 }
 
@@ -1871,7 +1914,8 @@ mod tests {
             host: "127.0.0.1".into(),
             user: "fixture".into(),
             port: target,
-            identity_files: Vec::new(),
+            auth: AuthMethod::Password,
+            identity_files: vec![key_path.to_string_lossy().into_owned()],
             jumps: [jump_a, jump_b]
                 .into_iter()
                 .map(|port| Hop {
@@ -1911,6 +1955,16 @@ mod tests {
         );
         let connection = timeout(Duration::from_secs(10), connect).await??;
         let mut requests = approve.await?;
+        let wrong_password = Connection::connect(
+            &profile,
+            Some("wrong-fixture-password".into()),
+            known_hosts.clone(),
+            trust.clone(),
+        );
+        match timeout(Duration::from_secs(10), wrong_password).await? {
+            Ok(_) => bail!("password authentication fell back to the configured key"),
+            Err(error) => assert!(error.is::<PasswordRejected>(), "{error:#}"),
+        }
         {
             let route = route.lock().unwrap();
             for (index, authentication) in ["私钥", "私钥", "密码"].into_iter().enumerate() {
@@ -2218,6 +2272,7 @@ mod tests {
             host: "127.0.0.1".into(),
             user: "fixture".into(),
             port: ssh_port,
+            auth: AuthMethod::Password,
             identity_files: Vec::new(),
             jumps: Vec::new(),
             source: None,
@@ -2327,6 +2382,7 @@ mod tests {
             host: "127.0.0.1".into(),
             user: "fixture".into(),
             port,
+            auth: AuthMethod::Key,
             identity_files: Vec::new(),
             jumps: Vec::new(),
             source: None,

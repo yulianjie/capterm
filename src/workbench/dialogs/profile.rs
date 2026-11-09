@@ -2,13 +2,16 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, ensure};
 use gpui_kit::component::button::{Button, ButtonVariants, DropdownButton};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Sizable, Theme};
+use gpui_kit::component::{Disableable, Sizable, Size, Theme};
 
 use super::*;
-use crate::config::{self, Hop, SshOptions};
+use crate::config::{self, AuthMethod, Hop, SshOptions};
+use crate::credentials;
 
 const NAV: [(IconName, &str); 6] = [
     (IconName::Server, "基本信息"),
@@ -43,6 +46,11 @@ struct ProfileForm {
     user: Entity<InputState>,
     port: Entity<InputState>,
     group: Entity<InputState>,
+    auth: Cell<AuthMethod>,
+    password: Entity<InputState>,
+    remembered_password: RefCell<Option<ConnectionProfile>>,
+    password_lookup_failed: bool,
+    clear_password: Cell<bool>,
     identities: Entity<InputState>,
     agent: Entity<InputState>,
     term: Entity<InputState>,
@@ -101,6 +109,17 @@ impl ProfileForm {
                 .placeholder("LocalForward 127.0.0.1:8080 localhost:80")
                 .default_value(forwards)
         });
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("SSH 密码")
+        });
+        let remembered_password = profile
+            .and_then(|profile| saved.iter().find(|saved| saved.id == profile.id))
+            .map_or(Ok(None), |profile| {
+                credentials::load(profile).map(|secret| secret.map(|_| profile.clone()))
+            });
+        let password_lookup_failed = remembered_password.is_err();
         let mut control = |placeholder, default| text_input(placeholder, default, window, cx);
         let field =
             |get: fn(&ConnectionProfile) -> &String| profile.map(get).cloned().unwrap_or_default();
@@ -118,6 +137,11 @@ impl ProfileForm {
                 profile.map_or_else(|| "22".into(), |p| p.port.to_string()),
             ),
             group: control("默认分组", field(|p| &p.group)),
+            auth: Cell::new(profile.map_or(AuthMethod::Password, |profile| profile.auth)),
+            password,
+            remembered_password: RefCell::new(remembered_password.ok().flatten()),
+            password_lookup_failed,
+            clear_password: Cell::new(false),
             identities: control(
                 "~/.ssh/id_ed25519",
                 profile.map_or_else(String::new, |p| p.identity_files.join("; ")),
@@ -320,6 +344,7 @@ impl ProfileForm {
             host: host.to_owned(),
             user: user.to_owned(),
             port,
+            auth: self.auth.get(),
             identity_files: if identities.is_empty() {
                 alias.map_or_else(Vec::new, |p| p.identity_files.clone())
             } else {
@@ -330,6 +355,28 @@ impl ProfileForm {
             group: value(&self.group, cx),
             ssh,
         })
+    }
+
+    fn password(&self, cx: &App) -> Option<String> {
+        if self.auth.get() != AuthMethod::Password || self.clear_password.get() {
+            return None;
+        }
+        let password = self.password.read(cx).value();
+        (!password.is_empty()).then(|| password.to_string())
+    }
+
+    fn save_password(&self, profile: &ConnectionProfile, cx: &App) -> anyhow::Result<()> {
+        let mut remembered_password = self.remembered_password.borrow_mut();
+        if let Some(previous) = remembered_password.as_ref().filter(|previous| {
+            self.clear_password.get() || !credentials::same_target(previous, profile)
+        }) {
+            credentials::remove(previous)?;
+            remembered_password.take();
+        }
+        if let Some(password) = self.password(cx) {
+            credentials::save(profile, &password)?;
+        }
+        Ok(())
     }
 
     fn ssh_options(&self, previous: Option<&SshOptions>, cx: &App) -> anyhow::Result<SshOptions> {
@@ -784,7 +831,7 @@ fn route_body(
     };
     section(
         "跳板链路",
-        "按顺序经过下列跳板机到达目标主机。可直接填写地址，或沿用已保存会话的认证设置。",
+        "按顺序经过下列跳板机到达目标主机。可直接填写地址，或沿用已保存会话的地址和密钥设置。",
         palette,
     )
     .child(
@@ -802,12 +849,12 @@ fn route_body(
                                 DropdownButton::new("add-hop")
                                     .secondary()
                                     .outline()
-                                    .with_size(px(32.))
+                                    .with_size(Size::Medium)
+                                    .disabled(!add_enabled)
                                     .menu_accessibility_label("选用已保存会话作为跳板")
                                     .button(
                                         Button::new("add-manual-hop")
                                             .label("＋  在目标前添加跳板")
-                                            .disabled(!add_enabled)
                                             .on_click(move |_, window, cx| {
                                                 add_hop(&add, None, window, cx)
                                             }),
@@ -819,11 +866,11 @@ fn route_body(
                                             let profile = profile.clone();
                                             let form = menu_form.clone();
                                             menu = menu.item(
-                                                PopupMenuItem::new(profile.name.clone())
-                                                    .disabled(!add_enabled)
-                                                    .on_click(move |_, window, cx| {
+                                                PopupMenuItem::new(profile.name.clone()).on_click(
+                                                    move |_, window, cx| {
                                                         add_hop(&form, Some(&profile), window, cx)
-                                                    }),
+                                                    },
+                                                ),
                                             );
                                         }
                                         menu
@@ -1193,63 +1240,113 @@ impl Workbench {
                 ),
                 1 => {
                     let options = form.clone();
-                    let forwarding = form.clone();
-                    section(
-                        "身份验证",
-                        "使用私钥和 SSH Agent，也可以从会话菜单使用密码连接。",
-                        palette,
-                    )
-                    .child(field(
-                        "私钥路径",
-                        input(&form.identities, "私钥路径", palette).font_family(mono.clone()),
-                        palette,
-                    ))
-                    .child(description_text(
-                        "使用分号分隔多个文件，留空时使用默认 SSH 私钥。",
-                        palette,
-                    ))
-                    .child(field(
-                        "SSH Agent",
-                        input(&form.agent, "SSH Agent", palette).font_family(mono),
-                        palette,
-                    ))
-                    .child(description_text(
-                        "留空使用系统 Agent，输入 none 禁用，也可填写本机套接字路径。",
-                        palette,
-                    ))
-                    .child(
-                        row()
-                            .justify_between()
-                            .gap(px(10.))
-                            .child("仅尝试指定的密钥")
-                            .child(
-                                Switch::new("identities-only")
-                                    .checked(form.identities_only.get().unwrap_or(false))
-                                    .on_click(move |checked, window, _| {
-                                        options.identities_only.set(Some(*checked));
-                                        window.refresh();
-                                    }),
-                            ),
-                    )
-                    .child(
-                        row()
-                            .justify_between()
-                            .gap(px(10.))
-                            .child(col().gap(px(4.)).child("转发 SSH Agent").child(
-                                description_text(
-                                    "允许远端通过当前 SSH 连接使用本机 Agent 签名。",
-                                    palette,
-                                ),
+                    let methods = [
+                        ("密码", AuthMethod::Password),
+                        ("私钥 / SSH Agent", AuthMethod::Key),
+                    ];
+                    let auth = form.auth.get();
+                    let selected = methods.iter().position(|(_, method)| *method == auth);
+                    let section = section("身份验证", "选择连接时使用的认证方式。", palette)
+                        .child(field(
+                            "认证方式",
+                            RadioGroup::horizontal("profile-auth-method")
+                                .children(methods.map(|(label, _)| label))
+                                .selected_index(selected)
+                                .on_change(move |index, window, _| {
+                                    options.auth.set(methods[*index].1);
+                                    window.refresh();
+                                }),
+                            palette,
+                        ));
+                    if auth == AuthMethod::Password {
+                        let has_password = form.remembered_password.borrow().is_some();
+                        let options = form.clone();
+                        let description = if has_password {
+                            "此会话已保存密码。输入新密码并保存即可更新。更改主机、用户或端口后需重新设置。"
+                        } else {
+                            "输入密码后点击保存，密码将存入系统凭据库。留空时在连接时输入。"
+                        };
+                        section
+                            .child(field(
+                                "SSH 密码",
+                                input(&form.password, "SSH 密码", palette)
+                                    .content_type(InputContentType::Password)
+                                    .disabled(form.clear_password.get()),
+                                palette,
                             ))
-                            .child(
-                                Switch::new("forward-ssh-agent")
-                                    .checked(form.forward_agent.get().unwrap_or(false))
-                                    .on_click(move |checked, window, _| {
-                                        forwarding.forward_agent.set(Some(*checked));
-                                        window.refresh();
-                                    }),
-                            ),
-                    )
+                            .child(description_text(description, palette))
+                            .when(form.password_lookup_failed, |section| {
+                                section.child(description_text(
+                                    "暂时无法读取已保存的密码。",
+                                    palette,
+                                ))
+                            })
+                            .when(has_password, |section| {
+                                section.child(
+                                    Checkbox::new("clear-profile-password")
+                                        .label("保存时清除已保存的密码")
+                                        .checked(form.clear_password.get())
+                                        .on_change(move |checked, window, _| {
+                                            options.clear_password.set(*checked);
+                                            window.refresh();
+                                        }),
+                                )
+                            })
+                    } else {
+                        let options = form.clone();
+                        let forwarding = form.clone();
+                        section.child(field(
+                            "私钥路径",
+                            input(&form.identities, "私钥路径", palette).font_family(mono.clone()),
+                            palette,
+                        ))
+                        .child(description_text(
+                            "使用分号分隔多个文件，留空时使用默认 SSH 私钥。",
+                            palette,
+                        ))
+                        .child(field(
+                            "SSH Agent",
+                            input(&form.agent, "SSH Agent", palette).font_family(mono),
+                            palette,
+                        ))
+                        .child(description_text(
+                            "留空使用系统 Agent，输入 none 禁用，也可填写本机套接字路径。",
+                            palette,
+                        ))
+                        .child(
+                            row()
+                                .justify_between()
+                                .gap(px(10.))
+                                .child("仅尝试指定的密钥")
+                                .child(
+                                    Switch::new("identities-only")
+                                        .checked(form.identities_only.get().unwrap_or(false))
+                                        .on_click(move |checked, window, _| {
+                                            options.identities_only.set(Some(*checked));
+                                            window.refresh();
+                                        }),
+                                ),
+                        )
+                        .child(
+                            row()
+                                .justify_between()
+                                .gap(px(10.))
+                                .child(col().gap(px(4.)).child("转发 SSH Agent").child(
+                                    description_text(
+                                        "允许远端通过当前 SSH 连接使用本机 Agent 签名。",
+                                        palette,
+                                    ),
+                                ))
+                                .child(
+                                    Switch::new("forward-ssh-agent")
+                                        .checked(form.forward_agent.get().unwrap_or(false))
+                                        .on_click(move |checked, window, _| {
+                                            forwarding.forward_agent.set(Some(*checked));
+                                            window.refresh();
+                                        }),
+                                ),
+                        )
+                    }
                 }
                 2 => route_body(&form, &saved, &view, palette, cx),
                 3 => section("终端", "终端字体、行号与时间戳使用全局外观设置。", palette)
@@ -1376,6 +1473,13 @@ impl Workbench {
                                     settings.profiles.push(profile.clone());
                                 }
                                 if this.persist(settings, cx) {
+                                    if let Err(error) = form.save_password(&profile, cx) {
+                                        status.fail(format!("会话已保存。{error:#}"), window);
+                                        return;
+                                    }
+                                    form.password.update(cx, |password, cx| {
+                                        password.clean(window, cx);
+                                    });
                                     this.announce(format!("已保存会话 · {}", profile.name), cx);
                                     window.close_dialog(cx);
                                     if connect {
@@ -1430,9 +1534,9 @@ impl Workbench {
                                         match test_form.collect(&this.settings.profiles, cx) {
                                             Ok(profile) => {
                                                 test_form.tested.replace(Some(profile.clone()));
-                                                test_status.start(window);
                                                 this.test_form(
                                                     profile,
+                                                    test_form.password(cx),
                                                     test_status.clone(),
                                                     window,
                                                     cx,

@@ -21,10 +21,11 @@ use gpui_kit::*;
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
-use crate::config::{self, ConnectionProfile, Settings, ThemePreference};
+use crate::config::{self, AuthMethod, ConnectionProfile, Settings, ThemePreference};
 use crate::local::{self, LocalShell};
 use crate::ssh::{
-    Connection, ConnectionPrompt, HopProgress, HopStage, Metrics, ShellCommand, ShellEvent,
+    Connection, ConnectionPrompt, HopProgress, HopStage, Metrics, PasswordRejected, ShellCommand,
+    ShellEvent,
 };
 use crate::terminal::highlight::{BUNDLED, LinuxHighlights};
 use crate::terminal::{ClipboardImage, TerminalCommand, TerminalSize, TerminalView};
@@ -172,6 +173,7 @@ struct Tab {
     operation_id: u64,
     session: Session,
     ssh_password_auth: bool,
+    ssh_password_rejected: bool,
     phase: Phase,
     terminal: Entity<TerminalView>,
     draft: Entity<TextareaState>,
@@ -254,6 +256,7 @@ enum Event {
         Result<Option<local::WslPaths>, String>,
     ),
     StartFailed(u64, String),
+    PasswordRejected(u64, String),
     TestFinished(u64, Result<(), String>),
     Route(u64, HopProgress),
     Shell(u64, ShellEvent),
@@ -633,6 +636,19 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let password = if password.is_none() && profile.auth == AuthMethod::Password {
+            let Some(password) = self.load_or_prompt_password(
+                &profile,
+                dialogs::CredentialTarget::NewTab,
+                window,
+                cx,
+            ) else {
+                return;
+            };
+            Some(password)
+        } else {
+            password
+        };
         let known_hosts = match config::known_hosts() {
             Ok(path) => path,
             Err(error) => {
@@ -667,9 +683,26 @@ impl Workbench {
         let Some(tab) = self.tab(id).filter(|tab| tab.can_reconnect()) else {
             return;
         };
-        if tab.ssh_password_auth {
-            if let Some(profile) = tab.ssh_profile().cloned() {
-                self.reconnect_password_dialog(id, profile, window, cx);
+        if tab.ssh_password_auth
+            && let Some(profile) = tab.ssh_profile().cloned()
+        {
+            if tab.ssh_password_rejected {
+                self.credential_dialog(
+                    profile,
+                    dialogs::CredentialTarget::Reconnect(id),
+                    Some("服务器拒绝了上次的密码，请重新输入。".into()),
+                    window,
+                    cx,
+                );
+                return;
+            }
+            if let Some(password) = self.load_or_prompt_password(
+                &profile,
+                dialogs::CredentialTarget::Reconnect(id),
+                window,
+                cx,
+            ) {
+                self.reconnect_ssh(id, Some(password), window, cx);
             }
         } else {
             self.reconnect_ssh(id, None, window, cx);
@@ -715,6 +748,7 @@ impl Workbench {
         let previous = tab.operation.take();
         tab.operation_id = operation_id;
         tab.phase = Phase::Connecting;
+        tab.ssh_password_rejected = false;
         tab.session = session;
         tab.link = link;
         tab.terminal = terminal;
@@ -864,6 +898,7 @@ impl Workbench {
             operation_id: id,
             session,
             ssh_password_auth,
+            ssh_password_rejected: false,
             phase: Phase::Connecting,
             terminal,
             draft,
@@ -891,24 +926,48 @@ impl Workbench {
         self.select_tab(id, window, cx);
     }
 
-    fn test(
-        &mut self,
-        profile: ConnectionProfile,
-        password: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.begin_test(profile, password, None, cx);
+    fn test(&mut self, profile: ConnectionProfile, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_test(profile, None, None, window, cx);
     }
 
     fn test_form(
         &mut self,
         profile: ConnectionProfile,
+        password: Option<String>,
         form: Rc<dialogs::FormStatus>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.begin_test(profile, None, Some(form.clone()), cx) {
-            form.finish(self.notice.clone(), false, window);
+        self.request_test(profile, password, Some(form), window, cx);
+    }
+
+    fn request_test(
+        &mut self,
+        profile: ConnectionProfile,
+        password: Option<String>,
+        form: Option<Rc<dialogs::FormStatus>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let password = if password.is_none() && profile.auth == AuthMethod::Password {
+            let Some(password) = self.load_or_prompt_password(
+                &profile,
+                dialogs::CredentialTarget::Test(form.clone()),
+                window,
+                cx,
+            ) else {
+                return;
+            };
+            Some(password)
+        } else {
+            password
+        };
+        if self.begin_test(profile, password, form.clone(), cx) {
+            if let Some(form) = form {
+                form.start(window);
+            }
+        } else if let Some(form) = form {
+            form.fail(self.notice.clone(), window);
         }
     }
 
@@ -1094,6 +1153,12 @@ impl Workbench {
                 }
             }
             Event::StartFailed(operation_id, error) => {
+                self.finish_tab(operation_id, Phase::Failed, &error, cx);
+            }
+            Event::PasswordRejected(operation_id, error) => {
+                if let Some(tab) = self.tab_mut_for_operation(operation_id) {
+                    tab.ssh_password_rejected = true;
+                }
                 self.finish_tab(operation_id, Phase::Failed, &error, cx);
             }
             Event::TestFinished(id, result) => {
@@ -1293,9 +1358,12 @@ async fn run_ssh(
     match establish(id, &target, password, known_hosts, reuse_jumps, &events).await {
         Ok(connection) => run_shell(id, Arc::new(connection), initial, &events).await,
         Err(error) => {
-            let _ = events
-                .send(Event::StartFailed(id, format!("{error:#}")))
-                .await;
+            let event = if error.is::<PasswordRejected>() {
+                Event::PasswordRejected(id, format!("{error:#}"))
+            } else {
+                Event::StartFailed(id, format!("{error:#}"))
+            };
+            let _ = events.send(event).await;
         }
     }
 }

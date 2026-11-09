@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
 use gpui_kit::component::input::{InputContentType, InputEvent, InputState};
 use gpui_kit::component::{Disableable, Theme, WindowExt};
@@ -14,13 +15,15 @@ use gpui_kit::*;
 
 use super::Workbench;
 use super::ui::{Palette, button, chrome_icon_tool, col, icon, input, primary, row, target, tool};
-use crate::config::ConnectionProfile;
+use crate::config::{AuthMethod, ConnectionProfile};
+use crate::credentials;
 use crate::ssh::{ProxyCommandRequest, TrustDecision, TrustRequest};
 
-#[derive(Clone, Copy)]
-enum CredentialTarget {
+#[derive(Clone)]
+pub(super) enum CredentialTarget {
     Connect,
-    Test,
+    NewTab,
+    Test(Option<Rc<FormStatus>>),
     Reconnect(u64),
 }
 
@@ -31,7 +34,7 @@ pub(super) struct FormStatus {
 }
 
 impl FormStatus {
-    fn start(&self, window: &mut Window) {
+    pub(super) fn start(&self, window: &mut Window) {
         self.busy.set(true);
         self.message.borrow_mut().take();
         window.refresh();
@@ -227,7 +230,7 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.credential_dialog(profile, CredentialTarget::Connect, window, cx);
+        self.credential_dialog(profile, CredentialTarget::Connect, None, window, cx);
     }
 
     pub(super) fn test_with_password(
@@ -236,23 +239,45 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.credential_dialog(profile, CredentialTarget::Test, window, cx);
+        self.credential_dialog(profile, CredentialTarget::Test(None), None, window, cx);
     }
 
-    pub(super) fn reconnect_password_dialog(
+    pub(super) fn load_or_prompt_password(
         &mut self,
-        id: u64,
-        profile: ConnectionProfile,
+        profile: &ConnectionProfile,
+        action: CredentialTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.credential_dialog(profile, CredentialTarget::Reconnect(id), window, cx);
+    ) -> Option<String> {
+        let result = if self.can_remember_password(profile) {
+            credentials::load(profile)
+        } else {
+            Ok(None)
+        };
+        match result {
+            Ok(Some(password)) => Some(password),
+            result => {
+                let error = result.err().map(|error| format!("{error:#}"));
+                self.credential_dialog(profile.clone(), action, error, window, cx);
+                None
+            }
+        }
     }
 
-    fn credential_dialog(
+    fn can_remember_password(&self, profile: &ConnectionProfile) -> bool {
+        profile.source.is_none()
+            && self
+                .settings
+                .profiles
+                .iter()
+                .any(|saved| credentials::same_target(saved, profile))
+    }
+
+    pub(super) fn credential_dialog(
         &mut self,
         profile: ConnectionProfile,
         action: CredentialTarget,
+        error: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -264,14 +289,22 @@ impl Workbench {
         });
         let view = cx.weak_entity();
         let status = Rc::new(FormStatus::default());
-        let focus_password = Cell::new(matches!(action, CredentialTarget::Reconnect(_)));
+        if let Some(error) = error {
+            status.fail(error, window);
+        }
+        let can_remember = profile.auth == AuthMethod::Password
+            && self.can_remember_password(&profile)
+            && !matches!(&action, CredentialTarget::Test(Some(_)));
+        let remember = Rc::new(Cell::new(false));
+        let focus_password = Cell::new(true);
         window.open_dialog(cx, move |dialog, window, cx| {
+            let password_focus = password.focus_handle(cx);
             if focus_password.replace(false) {
-                password.focus_handle(cx).focus(window, cx);
+                password_focus.focus(window, cx);
             }
-            let (description, label) = match action {
-                CredentialTarget::Connect => ("连接到", "连接"),
-                CredentialTarget::Test => ("测试连接到", "测试连接"),
+            let (description, label) = match &action {
+                CredentialTarget::Connect | CredentialTarget::NewTab => ("连接到", "连接"),
+                CredentialTarget::Test(_) => ("测试连接到", "测试连接"),
                 CredentialTarget::Reconnect(_) => ("重新连接到", "重新连接"),
             };
             let body = col()
@@ -287,38 +320,78 @@ impl Workbench {
                     input(&password, "SSH 密码", palette).content_type(InputContentType::Password),
                     palette,
                 ))
+                .when(can_remember, |body| {
+                    let remember = remember.clone();
+                    body.child(
+                        Checkbox::new("remember-ssh-password")
+                            .label("记住密码")
+                            .checked(remember.get())
+                            .on_click(move |checked, window, _| {
+                                remember.set(*checked);
+                                window.refresh();
+                            }),
+                    )
+                    .child(description_text("密码保存在系统凭据库中。", palette))
+                })
                 .children(status.error(palette));
             let view = view.clone();
             let password = password.clone();
             let profile = profile.clone();
             let status = status.clone();
-            let connect =
-                primary("connect-password", label, palette).on_click(move |_, window, cx| {
-                    let credential = password.read(cx).value().to_string();
-                    if credential.is_empty() {
-                        status.fail("请输入 SSH 密码。", window);
+            let action = action.clone();
+            let remember = remember.clone();
+            let submit = move |window: &mut Window, cx: &mut App| {
+                let credential = password.read(cx).value().to_string();
+                if credential.is_empty() {
+                    status.fail("请输入 SSH 密码。", window);
+                    return;
+                }
+                let _ = view.update(cx, |this, cx| {
+                    if remember.get()
+                        && this.can_remember_password(&profile)
+                        && let Err(error) = credentials::save(&profile, &credential)
+                    {
+                        status.fail(format!("{error:#}"), window);
                         return;
                     }
                     password.update(cx, |password, cx| password.clean(window, cx));
                     window.close_dialog(cx);
-                    let _ = view.update(cx, |this, cx| match action {
+                    let credential = Some(credential);
+                    match &action {
                         CredentialTarget::Connect => {
-                            this.connect(profile.clone(), Some(credential), window, cx)
+                            this.connect(profile.clone(), credential, window, cx)
                         }
-                        CredentialTarget::Test => this.test(profile.clone(), Some(credential), cx),
+                        CredentialTarget::NewTab => {
+                            this.connect_new(profile.clone(), credential, window, cx)
+                        }
+                        CredentialTarget::Test(form) => {
+                            this.request_test(profile.clone(), credential, form.clone(), window, cx)
+                        }
                         CredentialTarget::Reconnect(id) => {
-                            this.reconnect_ssh(id, Some(credential), window, cx)
+                            this.reconnect_ssh(*id, credential, window, cx)
                         }
-                    });
+                    }
                 });
+            };
+            let click_submit = submit.clone();
             styled_dialog(dialog, 470., palette).child(
                 col()
+                    .capture_key_down(move |event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "enter"
+                            && !event.keystroke.modifiers.modified()
+                            && password_focus.is_focused(window)
+                        {
+                            cx.stop_propagation();
+                            submit(window, cx);
+                        }
+                    })
                     .child(dialog_head("SSH 密码", palette, false))
                     .child(body)
                     .child(
-                        dialog_actions(palette)
-                            .child(cancel(palette, false))
-                            .child(connect),
+                        dialog_actions(palette).child(cancel(palette, false)).child(
+                            primary("connect-password", label, palette)
+                                .on_click(move |_, window, cx| click_submit(window, cx)),
+                        ),
                     ),
             )
         });
@@ -357,7 +430,13 @@ impl Workbench {
                                     true
                                 }
                             });
-                            this.announce(format!("已删除会话 · {}", profile.name), cx);
+                            let mut notice = format!("已删除会话 · {}", profile.name);
+                            if profile.source.is_none()
+                                && let Err(error) = credentials::remove(&profile)
+                            {
+                                notice.push_str(&format!(" · {error:#}"));
+                            }
+                            this.announce(notice, cx);
                             window.close_dialog(cx);
                         }
                     });
