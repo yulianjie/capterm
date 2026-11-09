@@ -1,0 +1,71 @@
+name: Verify macOS release launch
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag to install and open
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  launch:
+    name: Open CapTerm on ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, arch: arm64 }
+          - { runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      TAG: ${{ inputs.release_tag }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download, verify, and install the published DMG
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$(uname -m)" == "$ARCH" ]]
+          sw_vers
+          work=$(mktemp -d "$RUNNER_TEMP/capterm-smoke.XXXXXX")
+          cd "$work"
+          dmg="CapTerm-${TAG#v}-macos-$ARCH.dmg"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$dmg" --pattern SHA256SUMS-unix.txt
+          awk -v file="$dmg" '$2 == file' SHA256SUMS-unix.txt | shasum -a 256 -c
+
+          mount="$work/mounted"
+          mkdir "$mount"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
+          trap 'hdiutil detach "$mount"' EXIT
+          app=/Applications/CapTerm.app
+          [[ ! -e "$app" ]]
+          sudo ditto "$mount/CapTerm.app" "$app"
+          codesign --verify --deep --strict --verbose "$app"
+          lipo "$app/Contents/MacOS/capterm" -verify_arch "$ARCH"
+
+      - name: Launch the installed app and wait for its main window
+        shell: bash
+        run: |
+          app=/Applications/CapTerm.app
+          open -n -a "$app"
+          if ! swift scripts/verify-macos-window.swift "$app"; then
+            log show --last 2m --style compact --predicate 'process == "capterm"' || true
+            for report in "$HOME"/Library/Logs/DiagnosticReports/capterm*.ips; do
+              if [[ -f "$report" ]]; then
+                head -n 70 "$report"
+              fi
+            done
+            exit 1
+          fi
