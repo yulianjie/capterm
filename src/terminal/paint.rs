@@ -227,7 +227,7 @@ enum DisplayRow<'a> {
 
 pub(super) struct FrameOptions<'a> {
     pub(super) time: TimestampFormat,
-    pub(super) idle: std::time::Duration,
+    pub(super) idle_threshold: Option<std::time::Duration>,
     pub(super) dim_repeated: bool,
     pub(super) timeline_offset: usize,
     pub(super) show_timeline: bool,
@@ -346,11 +346,12 @@ impl Frame {
                     if first && let Some(messages) = timeline.systems.get(&stamp.number) {
                         display.extend(messages.iter().map(|message| DisplayRow::System(message)));
                     }
-                    if first
+                    if let Some(threshold) = options.idle_threshold
+                        && first
                         && line > grid.topmost_line()
                         && let Some(previous) = timeline.stamp(grid, line - 1)
                         && let Ok(idle) = (stamp.time - previous.time).to_std()
-                        && idle > options.idle
+                        && idle > threshold
                     {
                         display.push(DisplayRow::Gap(format!(
                             "◷  空闲 {}",
@@ -1056,7 +1057,7 @@ mod tests {
             String::new(),
             FrameOptions {
                 time: TimestampFormat::Seconds,
-                idle: std::time::Duration::from_secs(60),
+                idle_threshold: Some(std::time::Duration::from_secs(60)),
                 dim_repeated: true,
                 timeline_offset: offset,
                 show_timeline: true,
@@ -1084,6 +1085,29 @@ mod tests {
         assert_eq!(
             frame(&term, &timeline, geometry, 1).line_map,
             [Some(Line(0)), None, Some(Line(1))]
+        );
+        let hidden = Frame::new(
+            &term,
+            &timeline,
+            geometry,
+            Palette::new(false),
+            font("monospace"),
+            String::new(),
+            FrameOptions {
+                time: TimestampFormat::Seconds,
+                idle_threshold: None,
+                dim_repeated: true,
+                timeline_offset: 0,
+                show_timeline: true,
+                linux_highlights: None,
+                matches: &[],
+                current: 0,
+            },
+        );
+        assert_eq!(hidden.timeline_overflow, 0);
+        assert_eq!(
+            hidden.line_map,
+            [Some(Line(0)), Some(Line(1)), Some(Line(2))]
         );
         assert_eq!(term.grid().history_size(), 0);
     }

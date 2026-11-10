@@ -298,7 +298,7 @@ impl Workbench {
                 Button::new("file-follow")
                     .ghost()
                     .label("跟随终端")
-                    .tooltip("跟随终端当前目录（OSC 7 或 Shell 提示符）")
+                    .tooltip("跟随终端当前目录（OSC 7、Shell 工作目录或提示符）")
                     .h(px(23.))
                     .px(px(5.))
                     .text_size(px(12.))
@@ -326,6 +326,16 @@ impl Workbench {
             );
         let parent = file_parent(&directory, local);
         let selected = files.selected.clone().filter(|entry| !entry.is_dir);
+        let tool_width = if !local && width < px(236.) {
+            px(22.)
+        } else {
+            px(24.)
+        };
+        let toolbar_tool = |id, icon, title| {
+            file_tool(id, icon, title, palette)
+                .w(tool_width)
+                .min_w(tool_width)
+        };
         let toolbar = row()
             .h(px(32.))
             .flex_shrink_0()
@@ -334,7 +344,7 @@ impl Workbench {
             .border_b_1()
             .border_color(palette.line)
             .child(
-                file_tool("file-parent", IconName::ArrowUp, "上一级", palette)
+                toolbar_tool("file-parent", IconName::ArrowUp, "上一级")
                     .disabled(!can_operate || parent.is_none())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(path) = &parent {
@@ -344,21 +354,16 @@ impl Workbench {
             )
             .when(local, |toolbar| {
                 toolbar.child(
-                    file_tool(
-                        "file-pick-folder",
-                        IconName::FolderOpen,
-                        "选择本地文件夹…",
-                        palette,
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.pick_local_directory(id, window, cx);
-                    })),
+                    toolbar_tool("file-pick-folder", IconName::FolderOpen, "选择本地文件夹…")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.pick_local_directory(id, window, cx);
+                        })),
                 )
             })
             .when(!local, |toolbar| {
                 toolbar
                     .child(
-                        file_tool("file-new", IconName::FilePlus, "新建文件", palette)
+                        toolbar_tool("file-new", IconName::FilePlus, "新建文件")
                             .disabled(!can_operate)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if let Some(path) = this.upload_directory(id) {
@@ -367,7 +372,7 @@ impl Workbench {
                             })),
                     )
                     .child(
-                        file_tool("file-mkdir", IconName::FolderPlus, "新建文件夹", palette)
+                        toolbar_tool("file-mkdir", IconName::FolderPlus, "新建文件夹")
                             .disabled(!can_operate)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if let Some(path) = this.upload_directory(id) {
@@ -381,14 +386,14 @@ impl Workbench {
                             })),
                     )
                     .child(
-                        file_tool("file-upload", IconName::Upload, "上传文件…", palette)
+                        toolbar_tool("file-upload", IconName::Upload, "上传文件…")
                             .disabled(!can_operate)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.pick_upload(id, window, cx)
                             })),
                     )
                     .child(
-                        file_tool("file-download", IconName::Download, "下载所选文件", palette)
+                        toolbar_tool("file-download", IconName::Download, "下载所选文件")
                             .disabled(selected.is_none())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(entry) = selected.clone() {
@@ -398,20 +403,30 @@ impl Workbench {
                     )
             })
             .child(
-                file_tool(
-                    "file-send-path",
-                    IconName::Terminal,
-                    "发送路径到终端（优先使用选中项）",
-                    palette,
+                toolbar_tool(
+                    "file-insert-file-path",
+                    IconName::FileOutput,
+                    "插入文件路径到终端（所选文件）",
                 )
-                .disabled(!can_operate)
+                .disabled(files.insertion_path(PathTarget::File).is_none())
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.send_file_path(id, window, cx);
+                    this.insert_terminal_path(id, PathTarget::File, window, cx);
+                })),
+            )
+            .child(
+                toolbar_tool(
+                    "file-insert-folder-path",
+                    IconName::FolderOutput,
+                    "插入文件夹路径到终端（所选文件夹或当前目录）",
+                )
+                .disabled(files.insertion_path(PathTarget::Folder).is_none())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.insert_terminal_path(id, PathTarget::Folder, window, cx);
                 })),
             )
             .child(div().flex_1())
             .child(
-                file_tool(
+                toolbar_tool(
                     "file-hidden",
                     if !files.hide_hidden {
                         IconName::Eye
@@ -419,7 +434,6 @@ impl Workbench {
                         IconName::EyeOff
                     },
                     "显示隐藏文件",
-                    palette,
                 )
                 .when(!files.hide_hidden, |button| {
                     button.bg(palette.tint).text_color(palette.accent)
@@ -432,18 +446,13 @@ impl Workbench {
                 })),
             )
             .child(
-                file_tool(
-                    "file-filter-toggle",
-                    IconName::ListFilter,
-                    "筛选文件",
-                    palette,
-                )
-                .when(files.filter_open, |button| {
-                    button.bg(palette.tint).text_color(palette.accent)
-                })
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.toggle_file_filter(id, window, cx)),
-                ),
+                toolbar_tool("file-filter-toggle", IconName::ListFilter, "筛选文件")
+                    .when(files.filter_open, |button| {
+                        button.bg(palette.tint).text_color(palette.accent)
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_file_filter(id, window, cx)
+                    })),
             );
         let columns = row()
             .h(px(24.))
@@ -960,6 +969,7 @@ impl Workbench {
                             ));
                         }
                         this.active_file_editor = None;
+                        this.file_editor_to_activate = None;
                         cx.notify();
                     },
                 ))

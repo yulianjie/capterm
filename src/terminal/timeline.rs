@@ -492,6 +492,7 @@ impl Timeline {
         };
         if styled_prompt.is_some()
             || is_powershell_prompt(prompt)
+            || is_minimal_shell_prompt(prompt)
             || has_prompt_suffix
                 && prompt.split_whitespace().next().is_some_and(|part| {
                     part.contains('@')
@@ -544,6 +545,22 @@ impl Timeline {
             .retain(|number, block| block.last_line.unwrap_or(*number) >= oldest);
         self.systems.retain(|number, _| *number >= oldest);
     }
+}
+
+fn is_minimal_shell_prompt(prompt: &str) -> bool {
+    let Some(body) = prompt.strip_suffix(['$', '#']) else {
+        return false;
+    };
+    // BusyBox ash commonly shows "/path #" and Bash without an rc file uses
+    // "bash-5.2#". Some containers reduce PS1 to the marker alone.
+    body.is_empty()
+        || body.starts_with(['/', '~']) && body.ends_with(' ')
+        || body
+            .strip_prefix("bash-")
+            .or_else(|| body.strip_prefix("sh-"))
+            .is_some_and(|version| {
+                !version.is_empty() && version.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+            })
 }
 
 pub(super) fn is_powershell_prompt(text: &str) -> bool {

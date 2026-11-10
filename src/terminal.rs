@@ -252,6 +252,7 @@ pub struct TerminalView {
     launched_agent: Option<&'static str>,
     agent_started: Option<Instant>,
     cwd: Option<String>,
+    cwd_serial: u64,
     notification: Option<String>,
     notification_serial: u64,
     prompt_serial: u64,
@@ -274,7 +275,7 @@ pub struct TerminalView {
     show_numbers: bool,
     show_time: bool,
     timestamp_format: TimestampFormat,
-    idle_threshold: Duration,
+    idle_threshold: Option<Duration>,
     dim_repeated: bool,
     shift_enter: ShiftEnterPreference,
     font_size: Pixels,
@@ -323,6 +324,7 @@ impl TerminalView {
             launched_agent: None,
             agent_started: None,
             cwd: None,
+            cwd_serial: 0,
             notification: None,
             notification_serial: 0,
             prompt_serial: 0,
@@ -345,7 +347,7 @@ impl TerminalView {
             show_numbers: true,
             show_time: true,
             timestamp_format: TimestampFormat::default(),
-            idle_threshold: Duration::from_secs(60),
+            idle_threshold: None,
             dim_repeated: true,
             shift_enter: ShiftEnterPreference::default(),
             font_size: px(13.),
@@ -398,7 +400,7 @@ impl TerminalView {
     pub fn set_timeline_options(
         &mut self,
         format: TimestampFormat,
-        idle_threshold: Duration,
+        idle_threshold: Option<Duration>,
         dim_repeated: bool,
         cx: &mut Context<Self>,
     ) {
@@ -460,6 +462,10 @@ impl TerminalView {
 
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
+    }
+
+    pub fn cwd_serial(&self) -> u64 {
+        self.cwd_serial
     }
 
     pub fn prompt_serial(&self) -> u64 {
@@ -605,7 +611,10 @@ impl TerminalView {
 
     fn apply_marker(&mut self, marker: Marker, now: DateTime<Local>) {
         match marker {
-            Marker::Directory(path) => self.cwd = Some(path),
+            Marker::Directory(path) => {
+                self.cwd = Some(path);
+                self.cwd_serial = self.cwd_serial.wrapping_add(1);
+            }
             Marker::Notification(message) => self.push_notification(message),
             marker if !self.mode().contains(TermMode::ALT_SCREEN) => match marker {
                 Marker::Prompt => self.timeline.prompt(self.term.grid(), now),
@@ -731,6 +740,12 @@ impl TerminalView {
                 self.track_agent_change(previous);
             }
         }
+    }
+
+    pub fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.preedit.clear();
+        self.send_input(text.as_bytes().to_vec(), cx);
+        cx.notify();
     }
 
     pub fn send_draft(&mut self, text: &str, execute: bool, cx: &mut Context<Self>) {
@@ -1677,7 +1692,7 @@ impl Render for TerminalView {
                         view.preedit.clone(),
                         FrameOptions {
                             time: view.timestamp_format,
-                            idle: view.idle_threshold,
+                            idle_threshold: view.idle_threshold,
                             dim_repeated: view.dim_repeated,
                             timeline_offset: view.timeline_offset,
                             show_timeline: !view.manual_raw,
@@ -1834,9 +1849,7 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.preedit.clear();
-        self.send_input(text.as_bytes().to_vec(), cx);
-        cx.notify();
+        self.type_text(text, cx);
     }
 
     fn replace_and_mark_text_in_range(

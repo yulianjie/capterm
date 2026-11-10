@@ -34,6 +34,7 @@ mod files;
 mod forward;
 mod jumps;
 mod proxy;
+mod terminal_directory;
 
 use agent_forward::{AgentForwarding, AgentLease};
 pub(crate) use files::{

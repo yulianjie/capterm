@@ -90,7 +90,8 @@ pub(super) struct FilePane {
     wsl: Option<WslPaths>,
     terminal_directory: Option<String>,
     osc_directory: bool,
-    queried_login_directory: bool,
+    directory_probe_active: bool,
+    directory_probe_pending: bool,
     entries: Vec<RemoteEntry>,
     branches: HashMap<String, Option<Vec<RemoteEntry>>>,
     visible_rows: std::cell::RefCell<Option<browser::VisibleFileRows>>,
@@ -99,8 +100,7 @@ pub(super) struct FilePane {
     error: Option<String>,
     listing: u64,
     navigation: Option<String>,
-    editor_request: u64,
-    pending_editor: Option<PendingEditor>,
+    pending_editors: HashMap<String, PendingEditor>,
     follow_disabled: bool,
     hide_hidden: bool,
     filter_open: bool,
@@ -114,10 +114,34 @@ pub(super) struct FilePane {
     local_previews: Vec<tempfile::TempDir>,
 }
 
+enum PathTarget {
+    File,
+    Folder,
+}
+
+impl FilePane {
+    fn insertion_path(&self, target: PathTarget) -> Option<&str> {
+        if self.directory.is_empty() {
+            return None;
+        }
+        let selected = self.selected.as_ref();
+        match target {
+            PathTarget::File => selected
+                .filter(|entry| !entry.is_dir)
+                .map(|entry| entry.path.as_str()),
+            PathTarget::Folder => Some(
+                selected
+                    .filter(|entry| entry.is_dir)
+                    .map_or(self.directory.as_str(), |entry| entry.path.as_str()),
+            ),
+        }
+    }
+}
+
 struct PendingEditor {
-    path: String,
+    id: u64,
     encoding: TextEncoding,
-    pinned: bool,
+    open_external: bool,
     task: AbortHandle,
 }
 
@@ -211,7 +235,11 @@ struct Transfer {
 pub(super) enum FileEvent {
     List(u64, Result<(String, Vec<RemoteEntry>), String>),
     Branch(u64, String, Result<Vec<RemoteEntry>, String>),
-    Directory(Result<String, String>),
+    Directory {
+        prompt: u64,
+        osc: u64,
+        path: Option<String>,
+    },
     Text(u64, RemoteEntry, Result<Option<FileText>, String>),
     ClipboardReady(Result<(tempfile::TempDir, PathBuf), String>),
     Saved(u64, Rope, Result<SaveTextResult, String>),
@@ -339,6 +367,7 @@ impl Workbench {
         };
         let Some(directory) = path else { return };
         tab.files.osc_directory = true;
+        tab.files.directory_probe_pending = false;
         self.set_terminal_directory(id, directory, cx);
     }
 
@@ -360,11 +389,11 @@ impl Workbench {
         let Some(tab) = self.tab_mut(id).filter(|tab| tab.has_file_browser()) else {
             return;
         };
-        if tab.files.osc_directory {
-            return;
-        }
-        let prompt = tab.terminal.read(cx).prompt_text();
         if let Session::Local(shell) = tab.session {
+            if tab.files.osc_directory {
+                return;
+            }
+            let prompt = tab.terminal.read(cx).prompt_text();
             let directory = prompt.and_then(|line| match shell {
                 LocalShell::Wsl => {
                     let wsl = tab.files.wsl.as_ref()?;
@@ -377,31 +406,37 @@ impl Workbench {
             }
             return;
         }
-        if let Some(directory) = prompt.and_then(|line| prompt_directory(line, &tab.files.home)) {
-            self.set_terminal_directory(id, directory, cx);
+        // A report for this prompt wins. A later prompt can still need a probe
+        // after the shell stops emitting OSC 7.
+        if std::mem::take(&mut tab.files.osc_directory) {
             return;
         }
-        if tab.files.terminal_directory.is_some() || tab.files.queried_login_directory {
+        tab.files.directory_probe_pending = true;
+        self.probe_terminal_directory(id, cx);
+    }
+
+    fn probe_terminal_directory(&mut self, id: u64, cx: &Context<Self>) {
+        let Some(tab) = self.tab_mut(id) else { return };
+        if tab.files.directory_probe_active || !tab.files.directory_probe_pending {
             return;
         }
         let Some(connection) = tab.connection.clone() else {
             return;
         };
-        tab.files.queried_login_directory = true;
+        tab.files.directory_probe_active = true;
+        tab.files.directory_probe_pending = false;
+        let terminal = tab.terminal.read(cx);
+        let prompt = terminal.prompt_serial();
+        let osc = terminal.cwd_serial();
         let operation_id = tab.operation_id;
         let events = self.events.clone();
         self.runtime.spawn(async move {
-            let result = connection
-                .exec("pwd -P")
-                .await
-                .and_then(|output| {
-                    Ok(String::from_utf8(output)?
-                        .trim_end_matches(['\n', '\r'])
-                        .to_owned())
-                })
-                .map_err(report_error);
+            let path = connection.terminal_directory().await;
             let _ = events
-                .send(Event::File(operation_id, FileEvent::Directory(result)))
+                .send(Event::File(
+                    operation_id,
+                    FileEvent::Directory { prompt, osc, path },
+                ))
                 .await;
         });
     }
@@ -429,18 +464,14 @@ impl Workbench {
         &mut self,
         id: u64,
         entry: RemoteEntry,
-        pinned: bool,
+        explicit: bool,
         encoding: TextEncoding,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if entry.is_dir {
-            if let Some(tab) = self.tab_mut(id)
-                && tab.files.pending_editor.take().is_some()
-            {
-                tab.files.editor_request += 1;
-            }
-            if pinned {
+            self.file_editor_to_activate = None;
+            if explicit {
                 self.list(id, entry.path, cx);
             } else {
                 self.toggle_directory(id, entry, cx);
@@ -450,29 +481,23 @@ impl Workbench {
         if let Some(tab) = self.tab_mut(id) {
             tab.files.selected = Some(entry.clone());
         }
-        if self.activate_open_editor(id, &entry.path, pinned, window, cx) {
-            if let Some(tab) = self.tab_mut(id) {
-                tab.files.editor_request += 1;
-                tab.files.pending_editor = None;
-            }
+        if self.activate_open_editor(id, &entry.path, window, cx) {
             return;
         }
         let Some(tab) = self.tab_mut(id) else { return };
         let Some(source) = FileSource::for_tab(tab) else {
             return;
         };
-        if let Some(pending) = &mut tab.files.pending_editor
-            && pending.path == entry.path
+        if let Some(pending) = tab.files.pending_editors.get_mut(&entry.path)
             && pending.encoding == encoding
         {
-            pending.pinned |= pinned;
+            pending.open_external |= explicit;
+            self.file_editor_to_activate = Some(pending.id);
             cx.notify();
             return;
         }
-        tab.files.editor_request += 1;
-        tab.files.pending_editor = None;
-        let request = tab.files.editor_request;
         let operation_id = tab.operation_id;
+        let request = self.new_id();
         let path = entry.path.clone();
         let edit_limit_mb = self.settings.file_edit_limit_mb;
         let events = self.events.clone();
@@ -492,13 +517,17 @@ impl Workbench {
             })
             .abort_handle();
         if let Some(tab) = self.tab_mut(id) {
-            tab.files.pending_editor = Some(PendingEditor {
+            tab.files.pending_editors.insert(
                 path,
-                encoding,
-                pinned,
-                task,
-            });
+                PendingEditor {
+                    id: request,
+                    encoding,
+                    open_external: explicit,
+                    task,
+                },
+            );
         }
+        self.file_editor_to_activate = Some(request);
         cx.notify();
     }
 
@@ -535,30 +564,29 @@ impl Workbench {
             .then(|| tab.files.directory.clone())
     }
 
-    fn send_file_path(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    fn insert_terminal_path(
+        &mut self,
+        id: u64,
+        target: PathTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self
             .active
             .filter(|active| *active == id)
-            .and_then(|active| self.tab_mut(active))
-            .filter(|tab| tab.has_file_browser() && !tab.files.directory.is_empty())
+            .and_then(|active| self.tab(active))
+            .filter(|tab| tab.has_file_browser())
         else {
             return;
         };
-        let path = tab
-            .files
-            .selected
-            .as_ref()
-            .map_or(tab.files.directory.as_str(), |entry| entry.path.as_str());
+        let Some(path) = tab.files.insertion_path(target) else {
+            return;
+        };
         let argument = terminal_path_argument(path, &tab.session, tab.files.wsl.as_ref());
         match argument {
             Ok(argument) => {
-                // A pending preview from selecting the row must not retake focus.
-                if tab.files.pending_editor.take().is_some() {
-                    tab.files.editor_request += 1;
-                }
-                tab.terminal.update(cx, |terminal, cx| {
-                    terminal.send_draft(&argument, false, cx);
-                });
+                tab.terminal
+                    .update(cx, |terminal, cx| terminal.type_text(&argument, cx));
                 self.select_tab(id, window, cx);
             }
             Err(message) => self.announce(message, cx),
@@ -1184,31 +1212,46 @@ impl Workbench {
                     *tab.files.visible_rows.get_mut() = None;
                 }
             }
-            FileEvent::Directory(Ok(directory))
-                if !tab.files.osc_directory
-                    && tab.files.terminal_directory.is_none()
-                    && directory.starts_with('/') =>
-            {
-                self.set_terminal_directory(id, directory, cx);
+            FileEvent::Directory { prompt, osc, path } => {
+                tab.files.directory_probe_active = false;
+                let terminal = tab.terminal.read(cx);
+                if prompt == terminal.prompt_serial()
+                    && osc == terminal.cwd_serial()
+                    && let Some(directory) =
+                        path.or_else(|| prompt_directory(terminal.prompt_text()?, &tab.files.home))
+                {
+                    self.set_terminal_directory(id, directory, cx);
+                }
+                self.probe_terminal_directory(id, cx);
             }
-            FileEvent::Text(request, entry, result) if request == tab.files.editor_request => {
-                let local = tab.is_local();
-                let pinned = tab
-                    .files
-                    .pending_editor
-                    .take()
-                    .is_some_and(|pending| pending.pinned);
-                if self.active != Some(id) {
+            FileEvent::Text(request, entry, result) => {
+                let std::collections::hash_map::Entry::Occupied(pending) =
+                    tab.files.pending_editors.entry(entry.path.clone())
+                else {
+                    return;
+                };
+                if pending.get().id != request {
                     return;
                 }
+                let open_external = pending.remove().open_external;
+                let local = tab.is_local();
+                let activate =
+                    self.active == Some(id) && self.file_editor_to_activate == Some(request);
                 match result {
-                    Ok(Some(text)) => self.install_file_editor(id, entry, text, pinned, window, cx),
-                    Ok(None) if pinned && local => {
+                    Ok(Some(text)) => {
+                        self.install_file_editor(id, request, entry, text, window, cx)
+                    }
+                    Ok(None) if activate && open_external && local => {
                         self.open_system_entry(&entry, cx);
                     }
-                    Ok(None) if pinned => self.download_and_open(id, entry, cx),
-                    Ok(None) => {}
-                    Err(error) => self.announce(format!("无法打开 {} · {error}", entry.name), cx),
+                    Ok(None) if activate && open_external => self.download_and_open(id, entry, cx),
+                    Err(error) if self.active == Some(id) => {
+                        self.announce(format!("无法打开 {} · {error}", entry.name), cx);
+                    }
+                    _ => {}
+                }
+                if self.file_editor_to_activate == Some(request) {
+                    self.file_editor_to_activate = None;
                 }
             }
             FileEvent::ClipboardReady(Ok((directory, path))) => {
@@ -1332,6 +1375,18 @@ fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
 
+fn linux_path_argument(path: &str) -> String {
+    if path.starts_with('/')
+        && path
+            .chars()
+            .all(|character| character.is_alphanumeric() || "/._-+@:".contains(character))
+    {
+        path.to_owned()
+    } else {
+        shell_quote(path)
+    }
+}
+
 fn terminal_path_argument(
     path: &str,
     session: &Session,
@@ -1342,11 +1397,11 @@ fn terminal_path_argument(
         return Err("路径包含控制字符，无法安全发送到终端");
     }
     match session {
-        Session::Ssh(_) => Ok(shell_quote(path)),
+        Session::Ssh(_) => Ok(linux_path_argument(path)),
         Session::Local(LocalShell::Wsl) => wsl
             .and_then(|wsl| wsl.linux_path(path))
             .filter(|path| !path.chars().any(char::is_control))
-            .map(|path| shell_quote(&path))
+            .map(|path| linux_path_argument(&path))
             .ok_or("此路径无法映射到当前 WSL 发行版"),
         Session::Local(LocalShell::PowerShell) => {
             let mut quoted = String::with_capacity(path.len() + 2);
@@ -1375,8 +1430,16 @@ fn terminal_path_argument(
 
 fn prompt_directory(line: &str, home: &str) -> Option<String> {
     let line = line.trim().strip_suffix(['$', '#', '%'])?;
-    let (host, path) = line.split_once(':')?;
-    if !host.contains('@') {
+    let path = if line.starts_with(['/', '~']) {
+        line.strip_suffix(' ')?
+    } else {
+        let (host, path) = line.split_once(':')?;
+        if !host.contains('@') {
+            return None;
+        }
+        path
+    };
+    if path.chars().any(char::is_control) {
         return None;
     }
     if path.starts_with('/') {
@@ -1393,7 +1456,64 @@ fn prompt_directory(line: &str, home: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalShell, Session, shell_quote, terminal_path_argument};
+    use super::{
+        FilePane, LocalShell, PathTarget, RemoteEntry, Session, linux_path_argument,
+        prompt_directory, terminal_path_argument,
+    };
+
+    #[test]
+    fn inserts_file_and_folder_paths_from_their_respective_targets() {
+        let mut files = FilePane::default();
+        assert_eq!(files.insertion_path(PathTarget::Folder), None);
+        files.directory = "/srv/project".into();
+        assert_eq!(files.insertion_path(PathTarget::File), None);
+        assert_eq!(
+            files.insertion_path(PathTarget::Folder),
+            Some("/srv/project")
+        );
+
+        files.selected = Some(RemoteEntry {
+            name: "notes.txt".into(),
+            path: "/srv/project/docs/notes.txt".into(),
+            is_dir: false,
+            hidden: false,
+            size: None,
+            mtime: None,
+            permissions: None,
+        });
+        assert_eq!(
+            files.insertion_path(PathTarget::File),
+            Some("/srv/project/docs/notes.txt")
+        );
+        assert_eq!(
+            files.insertion_path(PathTarget::Folder),
+            Some("/srv/project")
+        );
+
+        let selected = files.selected.as_mut().unwrap();
+        selected.name = "docs".into();
+        selected.path = "/srv/project/docs".into();
+        selected.is_dir = true;
+        assert_eq!(files.insertion_path(PathTarget::File), None);
+        assert_eq!(
+            files.insertion_path(PathTarget::Folder),
+            Some("/srv/project/docs")
+        );
+    }
+
+    #[test]
+    fn extracts_full_paths_from_container_prompts() {
+        assert_eq!(
+            prompt_directory("/tmp/with spaces # ", "/root").as_deref(),
+            Some("/tmp/with spaces")
+        );
+        assert_eq!(
+            prompt_directory("root@container:~/data# ", "/root").as_deref(),
+            Some("/root/data")
+        );
+        assert_eq!(prompt_directory("[root@container data]# ", "/root"), None);
+        assert_eq!(prompt_directory("# ", "/root"), None);
+    }
 
     #[test]
     fn quotes_file_paths_for_the_receiving_shell() {
@@ -1411,11 +1531,25 @@ mod tests {
             terminal_path_argument(r"C:\", &cmd, None).unwrap(),
             r#""C:"\"#
         );
-        assert_eq!(
-            shell_quote("/tmp/O'Neil's $file"),
-            r"'/tmp/O'\''Neil'\''s $file'"
-        );
         assert!(terminal_path_argument("C:\\unsafe\nfile", &powershell, None).is_err());
         assert!(terminal_path_argument(r"C:\%TEMP%\file", &cmd, None).is_err());
+    }
+
+    #[test]
+    fn linux_file_paths_are_quoted_only_when_needed() {
+        for path in [
+            "/",
+            "/home/user/project-1/src/main.rs",
+            "/tmp/file+tag@1_0",
+            "/root/项目/日志.txt",
+        ] {
+            assert_eq!(linux_path_argument(path), path);
+        }
+        assert_eq!(linux_path_argument("/tmp/two words"), "'/tmp/two words'");
+        assert_eq!(linux_path_argument("/tmp/file[1]*"), "'/tmp/file[1]*'");
+        assert_eq!(
+            linux_path_argument("/tmp/O'Neil's $file"),
+            r"'/tmp/O'\''Neil'\''s $file'"
+        );
     }
 }

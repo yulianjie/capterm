@@ -249,18 +249,24 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        let result = if self.can_remember_password(profile) {
-            credentials::load(profile)
-        } else {
-            Ok(None)
-        };
-        match result {
+        match self.stored_ssh_password(profile) {
             Ok(Some(password)) => Some(password),
             result => {
                 let error = result.err().map(|error| format!("{error:#}"));
                 self.credential_dialog(profile.clone(), action, error, window, cx);
                 None
             }
+        }
+    }
+
+    pub(super) fn stored_ssh_password(
+        &self,
+        profile: &ConnectionProfile,
+    ) -> anyhow::Result<Option<String>> {
+        if self.can_remember_password(profile) {
+            credentials::load(profile)
+        } else {
+            Ok(None)
         }
     }
 

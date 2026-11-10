@@ -709,7 +709,6 @@ fn terminal_line_spacing(settings: &Settings) -> f32 {
 fn appearance(
     settings: &Settings,
     view: &View,
-    idle_input: &IdleInput,
     palette: Palette,
     fonts: &FontPickers,
     show_caption: bool,
@@ -852,12 +851,6 @@ fn appearance(
                         |s, v| s.dim_repeated_timestamps = v,
                     ),
                     palette,
-                ))
-                .child(setting_line(
-                    "空闲间隔线",
-                    "两行之间超出时长时插入分隔线。输入后按 Enter 或离开输入框保存。",
-                    idle_input.render(palette),
-                    palette,
                 )),
         )
 }
@@ -927,7 +920,12 @@ fn linux_highlight_settings(settings: &Settings, view: &View, palette: Palette) 
     ))
 }
 
-fn terminal_settings(settings: &Settings, view: &View, palette: Palette) -> Div {
+fn terminal_settings(
+    settings: &Settings,
+    view: &View,
+    idle_input: &IdleInput,
+    palette: Palette,
+) -> Div {
     let shift_enter = view.clone();
     let notifications = view.clone();
     let osc52 = view.clone();
@@ -1083,10 +1081,35 @@ fn terminal_settings(settings: &Settings, view: &View, palette: Palette) -> Div 
         )),
     )
     .child(linux_highlight_settings(settings, view, palette))
+    .child(
+        settings_section("终端显示", "", palette)
+            .border_t_1()
+            .pb(px(16.))
+            .child(setting_line(
+                "显示空闲间隔线",
+                "在相邻两行相隔较久时标注空闲时长。",
+                toggle_setting(
+                    "set-show-idle-separator",
+                    settings.show_idle_separator,
+                    view,
+                    |settings, value| settings.show_idle_separator = value,
+                ),
+                palette,
+            ))
+            .when(settings.show_idle_separator, |section| {
+                section.child(setting_line(
+                    "空闲间隔线阈值",
+                    "输入秒数后按 Enter 或离开输入框保存。",
+                    idle_input.render(palette),
+                    palette,
+                ))
+            }),
+    )
 }
 
 fn ssh_settings(settings: &Settings, view: &View, palette: Palette, mono: SharedString) -> Div {
     let trust_view = view.clone();
+    let session_view = view.clone();
     let mut agents = vec![
         (
             None,
@@ -1194,11 +1217,33 @@ fn ssh_settings(settings: &Settings, view: &View, palette: Palette, mono: Shared
     col()
         .flex_shrink_0()
         .child(
+            settings_section("已保存的会话", "", palette).child(setting_line(
+                "打开方式",
+                "双击右侧会话列表中的条目，或点击条目上的连接按钮时使用。",
+                preference_field(
+                    "set-saved-session-open-mode",
+                    settings.open_saved_session_in_new_tab,
+                    &[(false, "切换到已打开的标签"), (true, "在新标签中连接")],
+                    180.,
+                    palette,
+                    move |value, cx| {
+                        let _ = session_view.update(cx, |this, cx| {
+                            let mut settings = this.settings.clone();
+                            settings.open_saved_session_in_new_tab = value;
+                            this.persist(settings, cx);
+                        });
+                    },
+                ),
+                palette,
+            )),
+        )
+        .child(
             settings_section(
                 "SSH 配置文件",
                 "按照添加顺序显示各配置文件与已同步会话。",
                 palette,
             )
+            .border_t_1()
             .when(!settings.linked_configs.is_empty(), |section| {
                 section.child(
                     col()
@@ -1621,15 +1666,8 @@ impl Workbench {
                 }));
             let theme = Theme::global(cx);
             let body = match selected.get() {
-                0 => appearance(
-                    settings,
-                    &view,
-                    &idle_input,
-                    palette,
-                    &fonts,
-                    width >= px(720.),
-                ),
-                1 => terminal_settings(settings, &view, palette),
+                0 => appearance(settings, &view, palette, &fonts, width >= px(720.)),
+                1 => terminal_settings(settings, &view, &idle_input, palette),
                 2 => ssh_settings(settings, &view, palette, theme.mono_font_family.clone()),
                 3 => transfer_settings(settings, &view, palette, theme.mono_font_family.clone()),
                 4 => monitor_settings(settings, &view, palette),

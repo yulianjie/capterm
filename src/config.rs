@@ -342,7 +342,10 @@ pub struct Settings {
     pub show_timestamps: bool,
     pub timestamp_format: TimestampPreference,
     pub dim_repeated_timestamps: bool,
+    pub show_idle_separator: bool,
     pub idle_threshold: u64,
+    pub left_sidebar_width: f32,
+    pub right_sidebar_width: f32,
     pub terminal_font_size: f32,
     pub terminal_line_height: f32,
     pub terminal_scrollback_lines: u64,
@@ -369,6 +372,7 @@ pub struct Settings {
     pub ssh_identity_agent: Option<String>,
     pub ssh_require_known_host: bool,
     pub reuse_jumps: bool,
+    pub open_saved_session_in_new_tab: bool,
     pub download_directory: String,
     pub transfer_concurrency: usize,
     pub transfer_conflict: TransferConflictPreference,
@@ -388,7 +392,10 @@ impl Default for Settings {
             show_timestamps: true,
             timestamp_format: TimestampPreference::Seconds,
             dim_repeated_timestamps: true,
+            show_idle_separator: false,
             idle_threshold: 60,
+            left_sidebar_width: 272.,
+            right_sidebar_width: 296.,
             terminal_font_size: 13.,
             terminal_line_height: 20.,
             terminal_scrollback_lines: 10_000,
@@ -415,6 +422,7 @@ impl Default for Settings {
             ssh_identity_agent: None,
             ssh_require_known_host: false,
             reuse_jumps: true,
+            open_saved_session_in_new_tab: false,
             download_directory: String::new(),
             transfer_concurrency: 3,
             transfer_conflict: TransferConflictPreference::Ask,
@@ -518,18 +526,7 @@ impl Settings {
     }
 
     pub fn save(&self) -> Result<()> {
-        let directory = data_dir()?;
-        fs::create_dir_all(&directory)?;
-        let mut temp = tempfile::NamedTempFile::new_in(&directory)?;
-        {
-            let mut writer = BufWriter::new(temp.as_file_mut());
-            serde_json::to_writer_pretty(&mut writer, self)?;
-            writer.write_all(b"\n")?;
-            writer.flush()?;
-        }
-        temp.as_file().sync_all()?;
-        temp.persist(directory.join("settings.json"))?;
-        Ok(())
+        save_json("settings.json", self)
     }
 
     pub fn unlink(&mut self, path: &str) {
@@ -620,8 +617,27 @@ fn data_dir() -> Result<PathBuf> {
         .join("CapTerm"))
 }
 
+pub(crate) fn save_json(name: &str, value: &impl Serialize) -> Result<()> {
+    let directory = data_dir()?;
+    fs::create_dir_all(&directory)?;
+    let mut temp = tempfile::NamedTempFile::new_in(&directory)?;
+    {
+        let mut writer = BufWriter::new(temp.as_file_mut());
+        serde_json::to_writer_pretty(&mut writer, value)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+    }
+    temp.as_file().sync_all()?;
+    temp.persist(directory.join(name))?;
+    Ok(())
+}
+
 pub fn settings_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("settings.json"))
+}
+
+pub(crate) fn session_state_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("sessions.json"))
 }
 
 pub fn linux_highlights_path() -> Result<PathBuf> {
@@ -1549,6 +1565,25 @@ mod tests {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.osc52_write, Osc52WritePreference::Ask);
         assert!(settings.confirm_multiline_paste);
+    }
+
+    #[test]
+    fn workbench_display_preferences_keep_legacy_defaults_and_round_trip() -> Result<()> {
+        let mut settings: Settings = serde_json::from_str(r#"{"idle_threshold":30}"#)?;
+        assert_eq!(settings.left_sidebar_width, 272.);
+        assert_eq!(settings.right_sidebar_width, 296.);
+        assert!(!settings.show_idle_separator);
+        assert_eq!(settings.idle_threshold, 30);
+
+        settings.left_sidebar_width = 350.;
+        settings.right_sidebar_width = 380.;
+        settings.show_idle_separator = true;
+        let loaded: Settings = serde_json::from_value(serde_json::to_value(settings)?)?;
+        assert_eq!(loaded.left_sidebar_width, 350.);
+        assert_eq!(loaded.right_sidebar_width, 380.);
+        assert!(loaded.show_idle_separator);
+        assert_eq!(loaded.idle_threshold, 30);
+        Ok(())
     }
 
     #[test]

@@ -61,7 +61,7 @@ impl Picker {
             key_profile.auth = config::AuthMethod::Key;
             items.push(Choice::new(
                 format!("连接到 {}", ui::target(&profile)),
-                "快速连接 · 不保存会话",
+                "快速连接 · 不加入已保存的会话",
                 IconName::Terminal,
                 move |view, window, cx| view.connect(profile.clone(), None, window, cx),
             ));
@@ -767,11 +767,10 @@ impl Workbench {
         let Some(tab) = self.tab_mut(id) else { return };
         let terminal = tab.terminal.read(cx);
         let observed = &mut tab.observed_terminal;
-        let changed_dir = terminal.cwd() != observed.directory.as_deref();
-        if changed_dir {
-            observed.directory = terminal.cwd().map(str::to_owned);
-        }
-        let dir = changed_dir.then(|| observed.directory.clone()).flatten();
+        let dir = (observed.directory != terminal.cwd_serial())
+            .then(|| terminal.cwd().map(str::to_owned))
+            .flatten();
+        observed.directory = terminal.cwd_serial();
         let prompt = observed.prompt != terminal.prompt_serial();
         let note = (observed.notification != terminal.notification_serial())
             .then(|| terminal.notification().unwrap_or("终端响铃").to_owned());

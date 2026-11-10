@@ -694,6 +694,18 @@ mod tests {
     }
 
     #[test]
+    fn detects_container_prompts_without_user_or_host() {
+        for prompt in ["# ", "$ ", "/tmp/work folder # ", "bash-5.2# ", "sh-5.2$ "] {
+            let mut terminal = TerminalFixture::new(80, 6);
+            terminal.feed(prompt.as_bytes(), 1);
+            let initial = terminal.timeline.latest_prompt().unwrap();
+            terminal.feed(b"cd /tmp\r\n", 2);
+            terminal.feed(prompt.as_bytes(), 3);
+            assert!(terminal.timeline.latest_prompt().unwrap() > initial);
+        }
+    }
+
+    #[test]
     fn negotiates_only_implemented_keyboard_flags_and_restores_primary() {
         let events = TerminalEvents::default();
         let mut term = Term::new(Config::default(), &TerminalSize::default(), events.clone());

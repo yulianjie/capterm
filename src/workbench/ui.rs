@@ -340,7 +340,12 @@ pub(super) fn menu_action(
     })
 }
 
-#[derive(Clone, Copy)]
+pub(super) const MIN_LEFT_WIDTH: Pixels = px(220.);
+pub(super) const MAX_LEFT_WIDTH: Pixels = px(480.);
+pub(super) const MIN_RIGHT_WIDTH: Pixels = px(260.);
+pub(super) const MAX_RIGHT_WIDTH: Pixels = px(440.);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Split {
     Files,
     Sessions,
@@ -378,12 +383,13 @@ impl Render for Workbench {
         } else {
             px(0.)
         };
-        let max_left = (size.width - right_reserve - px(340.)).clamp(px(220.), px(480.));
+        let max_left =
+            (size.width - right_reserve - px(340.)).clamp(MIN_LEFT_WIDTH, MAX_LEFT_WIDTH);
         let left = self.left_width.min(max_left);
         let left_reserve = if full_left { left } else { px(0.) };
         let right = self
             .right_width
-            .min((size.width - left_reserve - px(340.)).clamp(px(260.), px(440.)));
+            .min((size.width - left_reserve - px(340.)).clamp(MIN_RIGHT_WIDTH, MAX_RIGHT_WIDTH));
         let monitor_height = self
             .monitor_height
             .min((size.height - px(184.)).max(px(130.)));
@@ -497,6 +503,11 @@ impl Render for Workbench {
             .text_size(px(13.))
             .text_color(p.ink)
             .bg(p.app)
+            .capture_any_mouse_up(cx.listener(Self::remember_sidebar_widths))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(Self::remember_sidebar_widths),
+            )
             .when(!self.focus_mode, |root| {
                 root.child(self.top(p, mono.clone(), size.width, cx))
             })
@@ -511,6 +522,30 @@ impl Render for Workbench {
 }
 
 impl Workbench {
+    fn remember_sidebar_widths(
+        &mut self,
+        event: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left || !cx.has_active_drag() {
+            return;
+        }
+        let left = f32::from(self.left_width);
+        let right = f32::from(self.right_width);
+        if (left, right)
+            != (
+                self.settings.left_sidebar_width,
+                self.settings.right_sidebar_width,
+            )
+        {
+            let mut settings = self.settings.clone();
+            settings.left_sidebar_width = left;
+            settings.right_sidebar_width = right;
+            self.persist(settings, cx);
+        }
+    }
+
     fn splitter(&self, split: Split, cx: &Context<Self>) -> impl IntoElement {
         let (id, axis, edge) = match split {
             Split::Files => ("resize-files", Axis::Horizontal, HandleEdge::Trailing),
@@ -521,14 +556,21 @@ impl Workbench {
             .inside(edge)
             .on_drag(split, |_, _, _, cx| cx.new(|_| SplitDrag))
             .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<Split>, window, cx| {
+                cx.listener(move |this, event: &DragMoveEvent<Split>, window, cx| {
+                    if *event.drag(cx) != split {
+                        return;
+                    }
                     let viewport = window.viewport_size();
                     let position = event.event.position;
-                    match event.drag(cx) {
-                        Split::Files => this.left_width = position.x.clamp(px(220.), px(480.)),
+                    match split {
+                        Split::Files => {
+                            this.left_width =
+                                position.x.round().clamp(MIN_LEFT_WIDTH, MAX_LEFT_WIDTH);
+                        }
                         Split::Sessions => {
-                            this.right_width =
-                                (viewport.width - position.x).clamp(px(260.), px(440.))
+                            this.right_width = (viewport.width - position.x)
+                                .round()
+                                .clamp(MIN_RIGHT_WIDTH, MAX_RIGHT_WIDTH);
                         }
                         Split::Monitor => {
                             this.monitor_height = (viewport.height - px(24.) - position.y)
@@ -1941,7 +1983,8 @@ impl Workbench {
                             .on_click(cx.listener({
                                 let connect = connect.clone();
                                 move |view, _, window, cx| {
-                                    view.connect(connect.clone(), None, window, cx)
+                                    cx.stop_propagation();
+                                    view.open_saved_session(connect.clone(), window, cx)
                                 }
                             })),
                     )
@@ -1956,7 +1999,7 @@ impl Workbench {
             )
             .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                 if event.click_count() >= 2 || event.is_keyboard() {
-                    view.connect(connect.clone(), None, window, cx);
+                    view.open_saved_session(connect.clone(), window, cx);
                 }
             }))
             .context_menu(move |menu, _, _| {

@@ -28,7 +28,6 @@ pub(in crate::workbench) struct FileEditor {
     language: (&'static str, &'static str),
     endings: &'static str,
     large: bool,
-    pinned: bool,
     dirty: bool,
     busy: bool,
     cursor: (u32, u32),
@@ -48,18 +47,16 @@ impl Workbench {
         &mut self,
         terminal: u64,
         path: &str,
-        pinned: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(editor) = self
             .file_editors
-            .iter_mut()
+            .iter()
             .find(|editor| editor.terminal == terminal && editor.entry.path == path)
         else {
             return false;
         };
-        editor.pinned |= pinned;
         let id = editor.id;
         self.activate_file_editor(id, window, cx);
         true
@@ -74,6 +71,7 @@ impl Workbench {
         let Some(editor) = self.file_editors.iter().find(|editor| editor.id == id) else {
             return;
         };
+        self.file_editor_to_activate = None;
         self.active_file_editor = Some(id);
         self.active = self.tab(editor.terminal).map(|tab| tab.id);
         self.set_monitored_tab(self.active);
@@ -84,9 +82,9 @@ impl Workbench {
     pub(super) fn install_file_editor(
         &mut self,
         terminal: u64,
+        id: u64,
         entry: RemoteEntry,
         mut original: FileText,
-        pinned: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -97,7 +95,6 @@ impl Workbench {
             self.tab(terminal)
                 .map_or_else(String::new, |tab| tab.name().to_owned())
         };
-        let id = self.new_id();
         let language = editor_language(&entry.name);
         let endings = line_endings(&original.text);
         let large = original.text.len() > FULL_EDITOR_BYTES;
@@ -128,9 +125,6 @@ impl Workbench {
             };
             let value = state.read(cx).text();
             editor.dirty = value != &editor.baseline;
-            if editor.dirty {
-                editor.pinned = true;
-            }
             let warn = Palette::new(this.settings.light).warn;
             let decorations = if editor.dirty
                 && !editor.large
@@ -167,7 +161,6 @@ impl Workbench {
             language,
             endings,
             large,
-            pinned,
             dirty: false,
             busy: false,
             cursor: (0, 0),
@@ -177,13 +170,12 @@ impl Workbench {
             _change: change,
             _cursor: cursor,
         };
-        if !pinned && let Some(preview) = self.file_editors.iter_mut().find(|editor| !editor.pinned)
-        {
-            *preview = editor;
-        } else {
-            self.file_editors.push(editor);
+        // A later click can finish loading before an earlier one.
+        let index = self.file_editors.partition_point(|editor| editor.id < id);
+        self.file_editors.insert(index, editor);
+        if self.active == Some(terminal) && self.file_editor_to_activate == Some(id) {
+            self.activate_file_editor(id, window, cx);
         }
-        self.activate_file_editor(id, window, cx);
     }
 
     pub(in crate::workbench) fn close_file_editor(
@@ -445,13 +437,7 @@ impl Workbench {
                     .cursor_pointer()
                     .tab_stop(true)
                     .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        if event.click_count() > 1
-                            && let Some(editor) =
-                                this.file_editors.iter_mut().find(|editor| editor.id == id)
-                        {
-                            editor.pinned = true;
-                        }
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.activate_file_editor(id, window, cx);
                     }))
                     .when(active, |tab| {
@@ -471,8 +457,7 @@ impl Workbench {
                             .flex_1()
                             .truncate()
                             .text_size(px(13.))
-                            .when(!editor.pinned, |name| name.italic())
-                            .when(editor.pinned, |name| name.font_weight(FontWeight::MEDIUM))
+                            .font_weight(FontWeight::MEDIUM)
                             .child(editor.entry.name.clone()),
                     )
                     .child(

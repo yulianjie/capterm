@@ -2,6 +2,7 @@ mod commands;
 mod dialogs;
 mod files;
 mod monitor;
+mod sessions;
 mod ui;
 
 use std::cell::{Cell, RefCell};
@@ -113,7 +114,7 @@ struct SessionNotice {
 
 #[derive(Default)]
 struct TerminalObservation {
-    directory: Option<String>,
+    directory: u64,
     prompt: u64,
     notification: u64,
     fullscreen: bool,
@@ -297,6 +298,7 @@ struct Workbench {
     monitor_interval: Arc<AtomicU64>,
     file_editors: Vec<files::FileEditor>,
     active_file_editor: Option<u64>,
+    file_editor_to_activate: Option<u64>,
     _pump: Task<()>,
     _subscriptions: Vec<Subscription>,
     runtime: tokio::runtime::Runtime,
@@ -356,6 +358,10 @@ impl Workbench {
             };
         let mut this = Self {
             notice: load_error.clone().or(highlight_error).unwrap_or_default(),
+            left_width: px(settings.left_sidebar_width)
+                .clamp(ui::MIN_LEFT_WIDTH, ui::MAX_LEFT_WIDTH),
+            right_width: px(settings.right_sidebar_width)
+                .clamp(ui::MIN_RIGHT_WIDTH, ui::MAX_RIGHT_WIDTH),
             settings,
             linux_highlights: Rc::new(linux_highlights),
             load_error,
@@ -374,8 +380,6 @@ impl Workbench {
             left_visible: true,
             right_visible: true,
             focus_mode: false,
-            left_width: px(272.),
-            right_width: px(296.),
             monitor_height: px(424.),
             collapsed_groups: HashSet::new(),
             drawer: None,
@@ -389,11 +393,13 @@ impl Workbench {
             monitor_interval,
             file_editors: Vec::new(),
             active_file_editor: None,
+            file_editor_to_activate: None,
             _pump: pump,
             _subscriptions: vec![filter_subscription, activation, appearance, keys],
             runtime,
         };
         this.start_linked_config_sync(window, cx);
+        this.restore_on_open(window, cx);
         this
     }
 
@@ -577,6 +583,7 @@ impl Workbench {
                 .update(cx, |terminal, cx| terminal.focus(window, cx));
             self.active = Some(id);
             self.active_file_editor = None;
+            self.file_editor_to_activate = None;
             self.set_monitored_tab(Some(id));
             if let Some(tab) = self.tab_mut(id) {
                 tab.pending_notification = false;
@@ -641,25 +648,54 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(tab) = self
-            .tabs
+        if let Some(id) = self.reusable_ssh_tab(&profile, false) {
+            self.select_tab(id, window, cx);
+        } else {
+            self.connect_new(profile, password, window, cx);
+        }
+    }
+
+    fn open_saved_session(
+        &mut self,
+        profile: ConnectionProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings.open_saved_session_in_new_tab
+            && let Some(id) = self.reusable_ssh_tab(&profile, true)
+        {
+            self.select_tab(id, window, cx);
+        } else {
+            self.connect_new(profile, None, window, cx);
+        }
+    }
+
+    fn reusable_ssh_tab(
+        &self,
+        profile: &ConnectionProfile,
+        include_disconnected: bool,
+    ) -> Option<u64> {
+        self.tabs
             .iter()
             .filter(|tab| {
                 tab.ssh_profile()
                     .is_some_and(|saved| saved.id == profile.id)
-                    && matches!(tab.phase, Phase::Connected | Phase::Connecting)
+                    && (include_disconnected
+                        || matches!(tab.phase, Phase::Connected | Phase::Connecting))
             })
-            .max_by_key(|tab| (Some(tab.id) == self.active, tab.phase == Phase::Connected))
-        {
-            self.select_tab(tab.id, window, cx);
-            return;
-        }
-        self.connect_new(profile, password, window, cx);
+            .max_by_key(|tab| {
+                (
+                    Some(tab.id) == self.active,
+                    tab.phase == Phase::Connected,
+                    tab.phase == Phase::Connecting,
+                )
+            })
+            .map(|tab| tab.id)
     }
 
     fn connect_new(
         &mut self,
-        mut profile: ConnectionProfile,
+        profile: ConnectionProfile,
         password: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -677,18 +713,25 @@ impl Workbench {
         } else {
             password
         };
-        let host_keys = match self.ssh_host_keys() {
-            Ok(path) => path,
-            Err(error) => {
-                self.announce(format!("无法打开已知主机文件：{error:#}"), cx);
-                return;
-            }
-        };
+        match self.start_ssh_tab(profile, password, window, cx) {
+            Ok(id) => self.select_tab(id, window, cx),
+            Err(error) => self.announce(format!("无法打开已知主机文件：{error:#}"), cx),
+        }
+    }
+
+    fn start_ssh_tab(
+        &mut self,
+        mut profile: ConnectionProfile,
+        password: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<u64> {
+        let host_keys = self.ssh_host_keys()?;
         self.settings.resolve_jump_references(&mut profile);
         let mut target = profile.clone();
         self.settings.apply_ssh_defaults(&mut target);
         let reuse_jumps = self.settings.reuse_jumps;
-        self.start_tab(
+        Ok(self.start_tab(
             Session::Ssh(profile),
             password.is_some(),
             window,
@@ -704,7 +747,7 @@ impl Workbench {
                     events,
                 )
             },
-        );
+        ))
     }
 
     fn request_reconnect(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -810,6 +853,16 @@ impl Workbench {
     }
 
     fn launch_local(&mut self, shell: LocalShell, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.start_local_tab(shell, window, cx);
+        self.select_tab(id, window, cx);
+    }
+
+    fn start_local_tab(
+        &mut self,
+        shell: LocalShell,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         self.start_tab(
             Session::Local(shell),
             false,
@@ -843,7 +896,7 @@ impl Workbench {
                     relay_shell_output(id, output, &events).await;
                 }
             },
-        );
+        )
     }
 
     fn build_terminal(
@@ -895,7 +948,23 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
         run: impl FnOnce(u64, TerminalSize, async_channel::Sender<Event>) -> F,
-    ) {
+    ) -> u64 {
+        let id = self.add_tab(session, ssh_password_auth, window, cx);
+        let tab = self.tabs.last_mut().expect("tab was just added");
+        let initial = tab.terminal.read(cx).size();
+        tab.phase = Phase::Connecting;
+        tab.operation = Some(self.runtime.spawn(run(id, initial, self.events.clone())));
+        self.notice.clear();
+        id
+    }
+
+    fn add_tab(
+        &mut self,
+        session: Session,
+        ssh_password_auth: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         let id = self.new_id();
         let link = Rc::new(TerminalLink::default());
         let (terminal, terminal_subscriptions) =
@@ -918,8 +987,6 @@ impl Workbench {
                     view.send_draft(id, window, cx);
                 }
             });
-        let initial = terminal.read(cx).size();
-        let operation = self.runtime.spawn(run(id, initial, self.events.clone()));
         let (history_key, saved_history, terminal_type) = match &session {
             Session::Ssh(profile) => (
                 format!("ssh:{}", profile.id),
@@ -944,7 +1011,7 @@ impl Workbench {
             terminal_type,
             ssh_password_auth,
             ssh_password_rejected: false,
-            phase: Phase::Connecting,
+            phase: Phase::Disconnected,
             terminal,
             draft,
             link,
@@ -959,7 +1026,7 @@ impl Workbench {
             observed_terminal: TerminalObservation::default(),
             route: Vec::new(),
             connection: None,
-            operation: Some(operation),
+            operation: None,
             monitor: None,
             monitor_state: monitor::MonitorState::default(),
             sample: None,
@@ -967,8 +1034,7 @@ impl Workbench {
             _draft_subscription: draft_subscription,
             _terminal_subscriptions: terminal_subscriptions,
         });
-        self.notice.clear();
-        self.select_tab(id, window, cx);
+        id
     }
 
     fn test(&mut self, profile: ConnectionProfile, window: &mut Window, cx: &mut Context<Self>) {
@@ -1390,7 +1456,9 @@ fn configure_terminal(
     );
     terminal.set_timeline_options(
         settings.timestamp_format.into(),
-        Duration::from_secs(settings.idle_threshold.max(1)),
+        settings
+            .show_idle_separator
+            .then(|| Duration::from_secs(settings.idle_threshold.max(1))),
         settings.dim_repeated_timestamps,
         cx,
     );
